@@ -17,14 +17,17 @@
 - [03-bridge-path-evaluation.md](03-bridge-path-evaluation.md) — 两条集成路径评估、推荐架构、风险与下一步
 - [04-codex-probe-results.md](04-codex-probe-results.md) — mock wham 实测：codex 0.156.1 全链路打通（enroll/WS/双向 JSON-RPC/seq-ack），帧格式实证
 - [05-real-wham-verification.md](05-real-wham-verification.md) — 真实 chatgpt.com wham 端到端闭环：bridge 凭证 enroll/手机配对/手机发任务本机执行并回复；CF 拦 Node fetch 的发现
+- [06-mobile-scenarios.md](06-mobile-scenarios.md) — 12 场景实测：手机端全部 JSON-RPC 方法序列/参数/事件流实证（反向代理抓帧），ZCode 映射表
+- [07-sim-layer.md](07-sim-layer.md) — 模拟层：桥直连真实 wham 扮演被控端，28 方法固定/模拟响应（不接 LLM），`npm run sim`
 
 ## 实现代码（探测阶段产出）
 
 - `src/auth/` — codex 同款 ChatGPT 登录栈（OAuth PKCE + 本地回调 + auth.json 存储 +
   token 自动刷新/过期感知/重新登录），`npm run auth -- login|status|refresh|logout|headers`
 - `src/wham/` — mock wham 服务器（REST enroll/refresh/pair + WS 隧道 + 模拟手机端脚本），
-  `npm run wham -- --port 8787`
-- 单测 21 项全绿：`npm test`
+  `npm run wham -- --port 8787`；curl REST 客户端（enroll/refresh/pair）
+- `src/sim/` — 模拟被控端（enroll→WSS→28 方法模拟响应），`npm run sim`
+- 单测 24 项全绿：`npm test`
 
 ## 核心结论（TL;DR）
 

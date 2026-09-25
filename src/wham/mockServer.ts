@@ -73,6 +73,12 @@ export class MockWhamServer {
   readonly mobileStreamId = randomUUID();
   /** 探测结果汇总（脚本跑完后填充）。 */
   readonly scriptResults: Array<{ method: string; response: unknown }> = [];
+  /** 收到的 codex 通知（method+params，测试断言用）。 */
+  readonly receivedNotifications: Array<{ method: string; params: unknown }> = [];
+  /** 收到的 codex 请求（codex 主动发起，如 attestation/generate）。 */
+  readonly receivedServerRequests: Array<{ method: string; params: unknown }> = [];
+  /** 收到的 server_message 帧 seq_id 序列（按到达顺序）。 */
+  readonly receivedSeqIds: number[] = [];
 
   constructor(opts: MockWhamOptions) {
     this.opts = opts;
@@ -266,6 +272,7 @@ export class MockWhamServer {
     switch (envelope.type) {
       case "server_message": {
         this.ack(envelope.seq_id, envelope.stream_id);
+        this.receivedSeqIds.push(envelope.seq_id);
         const message = envelope.message;
         if (!message) {
           return;
@@ -281,6 +288,11 @@ export class MockWhamServer {
           }
         } else if ("method" in message) {
           // codex 主动通知 / codex 发起的请求（如 approval 请求）
+          if ("id" in message) {
+            this.receivedServerRequests.push({ method: message.method, params: message.params });
+          } else {
+            this.receivedNotifications.push({ method: message.method, params: message.params });
+          }
           this.log(
             `← codex ${"id" in message ? `request(${message.method})` : `notify(${message.method})`} ` +
               `${JSON.stringify(message.params ?? {}).slice(0, 300)}`,
