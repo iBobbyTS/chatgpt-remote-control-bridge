@@ -1,0 +1,27 @@
+{
+  "name": "chatgpt-remote-control-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "把本地 ZCode 桥接到 codex 的 ChatGPT 远程控制后端（wham）",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test \"test/*.test.ts\"",
+    "auth": "tsx src/cli.ts",
+    "wham": "tsx src/wham/cli.ts",
+    "wham:probe": "tsx src/wham/probe-cli.ts",
+    "wham:proxy": "tsx src/wham/proxy.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  },
+  "dependencies": {
+    "@types/ws": "^8.18.1",
+    "ws": "^8.21.3"
+  }
+}

@@ -1,2 +1,5 @@
 /reference
 *.DS_Store
+node_modules/
+var/
+.agent-work/

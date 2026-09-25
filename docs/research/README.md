@@ -15,6 +15,16 @@
 - [01-codex-remote-control.md](01-codex-remote-control.md) — codex 远程控制功能：是否开源、代码位置、协议细节
 - [02-zcode-architecture.md](02-zcode-architecture.md) — ZCode 架构、可编程接口（app-server/CLI）、手机远控闭源证据
 - [03-bridge-path-evaluation.md](03-bridge-path-evaluation.md) — 两条集成路径评估、推荐架构、风险与下一步
+- [04-codex-probe-results.md](04-codex-probe-results.md) — mock wham 实测：codex 0.156.1 全链路打通（enroll/WS/双向 JSON-RPC/seq-ack），帧格式实证
+- [05-real-wham-verification.md](05-real-wham-verification.md) — 真实 chatgpt.com wham 端到端闭环：bridge 凭证 enroll/手机配对/手机发任务本机执行并回复；CF 拦 Node fetch 的发现
+
+## 实现代码（探测阶段产出）
+
+- `src/auth/` — codex 同款 ChatGPT 登录栈（OAuth PKCE + 本地回调 + auth.json 存储 +
+  token 自动刷新/过期感知/重新登录），`npm run auth -- login|status|refresh|logout|headers`
+- `src/wham/` — mock wham 服务器（REST enroll/refresh/pair + WS 隧道 + 模拟手机端脚本），
+  `npm run wham -- --port 8787`
+- 单测 21 项全绿：`npm test`
 
 ## 核心结论（TL;DR）
 
