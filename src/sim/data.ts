@@ -258,7 +258,12 @@ export interface FixedThread {
   items: ItemEntry[];
 }
 
-/** 固定消息列表：两个预置会话（用户可见的“历史”）。 */
+/**
+ * 固定消息列表：一个带完整历史的预置会话。
+ * 注意：codex 中不存在"零 turn 却长期出现在列表里"的线程——
+ * 空线程只在会话进行中存活（thread-store shutdown 时无 rollout 即丢弃
+ * pending metadata，live_writer.rs:192），故此处不预置空白线程。
+ */
 export function fixedThreads(): Map<string, FixedThread> {
   const now = Date.now();
   const t1 = makeThread({
@@ -280,12 +285,6 @@ export function fixedThreads(): Map<string, FixedThread> {
   t1.updatedAt = turn1.completedAt ?? t1.updatedAt;
   t1.recencyAt = t1.updatedAt;
 
-  const t2 = makeThread({
-    cwd: "/Users/ibobby",
-    preview: "模拟会话：空白任务示例",
-    createdAt: Math.floor((now - 86_400_000) / 1000),
-  });
-
   const map = new Map<string, FixedThread>();
   map.set(t1.id, {
     thread: t1,
@@ -296,6 +295,5 @@ export function fixedThreads(): Map<string, FixedThread> {
       completedAtMs: (turn1.startedAt ?? 0) * 1000 + i + 500,
     })),
   });
-  map.set(t2.id, { thread: t2, items: [] });
   return map;
 }

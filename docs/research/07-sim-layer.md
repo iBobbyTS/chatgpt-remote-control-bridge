@@ -129,6 +129,20 @@ npm run sim -- --name "名字"   # 手机上显示的服务器名（默认 <主�
    导致 [用户消息, 回复] 显示成 [回复, 用户消息]。
    → 修复：items/list 尊重 sortDirection（默认 desc），与 turns/list 一致。
 
+## 对齐 codex 线程生命周期（源码实证）
+
+codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁盘 rollout；
+`thread/start` 仅在内存 stage pending metadata，无 rollout 的线程 shutdown 时被
+丢弃，live_writer.rs:192）。据此调整模拟层：
+
+- 预置会话只保留带历史的一个；不再预置空白会话。
+- `thread/list` 过滤 ephemeral 线程与零 turn 线程。
+- `thread/start {ephemeral:true}`（手机"起名线程"，threadSource:"thread_title"）
+  仅存内存：不落盘、不进列表；跑过 turn 也不进。
+- 持久化快照排除 ephemeral；加载时丢弃零 turn 线程（等价 shutdown 清理）。
+- 起名线程的 turn 回复特殊化：从输入的 `User prompt:` 段提取用户首条消息，
+  生成 ≤36 字符单行标题（真实 codex 由 LLM 生成，手机用作任务名）。
+
 ## 已知边界（后续接入真实驱动时处理）
 
 - 出站不做分片（真实观测 11.4KB 单帧直发被接受；模拟回复远小于此）。

@@ -101,11 +101,11 @@ test("回环：initialize / thread/list（固定列表）/ thread/start / turn �
     assert.equal(init.result.platformOs, process.platform === "darwin" ? "macos" : "linux");
     assert.equal(init.result.codexHome, loop.authHome);
 
-    // thread/list：固定线程列表（2 个预置会话）
+    // thread/list：固定线程列表（1 个带历史的预置会话；零 turn 线程不列出）
     const list = (await loop.mock.rpc("thread/list", {})) as {
       result: { data: Array<{ id: string; preview: string }> };
     };
-    assert.equal(list.result.data.length, 2);
+    assert.equal(list.result.data.length, 1);
     assert.ok(list.result.data.every((t) => typeof t.id === "string" && t.id.includes("-")));
 
     // thread/start
@@ -377,6 +377,10 @@ test("持久化：重启后 thread id 与历史保持（手机缓存 thread id �
     threadId,
     input: [{ type: "text", text: "persist-me" }],
   });
+  // 再建一个零 turn 线程：codex 语义下不跨重启存活
+  const emptyStarted = (await app1.handleRequest(key, 6, "thread/start", { cwd: "/tmp-sim/never-used" })) as {
+    result: { thread: { id: string } };
+  };
   // 等 turn 流结束落盘
   await new Promise((r) => setTimeout(r, 300));
   app1.close();
@@ -387,6 +391,10 @@ test("持久化：重启后 thread id 与历史保持（手机缓存 thread id �
     result: { data: Array<{ id: string }> };
   };
   assert.ok(list.result.data.some((t) => t.id === threadId), "重启后同 thread id 仍存在");
+  assert.ok(
+    !list.result.data.some((t) => t.id === emptyStarted.result.thread.id),
+    "零 turn 线程不应跨重启存活",
+  );
   const resumed = (await app2.handleRequest(key, 4, "thread/resume", { threadId })) as {
     result: { turnsBackwardsCursor: string };
   };
@@ -399,6 +407,72 @@ test("持久化：重启后 thread id 与历史保持（手机缓存 thread id �
   );
   assert.ok(texts.includes("persist-me"), "重启后历史 userMessage 仍在");
   app2.close();
+});
+
+test("回环：ephemeral 起名线程与零 turn 线程不进列表（对齐 codex thread-store 行为）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+
+    // 普通空线程（未发消息）：turn/start 前 thread/list 不应包含它
+    const empty = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/empty" })) as {
+      result: { thread: { id: string; ephemeral: boolean } };
+    };
+    assert.equal(empty.result.thread.ephemeral, false);
+    let list = (await loop.mock.rpc("thread/list", {})) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.ok(!list.result.data.some((t) => t.id === empty.result.thread.id), "零 turn 线程不应出现在列表");
+
+    // ephemeral 起名线程（手机 threadSource:"thread_title" + ephemeral:true）
+    const titleThread = (await loop.mock.rpc("thread/start", {
+      cwd: "/tmp-sim/title",
+      ephemeral: true,
+      threadSource: "thread_title",
+    })) as { result: { thread: { id: string; ephemeral: boolean } } };
+    assert.equal(titleThread.result.thread.ephemeral, true);
+
+    // 起名 turn：输入含 "User prompt:\n<首条消息>"，回复应为 ≤36 字符短标题
+    await loop.mock.rpc("turn/start", {
+      threadId: titleThread.result.thread.id,
+      input: [{
+        type: "text",
+        text: "You are a helpful assistant. Generate a concise UI title of at most 36 characters.\n\nUser prompt:\nS9-ephemeral 标题测试",
+      }],
+    });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "turn/completed" &&
+            (n.params as { threadId: string }).threadId === titleThread.result.thread.id,
+        ),
+      8000,
+      "起名线程 turn/completed 未收到",
+    );
+    const titleReply = loop.mock.receivedNotifications.find(
+      (n) =>
+        n.method === "item/completed" &&
+        (n.params as { threadId: string; item: { type: string; text: string } }).threadId ===
+          titleThread.result.thread.id &&
+        (n.params as { item: { type: string } }).item.type === "agentMessage",
+    );
+    const titleText = String(
+      ((titleReply!.params as { item: { text: string } }).item.text ?? "").trim(),
+    );
+    assert.equal(titleText, "S9-ephemeral 标题测试");
+    assert.ok(titleText.length <= 36);
+
+    // 起名线程即使跑过 turn 也不进列表
+    list = (await loop.mock.rpc("thread/list", {})) as { result: { data: Array<{ id: string }> } };
+    assert.ok(
+      !list.result.data.some((t) => t.id === titleThread.result.thread.id),
+      "ephemeral 线程不应出现在列表",
+    );
+  } finally {
+    await loop.sim.stop();
+    await loop.mock.stop();
+  }
 });
 
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {

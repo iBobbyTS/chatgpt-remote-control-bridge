@@ -151,6 +151,9 @@ export class SimApp extends EventEmitter {
       const parsed = JSON.parse(raw) as Array<{ thread: ThreadRecord; items: ItemEntry[] }>;
       for (const entry of parsed) {
         if (entry?.thread?.id) {
+          if ((entry.thread.turns ?? []).length === 0) {
+            continue; // 零 turn 线程不跨重启存活（对齐 codex shutdown 清理）
+          }
           this.threads.set(entry.thread.id, {
             thread: entry.thread,
             items: entry.items ?? [],
@@ -168,10 +171,12 @@ export class SimApp extends EventEmitter {
   private persistState(): void {
     const statePath = this.opts.statePath;
     if (!statePath) return;
-    const snapshot = [...this.threads.values()].map((t) => ({
-      thread: t.thread,
-      items: t.items,
-    }));
+    const snapshot = [...this.threads.values()]
+      .filter((t) => !t.thread.ephemeral)
+      .map((t) => ({
+        thread: t.thread,
+        items: t.items,
+      }));
     this.saveQueue = this.saveQueue
       .then(async () => {
         const tmp = `${statePath}.tmp`;
@@ -349,7 +354,10 @@ export class SimApp extends EventEmitter {
   }
 
   private threadList(_p: AnyParams): unknown {
+    // 对齐 codex：thread/list 只读磁盘 rollout——ephemeral 线程与从未跑过
+    // turn 的线程都不会出现（live_writer.rs:192 无 rollout 即丢弃 pending metadata）
     const data = [...this.threads.values()]
+      .filter((t) => !t.thread.ephemeral && t.thread.turns.length > 0)
       .map((t) => this.serializeThread(t.thread, []))
       .sort((a, b) => (b.recencyAt ?? 0) - (a.recencyAt ?? 0));
     return { data, nextCursor: null, backwardsCursor: null };
@@ -358,9 +366,13 @@ export class SimApp extends EventEmitter {
   private threadStart(p: AnyParams): unknown {
     const cwd = p.cwd ?? homedir();
     const thread = makeThread({ cwd, threadSource: p.threadSource ?? "user" });
+    // ephemeral:true = 手机端的「起名线程」：仅内存、不落盘、不进列表
+    thread.ephemeral = p.ephemeral === true;
     if (p.model) thread.model = p.model;
     this.threads.set(thread.id, { thread, items: [], queue: [], sim: null });
-    this.persistState();
+    if (!thread.ephemeral) {
+      this.persistState();
+    }
     this.emitSoon("thread/started", { thread: this.serializeThread(thread, []) });
     return { thread: this.serializeThread(thread, []) };
   }
@@ -711,6 +723,14 @@ export class SimApp extends EventEmitter {
   }
 
   private buildReply(userText: string, thread: ThreadRecord): string {
+    if (thread.ephemeral) {
+      // 手机起名线程：输入是"…User prompt:\n<用户首条消息>"，回复须是 ≤36 字符单行标题
+      const m = userText.match(/User prompt:\s*([\s\S]+)$/);
+      const prompt = (m ? m[1]! : userText).trim();
+      const firstLine = prompt.split("\n").map((s) => s.trim()).filter(Boolean)[0] ?? "";
+      const title = firstLine.replace(/["`*#]/g, "").trim().slice(0, 36);
+      return title.length > 0 ? title : "模拟任务";
+    }
     return [
       `已收到消息：「${userText}」。`,
       "",
