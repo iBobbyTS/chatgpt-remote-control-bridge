@@ -12,12 +12,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, after } from "node:test";
-import { resetAgents } from "../src/agents/registry.ts";
+import { getAgent, registerAgent, resetAgents } from "../src/agents/registry.ts";
 import { BridgeAuthManager } from "../src/auth/manager.ts";
 import { makeTestJwt } from "../src/auth/jwt.ts";
 import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import { MockWhamServer } from "../src/wham/mockServer.ts";
 import { cgrcbPaths, instancePaths } from "../src/daemon/paths.ts";
+import { writeConfig } from "../src/daemon/config.ts";
 import { CgrcbDaemon, type CgrcbDaemonOptions } from "../src/daemon/daemon.ts";
 import { requestIpc, type AgentRuntimeStatus } from "../src/daemon/ipc.ts";
 
@@ -256,5 +257,116 @@ test("S03 IPC agent-reset（未运行 sim）：纯文件 reset 播种，无活�
     assert.deepEqual(JSON.parse(await readFile(ip.lifecycle, "utf8")), { everEnrolled: false });
   } finally {
     await daemon.shutdown();
+  }
+});
+
+// ------------------------------------------------ S03 BLOCKER1：enable/boot
+
+/** 幂等注册一个 onEnable 必抛错的 stub 模块（重启后再 start 需可重复注册）。 */
+function registerFlakyEnableModule(): void {
+  if (getAgent("flaky")) return;
+  registerAgent({
+    id: "flaky",
+    createInstance: () => {
+      throw new Error("flaky createInstance 不应被调用（onEnable 先失败）");
+    },
+    onEnable: async () => {
+      throw new Error("onEnable boom");
+    },
+  });
+}
+
+test("S03 BLOCKER1 enable 钩子抛错：enable 报失败、config 未 enabled、重启不自动启动", async () => {
+  const mock = await startMock();
+  const home = await tempDir("simd-en");
+  const paths = cgrcbPaths(home);
+  await writeAuthStore(paths.codexHome, fakeAuth());
+  const opts: CgrcbDaemonOptions = {
+    home,
+    baseUrl: `http://127.0.0.1:${mock.port}`,
+    reconnectDelayMs: 0,
+    log: () => {},
+    registerAgents: registerFlakyEnableModule,
+  };
+  const daemon = new CgrcbDaemon(opts);
+  let restarted: CgrcbDaemon | null = null;
+  try {
+    await daemon.start();
+    const enable = await requestIpc(paths.socketPath, "enable", { agent: "flaky" });
+    assert.equal(enable.ok, false, `enable 应失败: ${JSON.stringify(enable)}`);
+    assert.equal((enable as { error?: string }).error, "INTERNAL");
+    assert.match((enable as { message?: string }).message ?? "", /onEnable boom/);
+
+    // config 不得残留 enabled:true（方案②：播种成功后才提交）
+    const cfg = JSON.parse(await readFile(paths.configPath, "utf8")) as {
+      agents?: Record<string, { enabled?: boolean }>;
+    };
+    assert.notEqual(cfg.agents?.flaky?.enabled, true, "onEnable 失败后 config 不得 enabled");
+
+    // 重启：boot 路径按 config 判断，flaky 未被启用 → 不自动启动
+    await daemon.shutdown();
+    restarted = new CgrcbDaemon(opts);
+    await restarted.start();
+    assert.equal(
+      (await ipcAgentStatus(paths.socketPath, "flaky")).status,
+      "disabled",
+      "重启后不得据 config 自动启动",
+    );
+  } finally {
+    await restarted?.shutdown().catch(() => undefined);
+    await daemon.shutdown().catch(() => undefined);
+    await mock.stop();
+  }
+});
+
+test("S03 BLOCKER1 boot 路径：config enabled 但 store 未初始化 → 自动播种后上线", async () => {
+  const mock = await startMock();
+  const home = await tempDir("simd-boot");
+  const paths = cgrcbPaths(home);
+  await writeAuthStore(paths.codexHome, fakeAuth());
+  // 预写 enabled:true（模拟重启前的启用态）；store 故意不存在，boot 须自动播种
+  await writeConfig(paths.configPath, { version: 1, agents: { sim: { enabled: true } } });
+  const daemon = makeDaemon(home, mock);
+  try {
+    await daemon.start();
+    await waitFor(
+      async () => (await ipcAgentStatus(paths.socketPath, "sim")).online,
+      5000,
+      "boot 自动上线",
+    );
+    const ip = instancePaths(join(paths.instancesDir, "sim"));
+    const store = JSON.parse(await readFile(ip.state, "utf8")) as LooseStoreEntry[];
+    assert.deepEqual(normStore(store), SEED_SEMANTICS, "boot 路径应自动播种 state.json");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+// ------------------------------------------------ S03 BLOCKER2：reset 落盘失败
+
+test("S03 BLOCKER2 IPC agent-reset：state.json 落盘失败 → 返回失败而非成功", async () => {
+  const mock = await startMock();
+  const home = await tempDir("simd-rsf");
+  const paths = cgrcbPaths(home);
+  await writeAuthStore(paths.codexHome, fakeAuth());
+  const daemon = makeDaemon(home, mock);
+  try {
+    await daemon.start();
+    const enable = await requestIpc(paths.socketPath, "enable", { agent: "sim" });
+    assert.equal(enable.ok, true, JSON.stringify(enable));
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, "sim")).online, 5000, "online");
+
+    const ip = instancePaths(join(paths.instancesDir, "sim"));
+    // 注入落盘失败：把 state.json 占用为目录 → resetToSeed 的 rename(tmp, state.json) 报 EISDIR
+    await rm(ip.state, { force: true });
+    await mkdir(ip.state, { recursive: true });
+
+    const reset = await requestIpc(paths.socketPath, "agent-reset", { agent: "sim" });
+    assert.equal(reset.ok, false, `reset 应失败: ${JSON.stringify(reset)}`);
+    assert.equal((reset as { error?: string }).error, "INTERNAL");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
   }
 });

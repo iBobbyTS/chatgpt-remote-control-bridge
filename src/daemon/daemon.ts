@@ -211,11 +211,26 @@ export class CgrcbDaemon {
     // BLOCKER 1：初始自动启动也进入 per-agent 队列，disable/shutdown 可与之串行并等待
     for (const [id, cfg] of Object.entries(this.config.agents)) {
       if (cfg.enabled) {
-        void this.serialize(id, () => this.startInstance(id)).catch((err) =>
+        void this.serialize(id, () => this.bootInstance(id)).catch((err) =>
           this.logLine(`[${id}] 启动失败: ${errorMessage(err)}`),
         );
       }
     }
+  }
+
+  /**
+   * boot 自动启动（S03 BLOCKER1 闭合）：config enabled:true 的实例在无 IPC enable 的情况下
+   * 也需跑模块 onEnable 做幂等播种，否则 boot 路径会绕过播种直接建实例（store 未初始化）。
+   * onEnable 契约要求幂等，故每次 boot 调用安全；未声明钩子的模块保持原语义。
+   */
+  private async bootInstance(id: string): Promise<void> {
+    const module = getAgent(id);
+    if (module?.onEnable) {
+      const ctx = this.instanceContext(id);
+      await this.ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
+      await module.onEnable(ctx);
+    }
+    await this.startInstance(id);
   }
 
   /** start 中途收到 stop 请求：放弃并清理已建资源（IPC/socket/信号/自动刷新）。 */
@@ -602,16 +617,20 @@ export class CgrcbDaemon {
     if (!auth.loggedIn) {
       return { ok: false, error: "NOT_LOGGED_IN", message: "未登录：请先执行 chatgpt login" };
     }
-    if (this.config.agents[id]?.enabled !== true) {
-      // 写盘失败会 throw → 上层 INTERNAL，内存/实例均不动
-      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, true));
-    }
-    // S03：写 config 后、启动实例前做自动 init（幂等）。先建实例目录 → 首建写 lifecycle.json，
-    // 再调模块 onEnable（如 sim 播种 state.json）；未声明钩子的模块跳过（通用，不硬编码 sim）。
+    // S03（BLOCKER1 修复，语义 = 方案②）：**先建实例目录 + 跑 onEnable 幂等播种，成功后才
+    // commitConfig(enabled:true) → startInstance**。若播种抛错，本次 enable 直接失败且 config
+    // 保持原状（不会留下"config 已 enabled 但 store 未播种"），重启后既不会被误报为已启用成功，
+    // 也不会出现"enable 报失败却已 enabled"的矛盾状态。boot 自动启动路径另行补跑 onEnable
+    // （见 bootInstance），两者结合保证任何上线实例的 store 均已播种。
+    // 未声明钩子的模块跳过（通用，不硬编码 sim）。
     const module = getAgent(id)!;
     const ctx = this.instanceContext(id);
     await this.ensureInstanceDir(ctx.instanceDir);
     await module.onEnable?.(ctx);
+    if (this.config.agents[id]?.enabled !== true) {
+      // 写盘失败会 throw → 上层 INTERNAL，内存/实例均不动
+      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, true));
+    }
     const inst = this.instances.get(id);
     if (!inst || inst.status === "disabled") {
       await this.startInstance(id);

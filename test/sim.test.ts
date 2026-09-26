@@ -660,6 +660,21 @@ test("S03③ reset 活实例：清队列续跑计时器，无 turn 复活；内�
   app.close();
 });
 
+test("S03 BLOCKER2 resetToSeed：落盘失败向上抛（不经 persistState 吞错 catch）", async () => {
+  const dir = await tempDir("reset-fail");
+  const statePath = simStatePath(dir);
+  // 注入落盘失败：state.json 占用为目录 → persistSeedNow 的 rename(tmp, state.json) 报 EISDIR
+  await mkdir(statePath, { recursive: true });
+  const app = new SimApp({ codexHome: dir, statePath });
+  await assert.rejects(() => app.resetToSeed(), /EISDIR/, "reset 落盘失败必须抛出");
+  // 常规运行期 persistState 仍吞错：触发一次写不 reject（仅日志）
+  await assert.doesNotReject(async () => {
+    (app as unknown as { persistState: () => void }).persistState();
+    await new Promise((r) => setTimeout(r, 50));
+  }, "persistState 吞错语义不得改变");
+  app.close();
+});
+
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

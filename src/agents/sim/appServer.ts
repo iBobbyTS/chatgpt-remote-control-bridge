@@ -179,16 +179,21 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
   }
 
-  /** 原子落盘（tmp + rename），串行化避免并发写。 */
-  private persistState(): void {
-    const statePath = this.opts.statePath;
-    if (!statePath) return;
-    const snapshot = [...this.threads.values()]
+  /** 落盘快照：非 ephemeral 线程（persistState 与 reset 显式写共用同一形状）。 */
+  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[] }> {
+    return [...this.threads.values()]
       .filter((t) => !t.thread.ephemeral)
       .map((t) => ({
         thread: t.thread,
         items: t.items,
       }));
+  }
+
+  /** 原子落盘（tmp + rename），串行化避免并发写。运行期写失败**吞错**（仅日志）。 */
+  private persistState(): void {
+    const statePath = this.opts.statePath;
+    if (!statePath) return;
+    const snapshot = this.snapshotEntries();
     this.saveQueue = this.saveQueue
       .then(async () => {
         const tmp = `${statePath}.tmp`;
@@ -198,6 +203,19 @@ export class SimApp extends EventEmitter implements AgentApp {
       .catch((err) => {
         this.opts.log?.(`状态落盘失败: ${err instanceof Error ? err.message : err}`);
       });
+  }
+
+  /**
+   * reset 路径的显式播种落盘（S03 BLOCKER2）：原子 tmp + rename，唯一临时名避免与
+   * persistState 的固定 `.tmp` 冲突。与 persistState 不同，**错误向上抛**——reset 调用方
+   * （daemon IPC agent-reset）必须据此报失败，否则"报成功而磁盘非播种态"。
+   */
+  private async persistSeedNow(): Promise<void> {
+    const statePath = this.opts.statePath;
+    if (!statePath) return;
+    const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    await writeFile(tmp, JSON.stringify(this.snapshotEntries()), "utf8");
+    await rename(tmp, statePath);
   }
 
   // ------------------------------------------------------------------ 客户端
@@ -233,14 +251,19 @@ export class SimApp extends EventEmitter implements AgentApp {
    * （含队列续跑计时器），重新播种 fixedThreads 并落盘。
    *
    * 与 saveQueue 的交错：先排空在途写，避免 reset 前排队中的旧快照在播种后落盘覆盖。
-   * 不动 clients（在线手机连接保持不变）。
+   * 落盘走 persistSeedNow（可失败变体）——失败向上抛，daemon IPC 据此报 {ok:false,INTERNAL}。
+   *
+   * 保留语义（NIT，明确声明）：
+   * - `clients`：不动。在线手机连接须跨 reset 保持，否则 reset 会踢掉已配对会话。
+   * - `overlayDirs` / `overlayChildren`：不动。虚拟 FS 覆盖层是进程级模拟状态，
+   *   与"会话库播种态"无关，清理会让 reset 后线程引用的工作目录凭空消失。
+   * 二者均为运行态连接/环境模拟，不属于 store 播种语义。
    */
   async resetToSeed(): Promise<void> {
     await this.saveQueue.catch(() => undefined);
     this.clearAllTimers();
     this.seedPresetThreads();
-    this.persistState();
-    await this.saveQueue.catch(() => undefined);
+    await this.persistSeedNow();
   }
 
   // ------------------------------------------------------------------ 分发
