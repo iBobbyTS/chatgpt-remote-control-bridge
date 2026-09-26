@@ -1625,6 +1625,42 @@ test("T11 空闲回收：注册流静默超时后整流回收（容量归还 + f
   }
 });
 
+test("T12 连接级通知 target：仅目标注册流收到，其它注册流不收副本", async () => {
+  const { server } = await startMock({ autoAck: true });
+  const otherStream = randomUUID();
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "main" } });
+    await server.rpc("initialize", { clientInfo: { name: "other" } }, undefined, otherStream);
+    const main = server.mobileStreamId;
+
+    // command/exec/outputDelta 等连接级通知：对齐 codex
+    // send_server_notification_to_connection_and_wait，只投给发起连接
+    app.emit("event", {
+      method: "targeted/only",
+      params: { x: 1 },
+      target: { clientId: server.mobileClientId, streamId: otherStream },
+    } satisfies AgentNotification);
+
+    await waitFor(
+      () => server.dedupedByStream.get(otherStream)?.some((e) => e.method === "targeted/only") ?? false,
+      5000,
+      "目标流未收到连接级通知",
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(
+      (server.dedupedByStream.get(main) ?? []).filter((e) => e.method === "targeted/only").length,
+      0,
+      "非目标流不得收到连接级通知副本",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs = 5000, label?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

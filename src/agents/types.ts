@@ -28,6 +28,8 @@ export interface AgentNotification {
   method: string;
   params: Record<string, unknown>;
   threadId?: string;
+  /** 存在时仅投递给该连接（连接级通知，如 command/exec/outputDelta）。 */
+  target?: AgentClientKey;
 }
 
 export interface JsonRpcOutcomeSuccess {

@@ -2611,3 +2611,134 @@ test("回环：标题 turn 超 maxLength 截断、含 test queue 字样不误触
     await loop.mock.stop();
   }
 });
+
+test("回环：command/exec HOME 探测（ChatGPT 1.2026.258 发消息前置）流式 outputDelta + 空响应", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "codex_chatgpt_ios_remote" },
+      capabilities: { experimentalApi: true },
+    });
+    // 真机 2026-09-26T17:12:38Z 抓包原样参数（codex-read-only 只读沙箱包装）。
+    // 旧版走 process/spawn；新版发消息前必经此调用，-32601 会让手机报
+    // 「Codex 服务器返回了错误」并进入 30s 会话重建循环
+    const res = (await loop.mock.rpc("command/exec", {
+      timeoutMs: 20000,
+      cwd: "/",
+      processId: "ios-read-only-CBF71100",
+      outputBytesCap: 4097,
+      command: [
+        "/bin/sh", "-c", "printf '\\0'; exec \"$@\"", "codex-read-only",
+        "/bin/sh", "-lc", "cd \"$HOME\" && pwd -P",
+      ],
+      streamStdoutStderr: true,
+      env: { ENV: null, BASH_ENV: null },
+      sandboxPolicy: { type: "readOnly", networkAccess: false },
+    })) as { result: { exitCode: number; stdout: string; stderr: string } };
+    // 流式最终响应不带输出（command_exec.rs：流式字节不重复携带进响应）
+    assert.deepEqual(res.result, { exitCode: 0, stdout: "", stderr: "" });
+
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "command/exec/outputDelta"),
+      5000,
+      "outputDelta 通知未到达",
+    );
+    const delta = loop.mock.receivedNotifications.find(
+      (n) => n.method === "command/exec/outputDelta",
+    )!.params as { processId: string; stream: string; deltaBase64: string; capReached: boolean };
+    assert.equal(delta.processId, "ios-read-only-CBF71100");
+    assert.equal(delta.stream, "stdout");
+    assert.equal(delta.capReached, false);
+    // 外壳 printf '\0' 前缀 + 内层 pwd -P：与真实 codex 执行输出逐字节一致
+    const text = Buffer.from(delta.deltaBase64, "base64").toString("utf8");
+    assert.equal(text, `\0${realpathSync(homedir())}\n`);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：command/exec 缓冲模式 stdout 随响应返回 + outputBytesCap 按字节截断", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "codex_chatgpt_ios_remote" } });
+    const command = [
+      "/bin/sh", "-c", "printf '\\0'; exec \"$@\"", "codex-read-only",
+      "/bin/sh", "-lc", "cd \"$HOME\" && pwd -P",
+    ];
+    const res = (await loop.mock.rpc("command/exec", { command, cwd: "/" })) as {
+      result: { exitCode: number; stdout: string; stderr: string };
+    };
+    assert.equal(res.result.exitCode, 0);
+    assert.equal(res.result.stderr, "");
+    assert.equal(res.result.stdout, `\0${realpathSync(homedir())}\n`);
+    assert.equal(
+      loop.mock.receivedNotifications.filter((n) => n.method === "command/exec/outputDelta").length,
+      0,
+      "缓冲模式不得发 outputDelta",
+    );
+
+    const capped = (await loop.mock.rpc("command/exec", { command, outputBytesCap: 3 })) as {
+      result: { stdout: string };
+    };
+    assert.equal(Buffer.byteLength(capped.result.stdout), 3, "outputBytesCap 应按字节截断");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：command/exec 校验顺序与 write/terminate/resize 无会话错误对齐 codex 文案", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "codex_chatgpt_ios_remote" } });
+    // 流式前置校验先于空命令校验（command_exec.rs start() 159 行 → 254 行）
+    const noId = (await loop.mock.rpc("command/exec", {
+      command: ["/bin/sh", "-lc", "true"],
+      streamStdoutStderr: true,
+    })) as { error?: { code: number; message: string } };
+    assert.equal(noId.error?.code, -32600);
+    assert.equal(noId.error?.message, "command/exec tty or streaming requires a client-supplied processId");
+
+    const empty = (await loop.mock.rpc("command/exec", { command: [] })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(empty.error?.code, -32600);
+    assert.equal(empty.error?.message, "command must not be empty");
+
+    const noDelta = (await loop.mock.rpc("command/exec/write", { processId: "p1" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(noDelta.error?.code, -32602);
+    assert.equal(noDelta.error?.message, "command/exec/write requires deltaBase64 or closeStdin");
+
+    const write = (await loop.mock.rpc("command/exec/write", { processId: "p1", deltaBase64: "aGk=" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(write.error?.code, -32600);
+    assert.equal(write.error?.message, 'no active command/exec for process id "p1"');
+
+    const terminate = (await loop.mock.rpc("command/exec/terminate", { processId: "p2" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(terminate.error?.code, -32600);
+    assert.equal(terminate.error?.message, 'no active command/exec for process id "p2"');
+
+    const badSize = (await loop.mock.rpc("command/exec/resize", {
+      processId: "p3",
+      size: { rows: 0, cols: 80 },
+    })) as { error?: { code: number; message: string } };
+    assert.equal(badSize.error?.code, -32602);
+    assert.equal(badSize.error?.message, "command/exec size rows and cols must be greater than 0");
+
+    const resize = (await loop.mock.rpc("command/exec/resize", {
+      processId: "p3",
+      size: { rows: 24, cols: 80 },
+    })) as { error?: { code: number; message: string } };
+    assert.equal(resize.error?.code, -32600);
+    assert.equal(resize.error?.message, 'no active command/exec for process id "p3"');
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});

@@ -416,3 +416,33 @@ fanOut 向 streams 里**所有**（含已死/僵尸）流广播通知副本；�
 
 重跑 `test queue`：排队后手机消息应完整（即便中途锁屏/切换致 wss 断代，最长 60s
 自愈）；`~/.cgrcb/instances/sim/frames.jsonl` 可核对双向帧与 ack。
+
+## 2026-09-26 新版 ChatGPT 1.2026.258：command/exec 缺失 →「Codex 服务器返回了错误」
+
+**现象**：手机端意外升级到 1.2026.258 后，hi / test queue 均弹「Codex 服务器返回了错误」，
+frames.jsonl 显示每 30 秒一次 initialize 会话重建循环（17:12-17:14 实录）。
+
+**根因**（非上轮改动）：新版把发消息前的一次性命令探测从 process/spawn 迁移到
+**command/exec**（app-server-protocol v2/command_exec.rs）：真机在 17:12:38/17:13:01 两次
+调用 `["/bin/sh","-c","printf '\\0'; exec \"$@\"","codex-read-only","/bin/sh","-lc","cd \"$HOME\" && pwd -P"]`
+（streamStdoutStderr:true + processId + outputBytesCap:4097 + sandboxPolicy readOnly），
+sim 未实现该方法回 -32601，手机即报错并重建会话。17:00 旧版 1.2026.251 同类探测仍走
+process/spawn（全部成功），证明是新版协议差异。
+
+**契约要点**（对齐 codex）：
+- 最终结果直接作为 RPC 响应 `{exitCode, stdout, stderr}`（不同于 process/spawn 的
+  `{}` + process/exited 通知）；流式（streamStdoutStderr/tty，必须带 processId）时输出经
+  **连接级** `command/exec/outputDelta` 通知（base64、stream: stdout|stderr、capReached）
+  下发，最终响应 stdout/stderr 为空——对应 codex `send_server_notification_to_connection_and_wait`。
+- 校验顺序：先「流式必须带 processId」（-32600），后「command must not be empty」（-32600）；
+  outputBytesCap 按字节截断；write 缺 deltaBase64 且未 closeStdin → -32602；
+  write/terminate/resize 无活动会话 → -32600 `no active command/exec for process id "<id>"`。
+- codex-read-only 外壳先 `printf '\0'` 再 exec 内层脚本——应答 stdout 保持 `\0` 前缀，
+  与真实 codex 执行输出逐字节一致。
+
+**修复**（commit 75009e6 一批）：
+- `AgentNotification`/`SimNotification` 增加可选 `target`（连接级定向），tunnel fanOut
+  只投给目标注册流；
+- sim 实现 `command/exec`（+write/terminate/resize），仿真引擎与 process/spawn 共用
+  （`emulateShellScript` 提取），HOME 探测回 `\0 + realpath($HOME)`；
+- 测试：sim 3 个（流式/缓冲+cap/校验与错误文案）+ wham T12（target 定向路由），全量 179/179。

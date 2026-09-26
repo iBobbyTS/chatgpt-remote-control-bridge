@@ -60,6 +60,8 @@ export interface SimNotification {
   params: Record<string, unknown>;
   /** 存在时仅投递给订阅了该 thread 的客户端。 */
   threadId?: string;
+  /** 存在时仅投递给该连接（连接级通知，如 command/exec/outputDelta）。 */
+  target?: SimClientKey;
 }
 
 export interface JsonRpcSuccess {
@@ -535,6 +537,14 @@ export class SimApp extends EventEmitter implements AgentApp {
         return {};
       case "process/spawn":
         return this.processSpawn(p);
+      case "command/exec":
+        return this.commandExec(key, p);
+      case "command/exec/write":
+        return this.commandExecWrite(p);
+      case "command/exec/terminate":
+        return this.commandExecTerminate(p);
+      case "command/exec/resize":
+        return this.commandExecResize(p);
       case "config/read":
         return readConfig();
       case "config/batchWrite":
@@ -1841,8 +1851,26 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   private processSpawn(p: AnyParams): unknown {
     const command: string[] = Array.isArray(p.command) ? p.command : [];
-    const script = command.join(" ");
     const handle = p.processHandle ?? `sim-${uuidv7()}`;
+    const { stdout, stderr, exitCode } = this.emulateShellScript(command.join(" "));
+    this.emit("event", this.notification("process/exited", {
+      processHandle: handle,
+      exitCode,
+      stdout,
+      stdoutCapReached: false,
+      stderr,
+      stderrCapReached: false,
+    }));
+    return {};
+  }
+
+  /**
+   * process/spawn 与 command/exec 共用的脚本模式仿真（不真正执行）。
+   * 已知模式按真机语义应答：任务目录 mkdir（覆盖层 + 路径应答）、HOME 探测、
+   * draft git 探测（非 git 目录形状）、其他 mkdir 登记覆盖层、周期 workspace-diff
+   * 静默空应答；未识别脚本留痕后空 stdout / exit 0 兜底。
+   */
+  private emulateShellScript(script: string): { stdout: string; stderr: string; exitCode: number } {
     let stdout = "";
     let stderr = "";
     let exitCode = 0;
@@ -1869,17 +1897,99 @@ export class SimApp extends EventEmitter implements AgentApp {
     } else if (!script.includes("collecting a workspace diff")) {
       // 周期性 workspace-diff 快照不记日志（约 30s 一次会刷屏）；其余未识别脚本
       // 留痕，便于真机出现新脚本模式时定位（当前以空 stdout / exit 0 兜底应答）
-      this.opts.log?.(`spawn 未识别脚本（空 stdout 应答）: ${script.slice(0, 80)}`);
+      this.opts.log?.(`exec 未识别脚本（空 stdout 应答）: ${script.slice(0, 80)}`);
     }
-    this.emit("event", this.notification("process/exited", {
-      processHandle: handle,
-      exitCode,
-      stdout,
-      stdoutCapReached: false,
-      stderr,
-      stderrCapReached: false,
-    }));
-    return {};
+    return { stdout, stderr, exitCode };
+  }
+
+  /**
+   * command/exec：无线程/turn 的一次性命令（ChatGPT iOS 1.2026.258 起在发消息前
+   * 用它经 codex-read-only 只读包装探测 $HOME；此前同类探测走 process/spawn）。
+   * 契约（app-server-protocol v2/command_exec.rs + app-server command_exec.rs）：
+   * 最终结果直接作为 RPC 响应 {exitCode, stdout, stderr}；streamStdoutStderr 时
+   * 输出改经 command/exec/outputDelta 通知（base64、连接级定向）下发，最终响应
+   * 的 stdout/stderr 为空且流式字节不重复携带。返回 -32601 会让手机报
+   * 「Codex 服务器返回了错误」并进入 30 秒会话重建循环（2026-09-26 真机复现，
+   * frames.jsonl 17:12-17:14）。仿真策略与 process/spawn 一致：按脚本模式应答。
+   */
+  private commandExec(key: SimClientKey, p: AnyParams): unknown {
+    const command: string[] = Array.isArray(p.command) ? p.command : [];
+    const streamStdoutStderr = p.streamStdoutStderr === true;
+    const processId = typeof p.processId === "string" ? p.processId : null;
+    // 校验顺序对齐 command_exec.rs start()：先流式前置（159 行），后空命令（254 行）
+    if (!processId && (p.tty === true || p.streamStdin === true || streamStdoutStderr)) {
+      throw new SimMethodError(-32600, "command/exec tty or streaming requires a client-supplied processId");
+    }
+    if (command.length === 0) {
+      throw new SimMethodError(-32600, "command must not be empty");
+    }
+    // codex-read-only 包装：["/bin/sh","-c","printf '\0'; exec \"$@\"",arg0,
+    // "/bin/sh","-lc",<内层脚本>]——外壳先输出 NUL 再 exec 内层，仿真保持同形状
+    let script = command.join(" ");
+    let nulPrefix = false;
+    if (
+      command.length === 7 && command[3] === "codex-read-only" && command[5] === "-lc" &&
+      typeof command[6] === "string"
+    ) {
+      script = command[6];
+      nulPrefix = typeof command[2] === "string" && command[2].includes("printf '\\0'");
+    }
+    const emulated = this.emulateShellScript(script);
+    const stdout = nulPrefix ? `\0${emulated.stdout}` : emulated.stdout;
+    const capBytes = typeof p.outputBytesCap === "number" && Number.isFinite(p.outputBytesCap) &&
+      p.outputBytesCap >= 0
+      ? p.outputBytesCap
+      : null;
+    // cap 按字节截断（真实实现按输出字节计；仿真输出为 ASCII 时与字符截断一致）
+    const capText = (text: string): string =>
+      capBytes === null ? text : Buffer.from(text, "utf8").subarray(0, capBytes).toString("utf8");
+    const stdoutCapped = capText(stdout);
+    const stderrCapped = capText(emulated.stderr);
+    if (streamStdoutStderr && processId) {
+      const emitDelta = (stream: "stdout" | "stderr", text: string): void => {
+        if (!text) return;
+        this.emit("event", {
+          method: "command/exec/outputDelta",
+          params: {
+            processId,
+            stream,
+            deltaBase64: Buffer.from(text, "utf8").toString("base64"),
+            capReached: false,
+          },
+          target: key,
+        });
+      };
+      emitDelta("stdout", stdoutCapped);
+      emitDelta("stderr", stderrCapped);
+      return { exitCode: emulated.exitCode, stdout: "", stderr: "" };
+    }
+    return { exitCode: emulated.exitCode, stdout: stdoutCapped, stderr: stderrCapped };
+  }
+
+  /**
+   * command/exec/write：sim 的 exec 为同步仿真完成、无常驻会话，参数校验对齐
+   * command_exec.rs write（缺 deltaBase64 且未 closeStdin → -32602），随后按
+   * send_control 语义报无活动进程（-32600）。
+   */
+  private commandExecWrite(p: AnyParams): unknown {
+    if (typeof p.deltaBase64 !== "string" && p.closeStdin !== true) {
+      throw new SimMethodError(-32602, "command/exec/write requires deltaBase64 or closeStdin");
+    }
+    throw noActiveCommandExec(p.processId);
+  }
+
+  private commandExecTerminate(p: AnyParams): unknown {
+    throw noActiveCommandExec(p.processId);
+  }
+
+  private commandExecResize(p: AnyParams): unknown {
+    const size = p.size;
+    const rows = typeof size === "object" && size !== null ? (size as { rows?: unknown }).rows : undefined;
+    const cols = typeof size === "object" && size !== null ? (size as { cols?: unknown }).cols : undefined;
+    if (rows === 0 || cols === 0) {
+      throw new SimMethodError(-32602, "command/exec size rows and cols must be greater than 0");
+    }
+    throw noActiveCommandExec(p.processId);
   }
 
   /**
@@ -1978,6 +2088,13 @@ class SimMethodError extends Error {
     super(message);
     this.name = "SimMethodError";
   }
+}
+
+/** 无活动 command/exec 会话的错误（文案对齐 command_exec.rs send_control，
+ * error_repr 为 serde JSON 字符串，即带引号的 processId）。 */
+function noActiveCommandExec(processId: unknown): SimMethodError {
+  const repr = typeof processId === "string" ? JSON.stringify(processId) : String(processId);
+  return new SimMethodError(-32600, `no active command/exec for process id ${repr}`);
 }
 
 /** input 数组归一化：[{type:"text", text, text_elements?}] → TextContent[]。 */

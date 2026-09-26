@@ -727,6 +727,14 @@ export class WhamTunnel extends EventEmitter {
         // 只发"已注册连接"（收到过该流请求）。未注册流（仅 ping/ack）不收通知副本，
         // 否则其副本占用全局未 ack 缓冲且永无 ack，会把活跃流饿死（真机截断根因）。
         if (!state.registered) continue;
+        // 连接级通知（command/exec/outputDelta 等）只投给发起连接，
+        // 对齐 codex send_server_notification_to_connection_and_wait
+        if (
+          event.target &&
+          (event.target.clientId !== state.clientId || event.target.streamId !== state.streamId)
+        ) {
+          continue;
+        }
         const clientState = this.app.clientState({ clientId: state.clientId, streamId: state.streamId });
         if (clientState.optOut.has(event.method)) continue;
         if (event.threadId && clientState.unsubscribed.has(event.threadId)) continue;
