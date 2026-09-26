@@ -109,7 +109,6 @@ export type AgentRuntimeStatusWithPairing = AgentRuntimeStatus & { pairing: Pair
 
 /** S04 吊销复核最大轮数（收敛上限）。 */
 const REVOKE_RECHECK_ROUNDS = 3;
-const DISABLE_RECOVERY_HINT = "先登录使 enroll 成功后再 disable";
 
 /** 启动/重启在 stopping 或实例代次失效时主动取消（BLOCKER 1）。 */
 class InstanceCancelledError extends Error {
@@ -729,15 +728,29 @@ export class CgrcbDaemon {
   }
 
   /**
-   * disable 中止后恢复实例：resume 配对并重建隧道（S02 监管者接管），保持 enabled。
-   * 实例已在则重建；未注册/不可达则落 failed 并由退避重启继续尝试。
+   * disable 中止后恢复实例。
+   * - `restart=true`（有可用身份记录：内存快照或磁盘 enrollment.json）→ resume 配对并重建隧道，
+   *   由 S02 监管者接管恢复在线；
+   * - `restart=false`（无身份记录 = 历史不明/记录丢失）→ 保持停止态，**绝不 fresh-enroll**
+   *   （B-1：否则可能铸新 environment，下次 disable 只吊销新环境、旧 client 遗留），
+   *   清退避重启定时器避免后台补跑。
    */
-  private async restoreAfterAbort(id: string): Promise<void> {
+  private async restoreAfterAbort(id: string, restart: boolean): Promise<void> {
     const pairing = this.pairings.get(id);
-    pairing?.resume();
     const inst = this.instances.get(id);
-    if (!inst || this.stopping) return;
+    if (!inst || this.stopping) {
+      pairing?.resume();
+      return;
+    }
     this.clearRestartTimer(inst);
+    if (!restart) {
+      inst.tunnel = null;
+      inst.app = null;
+      inst.status = "failed";
+      inst.error = "disable 已中止：缺少可用身份记录，实例保持停止（避免 fresh-enroll）";
+      return;
+    }
+    pairing?.resume();
     inst.tunnel = null;
     inst.app = null;
     inst.status = "failed";
@@ -752,17 +765,28 @@ export class CgrcbDaemon {
   /**
    * disable 成功收尾（第 (e) 步收敛后）：enabled=false、停实例、清 pairing.json、
    * 释放 PairingManager。
+   * - B-4：吊销已收敛、仅 config 写盘失败 → 恢复实例在线（config 语义仍 enabled=true）并报错供重试。
+   * - B-3：清盘前先 suspend 排空在途写，避免在途 rename 在 rm 之后落盘复活。
    */
   private async finalizeDisable(
     id: string,
     inst: InstanceRuntime | undefined,
     wasEnabled: boolean,
+    hasIdentity: boolean,
   ): Promise<void> {
     if (wasEnabled) {
-      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
+      try {
+        await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
+      } catch (err) {
+        await this.restoreAfterAbort(id, hasIdentity);
+        throw new Error(
+          `[${id}] 禁用配置写盘失败，已恢复实例（保持 enabled），可重试：${errorMessage(err)}`,
+        );
+      }
     }
     const pairing = this.pairings.get(id);
     if (pairing) {
+      await pairing.suspend(); // B-3：排空在途写后再清盘
       pairing.dispose();
       this.pairings.delete(id);
     }
@@ -882,47 +906,64 @@ export class CgrcbDaemon {
       return { ok: true, data: await this.agentStatus(id) };
     }
 
-    // (a) 停发新码 / 作废在途配对操作
-    this.pairings.get(id)?.suspend();
+    // (a) 停发新码 / 作废在途配对操作（B-3：排空在途写后才继续）
+    const pairing = this.pairings.get(id);
+    if (pairing) {
+      await pairing.suspend();
+    }
 
     // 内存 enrollment 快照（停隧道前捕获；tunnel.stop 不清空 enrollment）
     const memoryEnrollment = inst?.tunnel?.enrollmentSnapshot ?? null;
+    // 磁盘 enrollment.json（吊销只需 environment_id+账号鉴权，不看 token 过期）
+    const diskEnrollment = await readEnrollmentFile(dir);
+    const hasIdentity = !!(
+      memoryEnrollment?.environment_id || diskEnrollment?.environment_id
+    );
 
-    // (b) 停 WSS 隧道；保留 inst 引用以便中止后恢复
+    // (b) 停 WSS 隧道；无法确认停妥（stop 抛错，如 app.close 抛错 → WS 可能仍在线）→
+    // 中止 disable，避免在服务仍在线时误报"吊销成功"（B-2）。
     if (inst?.tunnel) {
+      let stopError: unknown = null;
       try {
         await inst.tunnel.stop();
       } catch (err) {
+        stopError = err;
         this.logLine(`[${id}] 停隧道失败: ${errorMessage(err)}`);
       }
       inst.status = "stopping";
+      if (stopError) {
+        await this.restoreAfterAbort(id, hasIdentity);
+        throw new Error(
+          `[${id}] 无法确认隧道已停妥，已中止 disable（保持 enabled）：${errorMessage(stopError)}`,
+        );
+      }
     }
 
     // (c) 定位 environment_id
-    const diskEnrollment = await readEnrollmentFile(dir);
     const environmentId = memoryEnrollment?.environment_id ?? diskEnrollment?.environment_id ?? null;
 
     if (!environmentId) {
       const lifecycle = await readLifecycle(paths.lifecycle);
       if (lifecycle && lifecycle.everEnrolled === false) {
         // 该实例从未成功 enroll（跨 daemon 重启成立）→ 无可吊销对象
-        await this.finalizeDisable(id, inst, wasEnabled);
+        await this.finalizeDisable(id, inst, wasEnabled, false);
         return { ok: true, data: await this.agentStatus(id) };
       }
-      await this.restoreAfterAbort(id);
+      // B-1：无可用身份记录 → 保持停止态，绝不 fresh-enroll 兜底
+      await this.restoreAfterAbort(id, false);
       const reason =
         lifecycle === null
           ? "lifecycle.json 缺失/损坏（历史不明）"
           : `everEnrolled=${lifecycle.everEnrolled} 但 enrollment.json 丢失`;
       throw new Error(
-        `[${id}] 无法定位 environment_id（${reason}），已中止 disable（保持 enabled）。` +
-          `恢复路径：${DISABLE_RECOVERY_HINT}。`,
+        `[${id}] 无法定位 environment_id（${reason}），已中止 disable（保持 enabled，实例保持停止）。` +
+          `恢复路径：先登录使 enroll 成功后再 disable，或恢复 enrollment.json 后重试。`,
       );
     }
 
     // (d)+(e) 账号鉴权吊销 + 复核轮
     if (!this.authManager) {
-      await this.restoreAfterAbort(id);
+      await this.restoreAfterAbort(id, hasIdentity);
       throw new Error(`[${id}] daemon 未就绪，已中止 disable（保持 enabled）`);
     }
     const client = new WhamClient({
@@ -934,20 +975,20 @@ export class CgrcbDaemon {
     try {
       converged = await this.revokeEnvironmentClients(client, id, environmentId);
     } catch (err) {
-      await this.restoreAfterAbort(id);
+      await this.restoreAfterAbort(id, hasIdentity);
       throw new Error(
         `[${id}] 吊销失败，已中止 disable（保持 enabled）：${errorMessage(err)}`,
       );
     }
     if (!converged) {
-      await this.restoreAfterAbort(id);
+      await this.restoreAfterAbort(id, hasIdentity);
       throw new Error(
         `[${id}] 吊销未收敛（environment=${environmentId} 仍有已配对客户端），` +
           `已中止 disable（保持 enabled，可重试）`,
       );
     }
 
-    await this.finalizeDisable(id, inst, wasEnabled);
+    await this.finalizeDisable(id, inst, wasEnabled, hasIdentity);
     return { ok: true, data: await this.agentStatus(id) };
   }
 

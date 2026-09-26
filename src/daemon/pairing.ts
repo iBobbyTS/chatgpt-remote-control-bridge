@@ -77,10 +77,17 @@ export interface PairingManagerOptions {
   renewalCheckIntervalMs?: number;
   /** 时间源（测试注入）；默认 Date.now。 */
   now?: () => number;
+  /**
+   * 测试注入缝：`persist` 通过末次代次守卫后、真正写盘前的等待点。
+   * 用于验证 `suspend()` 会排空在途写（finalize 的清盘不会早于在途 rename）。
+   */
+  beforePersist?: () => Promise<void> | void;
 }
 
 const DEFAULT_CLAIM_POLL_MS = 2000;
 const DEFAULT_RENEWAL_CHECK_MS = 5000;
+/** WARN 环形上限（A-NIT1）。 */
+const MAX_WARNINGS = 200;
 
 /** 读取实例目录的 enrollment.json（容错；无/损坏/缺 environment_id 返回 null）。 */
 export async function readEnrollmentFile(
@@ -117,6 +124,8 @@ export class PairingManager {
   private clientsRefreshedAt: string | null = null;
   private timer: NodeJS.Timeout | null = null;
   private suspended = false;
+  /** S04 B-5：在线且无 pending 时仍欠一次自动发码（首次瞬时失败后由 tick 重试）。 */
+  private autoPairPending = false;
   private loadedFromDisk = false;
   private generation = 0;
   private opChain: Promise<unknown> = Promise.resolve();
@@ -185,8 +194,15 @@ export class PairingManager {
     return this.enqueue(async (gen) => {
       if (this.suspended || gen !== this.generation) return this.view();
       if (!this.safeEnabled() || !this.safeOnline()) return this.view();
-      if (this.pending && this.notExpired(this.pending)) return this.view();
-      await this.issueCode(gen, "online");
+      if (this.pending && this.notExpired(this.pending)) {
+        this.autoPairPending = false;
+        return this.view();
+      }
+      const ok = await this.issueCode(gen, "online");
+      if (gen === this.generation && !this.suspended) {
+        // B-5：首次发码瞬时失败 → 标记待重试，由 tick 在"在线 && 无 pending"时补齐
+        this.autoPairPending = !ok;
+      }
       return this.view();
     });
   }
@@ -201,11 +217,15 @@ export class PairingManager {
     });
   }
 
-  /** 停止续码/轮询并在途结果作废（disable 第 (a) 步）。 */
-  suspend(): void {
+  /**
+   * 停止续码/轮询并在途结果作废（disable 第 (a) 步）。
+   * B-3：置位后**排空在途写操作**（opChain）才返回，保证 finalize 的清盘不早于在途 rename。
+   */
+  async suspend(): Promise<void> {
     this.generation += 1;
     this.suspended = true;
     this.stopTimer();
+    await this.opChain.catch(() => undefined);
   }
 
   /** 中止 disable 后恢复配对（保持 enabled 的复位）。 */
@@ -276,9 +296,17 @@ export class PairingManager {
     if (this.suspended || gen !== this.generation) return;
     if (!this.safeEnabled() || !this.safeOnline()) return;
     const pending = this.pending;
-    if (!pending) return;
+    if (!pending) {
+      // B-5：在线、无 pending 且欠一次自动发码（首次瞬时失败）→ 每 tick 重试
+      if (this.autoPairPending) {
+        const ok = await this.issueCode(gen, "retry");
+        if (gen === this.generation && !this.suspended) this.autoPairPending = !ok;
+      }
+      return;
+    }
     if (!this.notExpired(pending)) {
-      await this.issueCode(gen, "expiry");
+      const ok = await this.issueCode(gen, "expiry");
+      if (gen === this.generation && !this.suspended) this.autoPairPending = !ok;
       return;
     }
     await this.pollClaim(gen, pending);
@@ -317,6 +345,7 @@ export class PairingManager {
       token,
     };
     this.claimed = false;
+    this.autoPairPending = false;
     if (response.environment_id) {
       this.environmentId = response.environment_id;
     }
@@ -356,6 +385,11 @@ export class PairingManager {
 
   private async persist(gen: number): Promise<void> {
     if (this.suspended || gen !== this.generation || !this.pending) return;
+    // 测试注入缝：此处的等待点位于末次代次守卫之后、真正 rename 之前，
+    // 模拟"写盘已在途"；suspend() 必须排空它，finalize 才能安全清盘。
+    if (this.opts.beforePersist) {
+      await this.opts.beforePersist();
+    }
     await writeJsonAtomic(this.pairingPath, this.pending);
   }
 
@@ -427,6 +461,10 @@ export class PairingManager {
 
   private warn(line: string): void {
     this.warnings.push(line);
+    // A-NIT1：仅保留最近 200 条，防长期运行内存/status 膨胀
+    if (this.warnings.length > MAX_WARNINGS) {
+      this.warnings.splice(0, this.warnings.length - MAX_WARNINGS);
+    }
     this.log(`WARN ${line}`);
   }
 }

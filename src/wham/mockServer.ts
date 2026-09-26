@@ -62,16 +62,20 @@ export interface MockWhamOptions {
   forceClientPageSize?: number;
   /**
    * 每次 GET clients 计算完页面、回响应前回调（测试注入时序，如"末页 list 之后才 claim"）。
-   * 回调可新建 client（S04 AC6 复核轮捕获）。
+   * `cursor` = **该请求携带的 cursor**（null=首页）；`responseCursor` = 本次响应返回的下一页游标
+   * （null=末页）。回调可新建 client（S04 AC6 复核轮捕获）。
    */
   afterListClients?: (info: {
     environmentId: string;
     cursor: string | null;
+    responseCursor: string | null;
     pageSize: number;
     requestIndex: number;
   }) => void | Promise<void>;
   /** 前 N 次 DELETE clients 返回 500（测试注入 S04 吊销失败）。 */
   revokeFailuresRemaining?: number;
+  /** 前 N 次 pair 返回 500（测试注入 S04 自动发码瞬时失败 → tick 重试）。 */
+  pairFailuresRemaining?: number;
   log?: (line: string) => void;
 }
 
@@ -159,14 +163,18 @@ export class MockWhamServer {
     headers: Record<string, string>;
     response: unknown;
   }> = [];
-  /** pair/status 请求记录（测试断言轮询所用 token）。 */
+  /** pair/status 请求记录（测试断言轮询所用 token 与是否成功）。 */
   readonly pairStatusRequests: Array<{
     body: unknown;
     headers: Record<string, string>;
     claimed: boolean;
+    /** HTTP 2xx = true；401（token 过期/未知）等 = false（AC5 断言新 token 轮询成功）。 */
+    ok: boolean;
   }> = [];
   /** 剩余强制失败的 DELETE 次数（测试注入吊销失败；运行期可改）。 */
   revokeFailuresRemaining = 0;
+  /** 剩余强制失败的 pair 次数（测试注入发码失败；运行期可改）。 */
+  pairFailuresRemaining = 0;
   private listRequestCount = 0;
 
   constructor(opts: MockWhamOptions) {
@@ -179,6 +187,7 @@ export class MockWhamServer {
 
   async start(): Promise<void> {
     this.revokeFailuresRemaining = this.opts.revokeFailuresRemaining ?? 0;
+    this.pairFailuresRemaining = this.opts.pairFailuresRemaining ?? 0;
     const address = await new Promise<string>((resolve, reject) => {
       this.server = createServer((req, res) => {
         void this.handleRest(req, res);
@@ -214,6 +223,11 @@ export class MockWhamServer {
       clearTimeout(p.timer);
     }
     this.pending.clear();
+    // 终止所有活动客户端 socket（含故障注入场景下 daemon 侧未在 codexSocket 引用的旧连接），
+    // 避免测试进程因残留句柄不退出。
+    for (const client of this.wss?.clients ?? []) {
+      client.terminate();
+    }
     this.codexSocket?.close();
     this.wss?.close();
     await new Promise<void>((resolve) => this.server?.close(() => resolve()));
@@ -319,6 +333,12 @@ export class MockWhamServer {
         return;
       }
       const request = JSON.parse(body) as { manual_code: boolean };
+      if (this.pairFailuresRemaining > 0) {
+        this.pairFailuresRemaining -= 1;
+        this.pairRequests.push({ body: request, headers: headerRecord(req), response: { error: "injected_pair_failure" } });
+        await this.replyJson(res, { error: "injected_pair_failure" }, 500);
+        return;
+      }
       const manualCode = request.manual_code ? this.nextManualCode() : null;
       if (manualCode) {
         this.pendingPairings.set(manualCode, {
@@ -345,24 +365,26 @@ export class MockWhamServer {
       };
       const manual = request.manual_pairing_code;
       if (manual !== undefined) {
-        // S04 claim 轮询：只传 manualPairingCode + remoteControlToken（校验 token 新鲜度）
+        // S04 claim 轮询：只传 manualPairingCode + remoteControlToken。
+        // token 已轮换时旧 token 一律 401（pairStatusRequests.ok=false 供 AC5 断言）。
         if (!this.remoteControlTokenIsValid(bearer)) {
           this.pairStatusRequests.push({
             body: request,
             headers: headerRecord(req),
             claimed: false,
+            ok: false,
           });
           await this.replyJson(res, { error: "invalid_token" }, 401);
           return;
         }
         const claimed = this.pendingPairings.get(manual)?.claimed ?? false;
-        this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed });
+        this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed, ok: true });
         this.log(`pair/status: ${body} → ${JSON.stringify({ claimed })}`);
         await this.replyJson(res, { claimed });
         return;
       }
       // 兼容旧探测语义：无 manual code → claimed=true（手机端就是 mock 自己）
-      this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed: true });
+      this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed: true, ok: true });
       this.log(`pair/status: ${body} → {"claimed":true}`);
       await this.replyJson(res, { claimed: true });
       return;
@@ -483,6 +505,7 @@ export class MockWhamServer {
       await this.opts.afterListClients({
         environmentId,
         cursor: url.searchParams.get("cursor"),
+        responseCursor: cursor,
         pageSize: page.length,
         requestIndex: this.listRequestCount,
       });
