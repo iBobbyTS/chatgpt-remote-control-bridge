@@ -155,8 +155,13 @@ export class MockWhamServer {
   readonly receivedServerRequests: Array<{ method: string; params: unknown }> = [];
   /** 收到的 server_message 帧 seq_id 序列（按到达顺序）。 */
   readonly receivedSeqIds: number[] = [];
-  /** 收到的 pong 帧（心跳断言用）。 */
-  readonly receivedPongs: Array<{ client_id: string; stream_id: string; status?: string }> = [];
+  /** 收到的 pong 帧（心跳断言用）；seq_id 供重放/seq 连续性断言（pong 也占 per-stream seq）。 */
+  readonly receivedPongs: Array<{
+    client_id: string;
+    stream_id: string;
+    status?: string;
+    seq_id?: number;
+  }> = [];
   /** clients 管理端点每次请求（CLI/测试断言分页参数与鉴权头）。 */
   readonly clientsRequests: Array<{
     method: "GET" | "DELETE";
@@ -783,8 +788,9 @@ export class MockWhamServer {
           client_id: envelope.client_id,
           stream_id: envelope.stream_id,
           status: envelope.status,
+          seq_id: envelope.seq_id,
         });
-        this.log(`pong (status=${envelope.status ?? "?"})`);
+        this.log(`pong (status=${envelope.status ?? "?"}, seq_id=${envelope.seq_id ?? "?"})`);
         return;
       case "ack":
         this.log(`ack（服务器方向的 ack，一般不出现）: seq_id=${envelope.seq_id}`);

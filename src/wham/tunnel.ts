@@ -10,14 +10,16 @@
  *    authorization=Bearer <remote_control_token> / x-codex-installation-id）
  * - 信封层（对齐 protocol.rs，方向以 codex 视角）：
  *   收 ClientEnvelope（client_message / client_message_chunk / ack / ping / client_closed），
- *   发 ServerEnvelope（server_message 带 per-(client,stream) 递增 seq_id / pong）。
+ *   发 ServerEnvelope（server_message / pong，均带 per-(client,stream) 递增 seq_id）。
  * - 通知 fan-out：跳过 initialize 时 capabilities.optOutNotificationMethods 声明的方法
  *   与 thread/unsubscribe 过的线程（由 AgentApp.clientState 提供状态）。
  * - 重连：WS 断开后延迟重连；token 临近过期则续期。
- * - 出站可靠层（对齐 websocket.rs BoundedOutboundBuffer/背压）：server_message 先入每流
- *   pending，WS open 且全局未 ack 缓冲 < 128 时分配 seq、入缓冲并发送；ack 清除 seq ≤ 游标
- *   的缓冲帧并排空 pending；重连先按原 seq 重放缓冲再补发 pending（seq 单调连续）。pending
- *   每流上限 256，溢出先合并相邻同 itemId delta，仍溢出才丢最旧（未分配 seq，无空洞）。
+ * - 出站可靠层（对齐 websocket.rs BoundedOutboundBuffer/背压）：所有 ServerEnvelope
+ *   （server_message 与 pong 一视同仁，对齐 codex websocket.rs:101/:1062）先入每流 pending，
+ *   WS open 且全局未 ack 缓冲 < 128 时分配 seq、入缓冲并发送；ack 清除 seq ≤ 游标的缓冲帧，
+ *   并按轮询跨流排空所有流的 pending（B1：容量释放后他流积压不得滞留）；重连先按原 seq
+ *   重放缓冲（含 pong）再补发 pending（seq 单调连续）。pending 每流上限 256，溢出先合并
+ *   相邻同 itemId delta（pong 不合并），仍溢出才丢最旧（未分配 seq，无空洞）。
  *   订阅游标：任意入站信封 cursor last-writer-wins，重连握手带 x-codex-subscribe-cursor。
  *
  * 与具体下游解耦：只依赖 AgentApp 接口（src/agents/types.ts）。
@@ -97,15 +99,24 @@ const OUTBOUND_BUFFER_CAPACITY = 128;
 /** 每流 pending（未分配 seq）上限；溢出先合并相邻同 itemId delta，仍溢出才丢最旧。 */
 const OUTBOUND_PENDING_CAPACITY = 256;
 
+/**
+ * pending 队列元素：server_message 载荷或 pong。两者走同一有界可靠层（对齐 codex
+ * websocket.rs：所有 ServerEnvelope 含 pong 统一入有界缓冲、共享 per-stream seq、
+ * 重连原样重放）；pong 无 delta 语义，故不参与相邻 delta 合并。
+ */
+type PendingEvent =
+  | { kind: "server_message"; message: unknown }
+  | { kind: "pong"; status: "active" | "unknown" };
+
 interface StreamState {
   clientId: string;
   streamId: string;
   lastAckedSeq: number;
   sentSeq: number;
-  /** 已发送未 ack 的 server_message 帧（seq 升序、整帧含 seq_id）：重连时原样重放。 */
+  /** 已发送未 ack 的出站帧（seq 升序、整帧含 seq_id）：重连时原样重放（含 pong）。 */
   buffer: Array<{ seq: number; frame: Record<string, unknown> }>;
-  /** WS 未就绪/缓冲满时暂存的 server_message 载荷（未分配 seq，可合并/丢弃）。 */
-  pending: unknown[];
+  /** WS 未就绪/缓冲满时暂存的出站事件（未分配 seq，server_message 可合并/丢弃）。 */
+  pending: PendingEvent[];
 }
 
 /** item/agentMessage/delta 通知的合并判据（同 itemId 的相邻 delta 文本可拼接）。 */
@@ -524,9 +535,11 @@ export class WhamTunnel extends EventEmitter {
       case "ack": {
         const state = this.streamState(envelope);
         state.lastAckedSeq = Math.max(state.lastAckedSeq, envelope.seq_id ?? 0);
-        // 清除已确认的缓冲帧，再按序排空 pending（缓冲有空位即分配 seq 发送）
+        // 清除已确认的缓冲帧，再按轮询跨流排空 pending（缓冲有空位即分配 seq 发送）。
+        // B1：不能只排空本流——他流在全局背压期间积压的 pending 会因本流 ack 释放的
+        // 空位无人认领而永久滞留。
         this.removeAcked(state, state.lastAckedSeq);
-        this.drainPending(state);
+        this.drainPendingAcrossStreams();
         return;
       }
       case "ping": {
@@ -656,10 +669,12 @@ export class WhamTunnel extends EventEmitter {
   }
 
   /**
-   * 出站可靠层入口：server_message 一律先入 pending，再按序排空。
+   * 出站可靠层入口：所有 ServerEnvelope（server_message 与 pong）一律先入 pending，再按序排空。
    * - WS open 且缓冲有空位 → 立即分配 seq、入未 ack 缓冲、发送；
-   * - WS 未开或缓冲满（背压）→ 留在 pending（不分配 seq、不发送、不丢弃）；
-   * pong 永不缓冲/pending（连接未就绪即丢弃，维持现状）。
+   * - WS 未开或缓冲满（背压）→ 留在 pending（不分配 seq、不发送、不丢弃）。
+   * B2 修复：旧计划"pong 不入缓冲、连接未就绪即丢"的偏差作废，pong 与 server_message 同走
+   * 此路径（对齐 codex 蓝本：所有 ServerEnvelope 统一入有界缓冲）。否则 pong 在断线后丢失，
+   * 重放只剩 server_message，per-stream seq 出现空洞，违反"seq 连续、重放不改 seq"合同。
    */
   private sendEnvelope(
     clientId: string,
@@ -673,32 +688,17 @@ export class WhamTunnel extends EventEmitter {
       this.log(`! stop 后丢弃出站帧: ${event.type}`);
       return;
     }
-    if (event.type === "pong") {
-      const ws = this.ws;
-      if (!ws || ws.readyState !== WebSocket.OPEN) {
-        this.log(`! 发送失败（连接未就绪）: ${event.type}`);
-        return;
-      }
-      const state = this.streamState({ client_id: clientId, stream_id: streamId });
-      state.sentSeq += 1;
-      const frame = {
-        type: "pong",
-        client_id: clientId,
-        stream_id: streamId,
-        seq_id: state.sentSeq,
-        status: event.status,
-      };
-      ws.send(JSON.stringify(frame));
-      this.logFrame("agent→wham", frame);
-      return;
-    }
     const state = this.streamState({ client_id: clientId, stream_id: streamId });
-    state.pending.push(event.message);
+    state.pending.push(
+      event.type === "pong"
+        ? { kind: "pong", status: event.status }
+        : { kind: "server_message", message: event.message },
+    );
     this.enforcePendingCap(state);
     this.drainPending(state);
   }
 
-  /** 重连/首连：按 seq 顺序原样重放各流未 ack 缓冲帧（不重置 sentSeq），再排空 pending。 */
+  /** 重连/首连：按 seq 顺序原样重放各流未 ack 缓冲帧（含 pong，不重置 sentSeq），再跨流排空 pending。 */
   private replayBuffered(): void {
     const ws = this.ws;
     if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -707,8 +707,8 @@ export class WhamTunnel extends EventEmitter {
         ws.send(JSON.stringify(entry.frame));
         this.logFrame("agent→wham", entry.frame);
       }
-      this.drainPending(state);
     }
+    this.drainPendingAcrossStreams();
   }
 
   /** 移除 seq ≤ ackedSeq 的缓冲帧（ack 游标清除；未 ack 帧永不丢弃）。 */
@@ -719,31 +719,72 @@ export class WhamTunnel extends EventEmitter {
     state.buffer = remaining;
   }
 
-  /** 按序排空 pending：缓冲有空位即分配 seq、入缓冲、发送（保持单调连续）。 */
+  /** 按序排空本流 pending：缓冲有空位即分配 seq、入缓冲、发送（保持单调连续）。 */
   private drainPending(state: StreamState): void {
     const ws = this.ws;
     if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
     while (state.pending.length > 0 && this.bufferedUsed < OUTBOUND_BUFFER_CAPACITY) {
-      const message = state.pending.shift();
-      state.sentSeq += 1;
-      const frame = {
-        type: "server_message",
-        client_id: state.clientId,
-        stream_id: state.streamId,
-        seq_id: state.sentSeq,
-        message,
-      };
-      state.buffer.push({ seq: state.sentSeq, frame });
-      this.bufferedUsed += 1;
-      ws.send(JSON.stringify(frame));
-      this.logFrame("agent→wham", frame);
+      this.drainOne(state);
     }
   }
 
   /**
-   * pending 溢出闭环（内存有界）：先合并相邻且同 itemId 的 item/agentMessage/delta
-   * （delta 文本拼接，不丢内容），仍超上限才丢最旧未发送事件（未分配 seq → 无 seq 空洞），
-   * 记 WARN。已发送未 ack 缓冲永不经过此路径。
+   * 跨流公平排空（容量释放路径：ack / 重连重放后）：全局缓冲仍有余位时，按 streams
+   * 插入序轮询，逐流每次最多补一帧，直到容量耗尽或所有 pending 清空。
+   *
+   * B1：从前只在 ack 的流上 drainPending，全局背压期间进入他流 pending 的事件（该流
+   * 无新事件/ack/重连）会永久滞留。轮询而非"逐流一次性灌满"保证公平——任一流的
+   * pending 都不会独占刚释放的空位而饿死他流；循环条件恒检 bufferedUsed < 128，
+   * 绝不越过全局上限。
+   */
+  private drainPendingAcrossStreams(): void {
+    const ws = this.ws;
+    if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+    // 快照插入序：drainOne 不新增/删除流，轮询序在本方法内稳定
+    const states = [...this.streams.values()];
+    let progressed = true;
+    while (progressed && this.bufferedUsed < OUTBOUND_BUFFER_CAPACITY) {
+      progressed = false;
+      for (const state of states) {
+        if (state.pending.length === 0) continue;
+        if (this.bufferedUsed >= OUTBOUND_BUFFER_CAPACITY) break;
+        this.drainOne(state);
+        progressed = true;
+      }
+    }
+  }
+
+  /** 取 pending 首帧分配 seq、入未 ack 缓冲并发送（调用方须保证 WS open 且缓冲有余位）。 */
+  private drainOne(state: StreamState): void {
+    const ws = this.ws!;
+    const event = state.pending.shift()!;
+    state.sentSeq += 1;
+    const frame: Record<string, unknown> =
+      event.kind === "pong"
+        ? {
+            type: "pong",
+            client_id: state.clientId,
+            stream_id: state.streamId,
+            seq_id: state.sentSeq,
+            status: event.status,
+          }
+        : {
+            type: "server_message",
+            client_id: state.clientId,
+            stream_id: state.streamId,
+            seq_id: state.sentSeq,
+            message: event.message,
+          };
+    state.buffer.push({ seq: state.sentSeq, frame });
+    this.bufferedUsed += 1;
+    ws.send(JSON.stringify(frame));
+    this.logFrame("agent→wham", frame);
+  }
+
+  /**
+   * pending 溢出闭环（内存有界）：先合并相邻且同 itemId 的 server_message delta
+   * （delta 文本拼接，不丢内容；pong 不参与合并），仍超上限才丢最旧未发送事件
+   * （未分配 seq → 无 seq 空洞），记 WARN。已发送未 ack 缓冲永不经过此路径。
    */
   private enforcePendingCap(state: StreamState): void {
     if (state.pending.length <= OUTBOUND_PENDING_CAPACITY) return;
@@ -766,27 +807,29 @@ export class WhamTunnel extends EventEmitter {
 
   /** 把 pending 中相邻（队列位置相邻）且同 itemId 的 delta 合并为一条，返回合并次数。 */
   private mergeAdjacentDeltas(state: StreamState): number {
-    const merged: unknown[] = [];
+    const merged: PendingEvent[] = [];
     let count = 0;
-    for (const message of state.pending) {
+    for (const event of state.pending) {
       const previous = merged.at(-1);
-      if (previous !== undefined && this.mergeDeltaInto(previous, message)) {
+      if (previous !== undefined && this.mergeDeltaInto(previous, event)) {
         count += 1;
         continue;
       }
-      merged.push(message);
+      merged.push(event);
     }
     state.pending = merged;
     return count;
   }
 
-  /** 把 next 的 delta 文本并入 previous（同 itemId）；成功返回 true。 */
-  private mergeDeltaInto(previous: unknown, next: unknown): boolean {
-    const a = deltaNotification(previous);
-    const b = deltaNotification(next);
+  /** 把 next 的 delta 文本并入 previous（同 itemId 的 server_message）；成功返回 true。 */
+  private mergeDeltaInto(previous: PendingEvent, next: PendingEvent): boolean {
+    // pong 无 delta 语义：任一非 server_message 都不合并
+    if (previous.kind !== "server_message" || next.kind !== "server_message") return false;
+    const a = deltaNotification(previous.message);
+    const b = deltaNotification(next.message);
     if (!a || !b || a.itemId !== b.itemId) return false;
-    const target = previous as { params?: unknown; emittedAtMs?: unknown };
-    const source = next as { params: Record<string, unknown>; emittedAtMs?: unknown };
+    const target = previous.message as { params?: unknown; emittedAtMs?: unknown };
+    const source = next.message as { params: Record<string, unknown>; emittedAtMs?: unknown };
     target.params = { ...source.params, delta: a.delta + b.delta };
     if (source.emittedAtMs !== undefined) {
       target.emittedAtMs = source.emittedAtMs;

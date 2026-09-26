@@ -1273,6 +1273,87 @@ test("T8 stop：迟到出站帧丢弃不抛错、无帧发送、缓冲已清", a
   }
 });
 
+test("B1 跨流 pending 公平排空：全局满时流 B 积压，ack 流 A 后流 B pending 仍被发出", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  const streamA = server.mobileStreamId;
+  const streamB = randomUUID();
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }, 5000, streamA); // 流 A seq 1
+
+    // 仅流 A 存在时灌满全局未 ack 缓冲（1 响应 + 127 通知 = 128），无 pending
+    for (let i = 0; i < 127; i += 1) {
+      app.emit("event", { method: `b1/fill/${i}`, params: {} } satisfies AgentNotification);
+    }
+    await waitFor(() => tunnel.outboundBacklog().buffered === 128, 5000);
+    assert.equal(tunnel.outboundBacklog().pending, 0, "灌满阶段不应有 pending");
+
+    // 背压后创建流 B：其响应无法分配 seq → 进入流 B pending（此时流 A 无 pending）
+    server.sendClientEnvelope({
+      type: "client_message",
+      client_id: server.mobileClientId,
+      stream_id: streamB,
+      message: { jsonrpc: "2.0", id: 9001, method: "echoB", params: {} },
+    });
+    await waitFor(() => tunnel.outboundBacklog().pending === 1, 3000, "流 B 应进入 pending");
+    assert.equal(server.receivedSeqIds.length, 128, "流 B 未 ack 前不得发出新帧（背压）");
+
+    // ack 流 A 到其最大 seq（128）→ 释放全局容量。B1 缺陷：只排空流 A（无 pending），
+    // 流 B 的 pending 因无人认领空位而永久滞留。
+    server.ack(128, streamA);
+    await waitFor(() => tunnel.outboundBacklog().pending === 0, 3000, "跨流排空失败：流 B pending 滞留");
+    await waitFor(() => server.receivedSeqIds.length > 128, 3000, "流 B 的 pending 应被发出");
+    assert.ok(tunnel.outboundBacklog().buffered <= 128, "不得越过全局 128 上限");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("B2 pong 入缓冲重放：通知+pong 交错断线重连后重放含 pong 且 seq 连续无空洞", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server, reconnectDelayMs: 25 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }); // 默认流 seq 1
+
+    app.emit("event", { method: "b2/n1", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.receivedSeqIds.includes(2), 5000, "通知 n1 未发出（seq 2）");
+
+    server.sendPing(); // pong 与 server_message 共享 per-stream seq → seq 3
+    await waitFor(() => server.receivedPongs.length >= 1, 5000, "pong 未发出");
+    assert.equal(server.receivedPongs[0]!.seq_id, 3, "pong 应分配 per-stream seq");
+
+    app.emit("event", { method: "b2/n2", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.receivedSeqIds.includes(4), 5000, "通知 n2 未发出（seq 4）");
+    assert.equal(tunnel.outboundBacklog().buffered, 4, "响应 + pong + 两通知均入未 ack 缓冲");
+
+    const seqIdsBefore = server.receivedSeqIds.length;
+    const pongsBefore = server.receivedPongs.length;
+
+    server.dropCodexSocket();
+    await waitReconnect(server, tunnel);
+
+    // 重放：pong 必须与 server_message 一起按原 seq 重发。B2 缺陷：pong 不入缓冲 →
+    // 重连只重放 server_message（1、2、4），seq 3 空洞。
+    await waitFor(() => server.receivedPongs.length > pongsBefore, 5000, "重连未重放 pong");
+    await waitFor(() => server.receivedSeqIds.length > seqIdsBefore, 5000, "重连未重放 server_message");
+    const replayedSeqs = uniqueSortedSeqs([
+      ...server.receivedSeqIds.slice(seqIdsBefore),
+      ...server.receivedPongs.slice(pongsBefore).map((p) => p.seq_id ?? -1),
+    ]);
+    assertContiguousSeqs(replayedSeqs, "B2 重放序列（含 pong）");
+    assert.deepEqual(replayedSeqs, [1, 2, 3, 4], "重放应覆盖整段未 ack 缓冲（含 pong），seq 全序无空洞");
+    assert.equal(tunnel.outboundBacklog().buffered, 4, "重放不得清空未 ack 缓冲");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs = 5000, label?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
