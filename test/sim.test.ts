@@ -1,11 +1,14 @@
 /**
- * 模拟层回环测试：SimWhamServer（桥被控端）↔ MockWhamServer（扮演 wham 后端 + 手机端）。
+ * 模拟层回环测试：WhamTunnel（桥被控端，直连）↔ MockWhamServer（扮演 wham 后端 + 手机端）。
  *
  * 覆盖：enroll → WSS 握手 → initialize/thread/list/thread/start/turn/start
  * 的固定响应与通知事件流、seq 递增、interrupt、虚拟 FS、process/spawn。
+ *
+ * S03 迁移：SimWhamServer 适配层删除，harness 直接构造 SimApp + WhamTunnel
+ * （与 daemon 经注册表创建实例的接线一致）；断言语义与原测试完全一致。
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, after } from "node:test";
@@ -13,8 +16,9 @@ import { BridgeAuthManager } from "../src/auth/manager.ts";
 import { makeTestJwt } from "../src/auth/jwt.ts";
 import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import { MockWhamServer } from "../src/wham/mockServer.ts";
-import { SimApp } from "../src/sim/appServer.ts";
-import { SimWhamServer } from "../src/sim/server.ts";
+import { WhamTunnel } from "../src/wham/tunnel.ts";
+import { SimApp } from "../src/agents/sim/appServer.ts";
+import { simInit, simReset, simStatePath, simStoreInitialized } from "../src/agents/sim/store.ts";
 
 const cleanupDirs: string[] = [];
 after(async () => {
@@ -59,7 +63,7 @@ function fakeAuth(): AuthDotJson {
 
 interface Loop {
   mock: MockWhamServer;
-  sim: SimWhamServer;
+  tunnel: WhamTunnel;
   authHome: string;
 }
 
@@ -75,27 +79,30 @@ async function startLoop(): Promise<Loop> {
   });
   await mock.start();
 
-  const sim = new SimWhamServer({
+  const app = new SimApp({
+    codexHome: authHome,
+    stepDelayMs: 10,
+    deltaIntervalMs: 2,
+    deltaChars: 16,
+  });
+  const tunnel = new WhamTunnel({
     authManager,
+    app,
     baseUrl: `http://127.0.0.1:${mock.port}/backend-api`,
     reconnectDelayMs: 0,
+    installationDir: authHome,
     log: () => {},
-    app: new SimApp({
-      codexHome: authHome,
-      stepDelayMs: 10,
-      deltaIntervalMs: 2,
-      deltaChars: 16,
-    }),
+    agentLabel: "bridge-sim",
   });
   try {
-    await sim.start();
+    await tunnel.start();
   } catch (err) {
     await mock.stop();
     throw err;
   }
   // 等 WSS 建立
-  await waitFor(() => sim.connected, 5000, "sim wss 未连接");
-  return { mock, sim, authHome };
+  await waitFor(() => tunnel.connected, 5000, "sim wss 未连接");
+  return { mock, tunnel, authHome };
 }
 
 test("回环：initialize / thread/list（固定列表）/ thread/start / turn 事件流 / seq 递增", async () => {
@@ -215,7 +222,7 @@ test("回环：initialize / thread/list（固定列表）/ thread/start / turn �
       assert.ok(seqs[i]! > seqs[i - 1]!, `seq 递增失败: ${seqs[i - 1]} → ${seqs[i]}`);
     }
   } finally {
-    await loop.sim.stop();
+    await loop.tunnel.stop();
     await loop.mock.stop();
   }
 });
@@ -285,7 +292,7 @@ test("回环：interrupt → interrupted；steer 注入；queue 自动消费", a
     );
     assert.ok(queuedUserMsg, "排队消息应作为第二个 turn 的 userMessage 出现");
   } finally {
-    await loop.sim.stop();
+    await loop.tunnel.stop();
     await loop.mock.stop();
   }
 });
@@ -385,7 +392,7 @@ test("回环：fs 虚拟目录 + process/spawn mkdir 覆盖层", async () => {
     };
     assert.equal(meta.result.isDirectory, true);
   } finally {
-    await loop.sim.stop();
+    await loop.tunnel.stop();
     await loop.mock.stop();
   }
 });
@@ -498,9 +505,159 @@ test("回环：ephemeral 起名线程与零 turn 线程不进列表（对齐 cod
       "ephemeral 线程不应出现在列表",
     );
   } finally {
-    await loop.sim.stop();
+    await loop.tunnel.stop();
     await loop.mock.stop();
   }
+});
+
+// ------------------------------------------------------- S03：simInit / simReset
+
+interface LooseStoreEntry {
+  thread: { id: string; preview: string; turns: unknown[] };
+  items: unknown[];
+}
+
+/** store 语义归一（忽略随机 id/时间戳）：预览/ turn 数 / item 数。 */
+function normStore(entries: LooseStoreEntry[]): Array<{ preview: string; turns: number; items: number }> {
+  return entries.map((e) => ({
+    preview: e.thread.preview,
+    turns: e.thread.turns.length,
+    items: e.items.length,
+  }));
+}
+
+const SEED_SEMANTICS = [{ preview: "模拟会话：桥接链路验证", turns: 1, items: 2 }];
+
+test("S03② simInit：未初始化播种、连跑两次幂等、已有用户线程不覆盖", async () => {
+  const dir = await tempDir("init");
+  const path = simStatePath(dir);
+  assert.equal(await simStoreInitialized(dir), false, "空目录应为未初始化");
+  assert.equal(await simInit(dir), true, "首次应播种");
+  const first = await readFile(path, "utf8");
+  assert.deepEqual(normStore(JSON.parse(first) as LooseStoreEntry[]), SEED_SEMANTICS);
+  assert.equal(await simStoreInitialized(dir), true);
+
+  // 幂等：重复 init 不重新播种（文件字节不变）
+  assert.equal(await simInit(dir), false, "已初始化应 no-op");
+  assert.equal(await readFile(path, "utf8"), first, "重复 init 不得改写 store");
+
+  // 已有用户线程：不播种、不覆盖
+  const userDir = await tempDir("init-user");
+  const userPath = simStatePath(userDir);
+  const userStore: LooseStoreEntry[] = [
+    { thread: { id: "user-thread-1", preview: "我的会话", turns: [] }, items: [] },
+  ];
+  await writeFile(userPath, JSON.stringify(userStore));
+  const before = await readFile(userPath, "utf8");
+  assert.equal(await simInit(userDir), false, "已有用户线程不播种");
+  assert.equal(await readFile(userPath, "utf8"), before, "用户数据不得被覆盖");
+
+  // 空数组 store 视为未初始化 → 播种
+  const emptyDir = await tempDir("init-empty");
+  await writeFile(simStatePath(emptyDir), "[]");
+  assert.equal(await simInit(emptyDir), true);
+  assert.deepEqual(
+    normStore(JSON.parse(await readFile(simStatePath(emptyDir), "utf8")) as LooseStoreEntry[]),
+    SEED_SEMANTICS,
+  );
+});
+
+test("S03③ simReset：store == 播种态且与全新 init 语义等价；身份文件未动", async () => {
+  const dir = await tempDir("reset");
+  const identity = {
+    installationId: join(dir, "installation_id"),
+    enrollment: join(dir, "enrollment.json"),
+    pairing: join(dir, "pairing.json"),
+    lifecycle: join(dir, "lifecycle.json"),
+  };
+  await writeFile(identity.installationId, "install-abc\n");
+  await writeFile(identity.enrollment, JSON.stringify({ server_id: "s1", environment_id: "e1" }));
+  await writeFile(identity.pairing, JSON.stringify({ manual_pairing_code: "123456" }));
+  await writeFile(identity.lifecycle, JSON.stringify({ everEnrolled: true }));
+  await writeFile(
+    simStatePath(dir),
+    JSON.stringify([{ thread: { id: "user", preview: "旧会话", turns: [] }, items: [] }]),
+  );
+
+  await simReset(dir);
+
+  const afterReset = JSON.parse(await readFile(simStatePath(dir), "utf8")) as LooseStoreEntry[];
+  assert.deepEqual(normStore(afterReset), SEED_SEMANTICS, "reset 后 store 应为播种态");
+
+  // 与全新 init 结果语义等价
+  const freshDir = await tempDir("reset-fresh");
+  await simInit(freshDir);
+  const fresh = JSON.parse(await readFile(simStatePath(freshDir), "utf8")) as LooseStoreEntry[];
+  assert.deepEqual(normStore(afterReset), normStore(fresh), "reset ≡ 全新 init（语义）");
+
+  // 身份/配对/生命周期文件未被触碰
+  assert.equal(await readFile(identity.installationId, "utf8"), "install-abc\n");
+  assert.equal(
+    await readFile(identity.enrollment, "utf8"),
+    JSON.stringify({ server_id: "s1", environment_id: "e1" }),
+  );
+  assert.equal(
+    await readFile(identity.pairing, "utf8"),
+    JSON.stringify({ manual_pairing_code: "123456" }),
+  );
+  assert.equal(await readFile(identity.lifecycle, "utf8"), JSON.stringify({ everEnrolled: true }));
+});
+
+test("S03③ reset 活实例：清队列续跑计时器，无 turn 复活；内存/磁盘均为播种态", async () => {
+  const dir = await tempDir("reset-live");
+  const statePath = simStatePath(dir);
+  const app = new SimApp({
+    codexHome: dir,
+    statePath,
+    stepDelayMs: 40,
+    deltaIntervalMs: 2,
+    deltaChars: 64,
+  });
+  const notifications: Array<{ method: string }> = [];
+  app.on("event", (n) => notifications.push({ method: n.method }));
+  const key = { clientId: "c", streamId: "s" };
+  await app.handleRequest(key, 0, "initialize", { clientInfo: { name: "t" } });
+  const started = (await app.handleRequest(key, 1, "thread/start", { cwd: "/tmp-sim/reset" })) as {
+    result: { thread: { id: string } };
+  };
+  const threadId = started.result.thread.id;
+  await app.handleRequest(key, 2, "turn/start", {
+    threadId,
+    input: [{ type: "text", text: "主任务" }],
+  });
+  await app.handleRequest(key, 3, "thread/queue/add", {
+    threadId,
+    input: [{ type: "text", text: "排队消息" }],
+    clientUserMessageId: "q1",
+  });
+  // 主 turn 完成 → consumeQueue 已排下队列续跑计时器（schedule(null,…)）
+  await waitFor(
+    () => notifications.some((n) => n.method === "turn/completed"),
+    3000,
+    "主 turn 完成",
+  );
+  const timers = (app as unknown as { pendingTimers: Set<NodeJS.Timeout> }).pendingTimers;
+  assert.equal(timers.size, 1, "队列续跑计时器应在途（现 close() 不覆盖此计时器）");
+
+  notifications.length = 0;
+  await app.resetToSeed();
+  assert.equal(timers.size, 0, "reset 必须清理队列续跑计时器");
+  assert.equal(
+    (app as unknown as { threads: Map<string, unknown> }).threads.size,
+    1,
+    "内存应仅剩播种线程",
+  );
+  const onDisk = JSON.parse(await readFile(statePath, "utf8")) as LooseStoreEntry[];
+  assert.deepEqual(normStore(onDisk), SEED_SEMANTICS, "reset 后磁盘为播种态");
+
+  // 超过 stepDelay 窗口：被清掉的排队 turn 不得复活
+  await new Promise((r) => setTimeout(r, 160));
+  assert.equal(
+    notifications.some((n) => n.method === "turn/started" || n.method === "turn/completed"),
+    false,
+    "reset 后不得有 turn 复活",
+  );
+  app.close();
 });
 
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {

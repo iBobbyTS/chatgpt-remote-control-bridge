@@ -32,10 +32,19 @@ export interface AgentInstanceContext {
   log: (line: string) => void;
 }
 
-/** agent 模块契约：id + 实例工厂。 */
+/** agent 模块契约：id + 实例工厂 + 可选生命周期钩子。 */
 export interface AgentModule {
   readonly id: string;
   createInstance(ctx: AgentInstanceContext): AgentApp;
+  /**
+   * enable 钩子（S03）：daemon 写 config 后、启动实例前调用，用于幂等的自动初始化
+   * （如 sim 的 store 播种）。实现必须幂等，重复 enable 不得破坏已有数据。
+   */
+  onEnable?(ctx: AgentInstanceContext): Promise<void> | void;
+  /** IPC agent-init（S03）：app 为活实例实例（未运行时为 null），做幂等文件/运行态初始化。 */
+  onInit?(ctx: AgentInstanceContext, app: AgentApp | null): Promise<void> | void;
+  /** IPC agent-reset（S03）：清运行态并重置为播种态（app 未运行时为 null，走纯文件路径）。 */
+  onReset?(ctx: AgentInstanceContext, app: AgentApp | null): Promise<void> | void;
 }
 
 const modules = new Map<string, AgentModule>();

@@ -9,8 +9,10 @@
  *   （避免双写冲突；文件由实例生命周期保证存在）。
  * - **lifecycle.json**：实例目录首次创建时（daemon 亲历 mkdir）写 {everEnrolled:false}；
  *   首个 enrollment 事件置 true，此后不重置/删除；已有目录缺失该文件时 enable 不补写。
- * - 本节 enable/disable 不实现配对吊销（S04）；pair/pair-status/agent-init/agent-reset/
- *   auth-reset 仅分发骨架，返回 INTERNAL "not implemented"。
+ * - 本节 enable/disable 不实现配对吊销（S04）；pair/pair-status/auth-reset 仅分发骨架，
+ *   返回 INTERNAL "not implemented"。agent-init/agent-reset 实装（S03）：
+ *   agent 模块以可选钩子 onInit/onReset 声明语义，daemon 只做通用分发（不硬编码 sim）；
+ *   无钩子的模块保持 "not implemented" 占位语义。
  *
  * 并发/竞态（评审修复）：
  * - **per-agent 操作队列**：启动/重启/disable 全部经同一 `serialize(id, …)` 串行化，
@@ -72,6 +74,11 @@ export interface CgrcbDaemonOptions {
   installSignalHandlers?: boolean;
   /** 收到信号并在 shutdown 完成后是否 process.exit(0)（默认 false；S05 daemon 入口用）。 */
   exitOnSignal?: boolean;
+  /**
+   * S03 注入点：启动路径触发 agent 模块注册（registry 延迟工厂语义）。
+   * daemon 绝不静态 import 具体 agent；由入口/测试传入（如 `() => import("../agents/sim/index.ts")`）。
+   */
+  registerAgents?: () => void | Promise<void>;
 }
 
 interface InstanceRuntime {
@@ -99,8 +106,6 @@ const DAEMON_STOPPED_MESSAGE = "daemon 已停止，请创建新实例";
 const NOT_IMPLEMENTED_OPS = new Set<IpcRequest["op"]>([
   "pair",
   "pair-status",
-  "agent-init",
-  "agent-reset",
   "auth-reset",
 ]);
 
@@ -174,6 +179,9 @@ export class CgrcbDaemon {
       throw new Error(DAEMON_STOPPED_MESSAGE);
     }
     this.stopping = false;
+    // S03：注册 agent 模块（入口/测试注入的延迟工厂接线；daemon 不静态 import 具体 agent）
+    await this.opts.registerAgents?.();
+    if (this.stopRequested) return this.abandonStart("stop requested");
     await mkdir(this.paths.root, { recursive: true });
     if (this.stopRequested) return this.abandonStart("stop requested");
     await mkdir(this.paths.instancesDir, { recursive: true });
@@ -351,6 +359,19 @@ export class CgrcbDaemon {
     }
   }
 
+  /**
+   * 实例上下文（S03 复用）：identity 晚绑定到当前实例隧道（未 enroll 前 null）。
+   * 供 createInstance 与 enable/init/reset 钩子共用。
+   */
+  private instanceContext(id: string): AgentInstanceContext {
+    return {
+      instanceDir: instanceDirFor(this.paths.root, id),
+      authManager: this.authManager!,
+      identity: () => this.instances.get(id)?.tunnel?.identity() ?? null,
+      log: (line) => this.logLine(`[${id}] ${line}`),
+    };
+  }
+
   /** 建 app（工厂）→ 建 tunnel → 订阅事件 → start。工厂同步抛错由调用方捕获。 */
   private async startInto(inst: InstanceRuntime, module: AgentModule | undefined): Promise<void> {
     // BLOCKER 5：缺模块必须 throw（走失败分支保留 failed），不得正常返回被覆盖成 online
@@ -360,13 +381,7 @@ export class CgrcbDaemon {
     const dir = instanceDirFor(this.paths.root, inst.id);
     await this.ensureInstanceDir(dir); // 首次创建 → 写 lifecycle.json
 
-    let tunnelRef: WhamTunnel | null = null;
-    const ctx: AgentInstanceContext = {
-      instanceDir: dir,
-      authManager: this.authManager!,
-      identity: () => tunnelRef?.identity() ?? null,
-      log: (line) => this.logLine(`[${inst.id}] ${line}`),
-    };
+    const ctx = this.instanceContext(inst.id);
     const app = module.createInstance(ctx); // 可能同步抛错
 
     const cfg = this.config.agents[inst.id] as AgentConfig | undefined;
@@ -388,7 +403,6 @@ export class CgrcbDaemon {
       refreshThresholdMs: this.opts.refreshThresholdMs,
       agentLabel: this.opts.agentLabel ?? `bridge-${inst.id}`,
     });
-    tunnelRef = tunnel;
     inst.app = app;
     inst.tunnel = tunnel;
     tunnel.on("warn", (line) => inst.warnings.push(String(line)));
@@ -558,6 +572,14 @@ export class CgrcbDaemon {
           return await this.withAgentLock(request.agent, () => this.doEnable(request.agent));
         case "disable":
           return await this.withAgentLock(request.agent, () => this.doDisable(request.agent));
+        case "agent-init":
+          return await this.withAgentLock(request.agent, () =>
+            this.doAgentInitReset(request.agent, "init"),
+          );
+        case "agent-reset":
+          return await this.withAgentLock(request.agent, () =>
+            this.doAgentInitReset(request.agent, "reset"),
+          );
         default:
           if (NOT_IMPLEMENTED_OPS.has(request.op)) {
             return { ok: false, error: "INTERNAL", message: "not implemented" };
@@ -584,6 +606,12 @@ export class CgrcbDaemon {
       // 写盘失败会 throw → 上层 INTERNAL，内存/实例均不动
       await this.commitConfig((cfg) => withAgentEnabled(cfg, id, true));
     }
+    // S03：写 config 后、启动实例前做自动 init（幂等）。先建实例目录 → 首建写 lifecycle.json，
+    // 再调模块 onEnable（如 sim 播种 state.json）；未声明钩子的模块跳过（通用，不硬编码 sim）。
+    const module = getAgent(id)!;
+    const ctx = this.instanceContext(id);
+    await this.ensureInstanceDir(ctx.instanceDir);
+    await module.onEnable?.(ctx);
     const inst = this.instances.get(id);
     if (!inst || inst.status === "disabled") {
       await this.startInstance(id);
@@ -609,6 +637,36 @@ export class CgrcbDaemon {
     }
     // 占位：清 pairing 状态（真正的吊销/清理在 S04）
     await rm(instancePaths(instanceDirFor(this.paths.root, id)).pairing, { force: true });
+    return { ok: true, data: await this.agentStatus(id) };
+  }
+
+  /**
+   * IPC agent-init / agent-reset（S03）：通用分发到 agent 模块可选钩子。
+   * - 活实例：app 一并传入（如 sim reset 清理运行态定时器并内存播种）；
+   * - 未运行实例：app=null，模块走纯文件路径（调纯函数）；
+   * - 未声明钩子的模块保持 S02 占位语义（INTERNAL "not implemented"）。
+   */
+  private async doAgentInitReset(
+    id: string | undefined,
+    mode: "init" | "reset",
+  ): Promise<IpcResponse> {
+    if (!id || !this.isKnownAgent(id)) return unknownAgent(id);
+    if (this.stopping) {
+      return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
+    }
+    const module = getAgent(id);
+    const hasHook = mode === "init" ? module?.onInit : module?.onReset;
+    if (!module || !hasHook) {
+      return { ok: false, error: "INTERNAL", message: "not implemented" };
+    }
+    const ctx = this.instanceContext(id);
+    await this.ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
+    const app = this.instances.get(id)?.app ?? null;
+    if (mode === "init") {
+      await module.onInit!(ctx, app);
+    } else {
+      await module.onReset!(ctx, app);
+    }
     return { ok: true, data: await this.agentStatus(id) };
   }
 

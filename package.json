@@ -13,8 +13,7 @@
     "auth": "tsx src/cli.ts",
     "wham": "tsx src/wham/cli.ts",
     "wham:probe": "tsx src/wham/probe-cli.ts",
-    "wham:proxy": "tsx src/wham/proxy.ts",
-    "sim": "tsx src/sim/cli.ts"
+    "wham:proxy": "tsx src/wham/proxy.ts"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

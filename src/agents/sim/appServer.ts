@@ -33,6 +33,7 @@ import {
   type TurnRecord,
 } from "./data.ts";
 import { uuidv7 } from "./ids.ts";
+import type { AgentApp } from "../types.ts";
 
 export interface SimClientKey {
   clientId: string;
@@ -108,7 +109,7 @@ type AnyParams = Record<string, any>;
 const ERR_NOT_INITIALIZED = { code: -32600, message: "Not initialized" };
 const ERR_METHOD_NOT_FOUND = { code: -32601, message: "Method not found" };
 
-export class SimApp extends EventEmitter {
+export class SimApp extends EventEmitter implements AgentApp {
   private readonly clients = new Map<string, SimClientState>();
   private readonly threads = new Map<string, ThreadState>();
   /** 虚拟目录覆盖层：绝对路径 → 存在的目录（模拟 mkdir，不落盘）。 */
@@ -118,6 +119,11 @@ export class SimApp extends EventEmitter {
     SimAppOptions;
   private closed = false;
   private saveQueue: Promise<void> = Promise.resolve();
+  /**
+   * 全部在途定时器（S03）：既含各 turn 的 sim.timers，也含 `schedule(null, …)` 的
+   * 队列续跑计时器等无 turn 定时器。close()/reset 统一清理，避免 reset 后队列复活。
+   */
+  private readonly pendingTimers = new Set<NodeJS.Timeout>();
 
   constructor(opts: SimAppOptions) {
     super();
@@ -131,9 +137,15 @@ export class SimApp extends EventEmitter {
       this.loadStateSync(this.opts.statePath);
     }
     if (this.threads.size === 0) {
-      for (const [id, fixed] of fixedThreads()) {
-        this.threads.set(id, { thread: fixed.thread, items: fixed.items, queue: [], sim: null });
-      }
+      this.seedPresetThreads();
+    }
+  }
+
+  /** 内存恢复为预置线程（构造空库与 reset 共用）。 */
+  private seedPresetThreads(): void {
+    this.threads.clear();
+    for (const [id, fixed] of fixedThreads()) {
+      this.threads.set(id, { thread: fixed.thread, items: fixed.items, queue: [], sim: null });
     }
   }
 
@@ -213,9 +225,22 @@ export class SimApp extends EventEmitter {
 
   close(): void {
     this.closed = true;
-    for (const t of this.threads.values()) {
-      this.clearTimers(t.sim);
-    }
+    this.clearAllTimers();
+  }
+
+  /**
+   * S03：把运行态重置为播种态——清空线程/turn/items/queue/ephemeral 与**全部**在途定时器
+   * （含队列续跑计时器），重新播种 fixedThreads 并落盘。
+   *
+   * 与 saveQueue 的交错：先排空在途写，避免 reset 前排队中的旧快照在播种后落盘覆盖。
+   * 不动 clients（在线手机连接保持不变）。
+   */
+  async resetToSeed(): Promise<void> {
+    await this.saveQueue.catch(() => undefined);
+    this.clearAllTimers();
+    this.seedPresetThreads();
+    this.persistState();
+    await this.saveQueue.catch(() => undefined);
   }
 
   // ------------------------------------------------------------------ 分发
@@ -224,14 +249,14 @@ export class SimApp extends EventEmitter {
     key: SimClientKey,
     id: number | string,
     method: string,
-    params: AnyParams | null,
+    params: unknown,
   ): Promise<JsonRpcOutcome> {
     const client = this.clientState(key);
     if (method !== "initialize" && !client.initialized) {
       return { id, error: ERR_NOT_INITIALIZED };
     }
     try {
-      const result = await this.dispatch(key, client, method, params ?? {});
+      const result = await this.dispatch(key, client, method, (params ?? {}) as AnyParams);
       return { id, result };
     } catch (err) {
       if (err instanceof SimMethodError) {
@@ -900,9 +925,11 @@ export class SimApp extends EventEmitter {
 
   private schedule(sim: SimTurnRuntime | null, fn: () => void, ms: number): void {
     const timer = setTimeout(() => {
+      this.pendingTimers.delete(timer);
       if (sim) sim.timers.delete(timer);
       fn();
     }, ms);
+    this.pendingTimers.add(timer);
     if (sim) sim.timers.add(timer);
   }
 
@@ -910,8 +937,20 @@ export class SimApp extends EventEmitter {
     if (!sim) return;
     for (const timer of sim.timers) {
       clearTimeout(timer);
+      this.pendingTimers.delete(timer);
     }
     sim.timers.clear();
+  }
+
+  /** 清理全部在途定时器（turn 计时器 + 队列续跑等无 turn 计时器）。 */
+  private clearAllTimers(): void {
+    for (const timer of this.pendingTimers) {
+      clearTimeout(timer);
+    }
+    this.pendingTimers.clear();
+    for (const t of this.threads.values()) {
+      t.sim?.timers.clear();
+    }
   }
 }
 
