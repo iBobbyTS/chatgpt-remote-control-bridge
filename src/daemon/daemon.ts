@@ -102,6 +102,11 @@ interface InstanceRuntime {
   restartTimer: NodeJS.Timeout | null;
   warnings: string[];
   identityWarnings: string[];
+  /**
+   * 二波2：无身份中止标记。置位后自动重启（监管者/排队重启）一律跳过启动，
+   * 仅用户显式 IPC enable 可清除并放行（避免后台 fresh-enroll 铸新 environment）。
+   */
+  blockedNoIdentity: boolean;
 }
 
 /** status 出口：S04 在 AgentRuntimeStatus 上追加 pairing（pending 码/claim/已配对 clients）。 */
@@ -356,12 +361,18 @@ export class CgrcbDaemon {
       restartTimer: null,
       warnings: [],
       identityWarnings: [],
+      blockedNoIdentity: false,
     };
   }
 
-  private async startInstance(id: string): Promise<void> {
+  private async startInstance(id: string, allowBlocked = false): Promise<void> {
     if (this.stopping) return;
     const existing = this.instances.get(id);
+    // 二波2：无身份中止标记态跳过自动/监督启动（防 fresh-enroll）；显式 enable 传 allowBlocked
+    if (existing?.blockedNoIdentity && !allowBlocked) {
+      this.logLine(`[${id}] 实例处于"无身份中止"标记态，跳过自动启动（等待用户显式 enable）`);
+      return;
+    }
     if (existing && (existing.status === "online" || existing.status === "starting")) {
       return;
     }
@@ -380,6 +391,7 @@ export class CgrcbDaemon {
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
+      inst.blockedNoIdentity = false;
       this.logLine(`[${id}] 实例在线`);
       await this.notifyInstanceOnline(inst);
     } catch (err) {
@@ -580,10 +592,15 @@ export class CgrcbDaemon {
     }
   }
 
-  private async restartInstance(id: string): Promise<void> {
+  private async restartInstance(id: string, allowBlocked = false): Promise<void> {
     if (this.stopping) return;
     const inst = this.instances.get(id);
     if (!inst || this.config.agents[id]?.enabled !== true) return;
+    // 二波2：无身份中止标记态跳过自动/排队重启（仅显式 enable 传 allowBlocked）
+    if (inst.blockedNoIdentity && !allowBlocked) {
+      this.logLine(`[${id}] 实例处于"无身份中止"标记态，跳过自动重启（等待用户显式 enable）`);
+      return;
+    }
     await this.disposeInstance(inst);
     if (this.isStale(inst)) return;
     inst.status = "starting";
@@ -598,6 +615,7 @@ export class CgrcbDaemon {
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
+      inst.blockedNoIdentity = false;
       this.logLine(`[${id}] 实例已恢复在线`);
       await this.notifyInstanceOnline(inst);
     } catch (err) {
@@ -747,6 +765,7 @@ export class CgrcbDaemon {
       inst.tunnel = null;
       inst.app = null;
       inst.status = "failed";
+      inst.blockedNoIdentity = true;
       inst.error = "disable 已中止：缺少可用身份记录，实例保持停止（避免 fresh-enroll）";
       return;
     }
@@ -866,16 +885,27 @@ export class CgrcbDaemon {
     const ctx = this.instanceContext(id);
     await this.ensureInstanceDir(ctx.instanceDir);
     await module.onEnable?.(ctx);
+    // 二波2：用户显式 enable 允许清除"无身份中止"标记并重新 enroll（合规、可能铸新身份），
+    // 记 identityWarnings WARN 供 status 可见。
+    const blocked = this.instances.get(id)?.blockedNoIdentity === true;
+    if (blocked) {
+      const inst = this.instances.get(id)!;
+      inst.blockedNoIdentity = false;
+      const warn =
+        "用户显式 enable：清除\"无身份中止\"标记并重新 enroll（可能铸新 environment）";
+      inst.identityWarnings.push(warn);
+      this.logLine(`[${id}] WARN ${warn}`);
+    }
     if (this.config.agents[id]?.enabled !== true) {
       // 写盘失败会 throw → 上层 INTERNAL，内存/实例均不动
       await this.commitConfig((cfg) => withAgentEnabled(cfg, id, true));
     }
     const inst = this.instances.get(id);
     if (!inst || inst.status === "disabled") {
-      await this.startInstance(id);
+      await this.startInstance(id, true);
     } else if (inst.status === "failed") {
       this.clearRestartTimer(inst);
-      await this.restartInstance(id);
+      await this.restartInstance(id, true);
     }
     return { ok: true, data: await this.agentStatus(id) };
   }
@@ -1130,7 +1160,7 @@ export class CgrcbDaemon {
       environmentId: identity?.environmentId ?? tunnel?.enrollmentSnapshot?.environment_id ?? null,
       installationId: identity?.installationId ?? null,
       everEnrolled,
-      identityWarnings: tunnel?.identityWarnings ?? [],
+      identityWarnings: [...(tunnel?.identityWarnings ?? []), ...inst.identityWarnings],
       warnings: tunnel?.warnings ?? [],
       error: inst.error,
       pairing,

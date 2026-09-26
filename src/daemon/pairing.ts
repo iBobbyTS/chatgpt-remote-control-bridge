@@ -190,6 +190,9 @@ export class PairingManager {
    * 启定时器；若无有效 pending 则自动发码（多设备第二次 enable 不重复发）。
    */
   async onInstanceOnline(): Promise<PairingPendingView | null> {
+    // 二波1：显式 enable / 中止后恢复会重新上线并调用本方法；per-agent 锁保证与 disable 互斥，
+    // 故在此清除 suspend 标记，否则配对会静默失效（不发码、不报错）。
+    this.suspended = false;
     this.startTimer();
     return this.enqueue(async (gen) => {
       if (this.suspended || gen !== this.generation) return this.view();
@@ -336,7 +339,7 @@ export class PairingManager {
       this.warn(`配对响应缺少 code（${reason}）`);
       return false;
     }
-    this.pending = {
+    const next: PairingPending = {
       code,
       expiresAt:
         typeof response.expires_at === "string"
@@ -344,13 +347,22 @@ export class PairingManager {
           : new Date(this.now() + 10 * 60_000).toISOString(),
       token,
     };
+    // 二波4：先持久化成功再设内存 pending；写盘瞬时失败则保持无 pending，
+    // 由 tick（autoPairPending / 无 pending）重试，避免"内存有码但磁盘无码"。
+    try {
+      await this.writePending(gen, next);
+    } catch (err) {
+      this.warn(`配对码写盘失败，稍后重试: ${errorMessage(err)}`);
+      return false;
+    }
+    if (this.suspended || gen !== this.generation) return false;
+    this.pending = next;
     this.claimed = false;
     this.autoPairPending = false;
     if (response.environment_id) {
       this.environmentId = response.environment_id;
     }
-    await this.persist(gen);
-    this.log(`配对码已生成: ${code} expires=${this.pending.expiresAt}（${reason}）`);
+    this.log(`配对码已生成: ${code} expires=${next.expiresAt}（${reason}）`);
     return true;
   }
 
@@ -384,13 +396,19 @@ export class PairingManager {
   }
 
   private async persist(gen: number): Promise<void> {
-    if (this.suspended || gen !== this.generation || !this.pending) return;
+    if (!this.pending) return;
+    await this.writePending(gen, this.pending);
+  }
+
+  /** 落盘指定 pending（守卫 + 测试注入缝）。返回即已 rename 完成或调用方已失效。 */
+  private async writePending(gen: number, value: PairingPending): Promise<void> {
+    if (this.suspended || gen !== this.generation) return;
     // 测试注入缝：此处的等待点位于末次代次守卫之后、真正 rename 之前，
     // 模拟"写盘已在途"；suspend() 必须排空它，finalize 才能安全清盘。
     if (this.opts.beforePersist) {
       await this.opts.beforePersist();
     }
-    await writeJsonAtomic(this.pairingPath, this.pending);
+    await writeJsonAtomic(this.pairingPath, value);
   }
 
   private async loadPending(): Promise<void> {

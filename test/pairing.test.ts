@@ -93,8 +93,6 @@ async function startMock(overrides: Partial<MockWhamOptions> = {}): Promise<Mock
 
 class StubAgentApp extends EventEmitter {
   readonly states = new Map<string, AgentClientState>();
-  /** B-2 注入：close() 抛错 → WhamTunnel.stop() 抛错（WS 未关）。 */
-  closeThrows = false;
 
   clientState(key: AgentClientKey): AgentClientState {
     const id = `${key.clientId}/${key.streamId}`;
@@ -114,9 +112,7 @@ class StubAgentApp extends EventEmitter {
     return "unknown";
   }
 
-  close(): void {
-    if (this.closeThrows) throw new Error("stub close boom");
-  }
+  close(): void {}
 
   async handleRequest(
     _key: AgentClientKey,
@@ -727,7 +723,7 @@ test("B-2 停隧道失败 → 中止 disable、恢复实例在线、不误报吊
   const home = await tempDir("p-b2");
   const paths = cgrcbPaths(home);
   const id = uniqueId("pb2");
-  const stub = registerStub(id);
+  registerStub(id);
   const daemon = makeDaemon(home, mock);
   try {
     await wantLoggedIn(home);
@@ -735,11 +731,22 @@ test("B-2 停隧道失败 → 中止 disable、恢复实例在线、不误报吊
     await requestIpc(paths.socketPath, "enable", { agent: id });
     await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 5000, "online");
 
-    // app.close 抛错 → tunnel.stop() 抛错（隧道未确认关闭）
-    for (const app of stub.apps) app.closeThrows = true;
+    // 在 daemon 边界注入 stop() 拒绝（模拟"无法确认隧道已停妥"）
+    const runtime = (
+      daemon as unknown as {
+        instances: Map<string, { tunnel: { stop: () => Promise<void> } | null }>;
+      }
+    ).instances.get(id)!;
+    let stopCalls = 0;
+    runtime.tunnel!.stop = () => {
+      stopCalls += 1;
+      return Promise.reject(new Error("stop boom"));
+    };
+
     const dis = await requestIpc(paths.socketPath, "disable", { agent: id });
     assert.equal(dis.ok, false, `stop 失败应中止: ${JSON.stringify(dis)}`);
     assert.match((dis as { message?: string }).message ?? "", /无法确认隧道已停妥/);
+    assert.ok(stopCalls >= 1, "应调用 stop 并观察到失败");
     assert.equal((await readConfig(paths.configPath)).agents[id]!.enabled, true, "应保持 enabled");
     // 有身份记录 → 恢复实例在线
     await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 8000, "恢复在线");
@@ -866,6 +873,132 @@ test("B-5 首次自动发码瞬时失败 → 定时检查重试补齐 pending", 
     assert.ok(mock.pairRequests.length >= 2, `应有失败+重试: ${mock.pairRequests.length}`);
     const st = await ipcPairStatus(paths.socketPath, id);
     assert.ok(st.pending?.code, "pair-status 应见重试后的 pending");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+// --------------------------------------- S04 二波修复（恢复/门控/落盘次序）
+
+test("二波1 无身份中止后显式 enable：清标记、恢复在线并自动补发配对码", async () => {
+  const mock = await startMock({ enrollFailuresRemaining: 1 });
+  const home = await tempDir("p-w1");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("pw1");
+  registerStub(id);
+  await wantLoggedIn(home);
+  // config enabled + 已有实例目录且 everEnrolled=true（enroll 首试失败 → 无身份）
+  await writeConfig(paths.configPath, { version: 1, agents: { [id]: { enabled: true } } });
+  const ip = instancePaths(join(paths.instancesDir, id));
+  await mkdir(ip.dir, { recursive: true });
+  await writeFile(ip.lifecycle, JSON.stringify({ everEnrolled: true }));
+
+  const daemon = makeDaemon(home, mock, { restartBaseDelayMs: 60_000, restartMaxDelayMs: 60_000 });
+  try {
+    await daemon.start();
+    await waitFor(
+      async () => (await ipcAgentStatus(paths.socketPath, id)).status === "failed",
+      5000,
+      "boot enroll 失败 → failed",
+    );
+    assert.equal(mock.enrollCount, 1);
+    assert.equal(existsSync(ip.enrollment), false);
+
+    const dis = await requestIpc(paths.socketPath, "disable", { agent: id });
+    assert.equal(dis.ok, false, JSON.stringify(dis));
+    assert.match((dis as { message?: string }).message ?? "", /enrollment\.json 丢失/);
+    assert.equal(
+      (await ipcAgentStatus(paths.socketPath, id)).status,
+      "failed",
+      "中止后保持停止",
+    );
+
+    // 用户按指引显式 enable：清"无身份中止"标记并重新 enroll（合规）
+    const en = await requestIpc(paths.socketPath, "enable", { agent: id });
+    assert.equal(en.ok, true, JSON.stringify(en));
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 8000, "恢复在线");
+
+    // 配对不得静默失效：自动补发 pending + IPC pair 成功
+    await waitFor(async () => (await readPairingJson(ip.pairing)) !== null, 5000, "自动补发配对码");
+    const pair = await ipcPair(paths.socketPath, id);
+    assert.ok(pair.pending.code, "IPC pair 应成功");
+    const st = await ipcAgentStatus(paths.socketPath, id);
+    assert.ok(
+      st.identityWarnings.some((w) => /无身份中止/.test(w)),
+      `显式 enable 应记 identityWarnings WARN: ${JSON.stringify(st.identityWarnings)}`,
+    );
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("二波2 无身份中止后排队/自动重启不拉起（enrollCount 稳定、保持停止）", async () => {
+  const mock = await startMock({ enrollFailuresRemaining: 1000 });
+  const home = await tempDir("p-w2");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("pw2");
+  registerStub(id);
+  await wantLoggedIn(home);
+  await writeConfig(paths.configPath, { version: 1, agents: { [id]: { enabled: true } } });
+  const ip = instancePaths(join(paths.instancesDir, id));
+  await mkdir(ip.dir, { recursive: true });
+  await writeFile(ip.lifecycle, JSON.stringify({ everEnrolled: true }));
+
+  const daemon = makeDaemon(home, mock, { restartBaseDelayMs: 30, restartMaxDelayMs: 30 });
+  try {
+    await daemon.start();
+    // 让退避重启实际发生（boot + 至少一次重启尝试）
+    await waitFor(() => mock.enrollCount >= 2, 5000, "boot+重启尝试");
+
+    const dis = await requestIpc(paths.socketPath, "disable", { agent: id });
+    assert.equal(dis.ok, false, JSON.stringify(dis));
+    assert.match((dis as { message?: string }).message ?? "", /enrollment\.json 丢失/);
+
+    await new Promise((r) => setTimeout(r, 200)); // 收敛在途重启
+    const baseline = mock.enrollCount;
+    await new Promise((r) => setTimeout(r, 500));
+    assert.equal(mock.enrollCount, baseline, "无身份标记态不得再自动拉起 enroll");
+    const st = await ipcAgentStatus(paths.socketPath, id);
+    assert.equal(st.enabled, true, "中止保持 enabled");
+    assert.equal(st.status, "failed", "实例保持停止");
+    assert.equal(st.connected, false);
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("二波4 发码写盘瞬时失败 → 不残留内存 pending，tick 补齐 pairing.json", async () => {
+  const mock = await startMock();
+  const home = await tempDir("p-w4");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("pw4");
+  registerStub(id);
+  await wantLoggedIn(home);
+  const ip = instancePaths(join(paths.instancesDir, id));
+  // 占用 pairing.json 为目录 → rename(tmp, pairing.json) 瞬时失败
+  await mkdir(ip.pairing, { recursive: true });
+
+  const daemon = makeDaemon(home, mock);
+  try {
+    await daemon.start();
+    const en = await requestIpc(paths.socketPath, "enable", { agent: id });
+    assert.equal(en.ok, true, JSON.stringify(en));
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 5000, "online");
+
+    // 写盘失败期间：内存不得残留 pending（pair-status 应为 null）
+    const failed = await ipcPairStatus(paths.socketPath, id);
+    assert.equal(failed.pending, null, "写盘失败不得残留内存 pending");
+    assert.ok(mock.pairRequests.length >= 1, "pair 已发出");
+
+    // 解除占用 → tick 重试补齐
+    await rm(ip.pairing, { recursive: true, force: true });
+    await waitFor(async () => (await readPairingJson(ip.pairing)) !== null, 5000, "tick 补齐 pairing.json");
+    assert.ok(mock.pairRequests.length >= 2, "应有重试");
+    const ok = await ipcPairStatus(paths.socketPath, id);
+    assert.ok(ok.pending?.code, "补齐后 pair-status 可见 pending");
   } finally {
     await daemon.shutdown();
     await mock.stop();

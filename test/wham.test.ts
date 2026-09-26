@@ -898,6 +898,35 @@ test("WS：握手头记录、rpc 下发(client_message)、响应(server_message)
   }
 });
 
+test("二波3 tunnel.stop：app.close 抛错仍关闭 WS 且 stop() resolve（无旧连接泄漏）", async () => {
+  const { server } = await startMock();
+  const { authManager } = await makeAuthManager();
+  const app = new StubAgentApp();
+  app.close = () => {
+    throw new Error("close boom");
+  };
+  const tunnel = new WhamTunnel({
+    authManager,
+    app: app as unknown as AgentApp,
+    baseUrl: `http://127.0.0.1:${server.port}`,
+    reconnectDelayMs: 0,
+    log: () => {},
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    assert.ok(server["codexSocket"], "WSS 已建立");
+
+    // app.close 抛错不得让 stop() reject / 跳过 ws.close()
+    await tunnel.stop();
+    await waitFor(() => server["codexSocket"] === null, 5000);
+    assert.equal(tunnel.connected, false, "stop 后不得仍连接");
+    assert.equal(server["codexSocket"], null, "mock 侧旧 WS 必须已关闭");
+  } finally {
+    await server.stop();
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

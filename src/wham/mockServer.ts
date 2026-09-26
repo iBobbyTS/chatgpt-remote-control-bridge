@@ -76,6 +76,8 @@ export interface MockWhamOptions {
   revokeFailuresRemaining?: number;
   /** 前 N 次 pair 返回 500（测试注入 S04 自动发码瞬时失败 → tick 重试）。 */
   pairFailuresRemaining?: number;
+  /** 前 N 次 enroll 返回 500（测试注入"enroll 失败但实例目录已有历史"，enrollCount 仍计次）。 */
+  enrollFailuresRemaining?: number;
   log?: (line: string) => void;
 }
 
@@ -175,6 +177,8 @@ export class MockWhamServer {
   revokeFailuresRemaining = 0;
   /** 剩余强制失败的 pair 次数（测试注入发码失败；运行期可改）。 */
   pairFailuresRemaining = 0;
+  /** 剩余强制失败的 enroll 次数（测试注入 enroll 失败；计数仍递增）。 */
+  enrollFailuresRemaining = 0;
   private listRequestCount = 0;
 
   constructor(opts: MockWhamOptions) {
@@ -188,6 +192,7 @@ export class MockWhamServer {
   async start(): Promise<void> {
     this.revokeFailuresRemaining = this.opts.revokeFailuresRemaining ?? 0;
     this.pairFailuresRemaining = this.opts.pairFailuresRemaining ?? 0;
+    this.enrollFailuresRemaining = this.opts.enrollFailuresRemaining ?? 0;
     const address = await new Promise<string>((resolve, reject) => {
       this.server = createServer((req, res) => {
         void this.handleRest(req, res);
@@ -257,6 +262,11 @@ export class MockWhamServer {
     const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     if (url.pathname === REST_PATHS.enroll) {
       this.enrollCount += 1;
+      if (this.enrollFailuresRemaining > 0) {
+        this.enrollFailuresRemaining -= 1;
+        await this.replyJson(res, { error: "injected_enroll_failure" }, 500);
+        return;
+      }
       const request = JSON.parse(body) as EnrollRemoteServerRequest;
       const accountId = headerValue(req, "chatgpt-account-id");
       // 稳定账号身份：优先 account id，其次该次 bearer（无账号头的本地探测）

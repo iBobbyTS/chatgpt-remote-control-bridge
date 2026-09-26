@@ -414,7 +414,13 @@ export class WhamTunnel extends EventEmitter {
     this.stopPing();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     const inFlight = this.renewalInFlight;
-    this.app.close();
+    // 二波3（有界授权加固）：app.close 抛错不得跳过 ws.close()/stopPromise 建立，
+    // 否则旧 WS 泄漏且 stop() 永不收敛。吞错仅记日志，不改变其余语义。
+    try {
+      this.app.close();
+    } catch (err) {
+      this.log(`app.close 失败（忽略，继续关闭 WS）: ${errorMessage(err)}`);
+    }
     this.ws?.close();
     this.ws = null;
     this.stopPromise = (async () => {
