@@ -35,11 +35,13 @@ import {
 } from "./oauth.ts";
 import { startLoginServer } from "./loginServer.ts";
 import {
-  deleteAuthStore,
+  commitAuthRefresh,
+  deleteAuthStoreLocked,
   describeTokens,
   readAuthStore,
-  writeAuthStore,
+  writeAuthStoreLocked,
   type AuthDotJson,
+  type AuthLockOptions,
 } from "./store.ts";
 
 export interface AuthStatus {
@@ -84,6 +86,8 @@ export interface BridgeAuthManagerOptions {
   env?: NodeJS.ProcessEnv;
   /** 自动刷新巡检间隔（测试用）。 */
   autoRefreshIntervalMs?: number;
+  /** 跨进程提交锁参数/测试注入钩子（S05 ④）。 */
+  lockOptions?: AuthLockOptions;
 }
 
 export class BridgeAuthManager extends EventEmitter {
@@ -93,6 +97,7 @@ export class BridgeAuthManager extends EventEmitter {
   private readonly fetchImpl?: FetchLike;
   private readonly env: NodeJS.ProcessEnv;
   private readonly autoRefreshIntervalMs: number;
+  private readonly lockOptions: AuthLockOptions;
   private autoRefreshTimer: NodeJS.Timeout | null = null;
   private refreshInFlight: Promise<boolean> | null = null;
   private needsReLogin = false;
@@ -104,6 +109,7 @@ export class BridgeAuthManager extends EventEmitter {
     this.issuer = opts.issuer ?? resolveIssuer(this.env);
     this.clientId = opts.clientId ?? resolveClientId(this.env);
     this.fetchImpl = opts.fetchImpl;
+    this.lockOptions = opts.lockOptions ?? {};
     this.autoRefreshIntervalMs =
       opts.autoRefreshIntervalMs ?? AUTO_REFRESH_CHECK_INTERVAL_MS;
   }
@@ -168,7 +174,7 @@ export class BridgeAuthManager extends EventEmitter {
         },
         last_refresh: new Date().toISOString(),
       };
-      await writeAuthStore(this.codexHome, auth);
+      await writeAuthStoreLocked(this.codexHome, auth, this.lockOptions);
       this.needsReLogin = false;
       this.emit("changed", this.getStatusSync(auth));
       return this.getStatusSync(auth);
@@ -191,7 +197,7 @@ export class BridgeAuthManager extends EventEmitter {
         this.emit("warn", `token revoke failed (non-fatal): ${err}`);
       }
     }
-    const removed = await deleteAuthStore(this.codexHome);
+    const removed = await deleteAuthStoreLocked(this.codexHome, this.lockOptions);
     this.needsReLogin = false;
     this.emit("changed", this.getStatusSync(null));
     return removed;
@@ -271,6 +277,8 @@ export class BridgeAuthManager extends EventEmitter {
     if (!tokens) {
       return false;
     }
+    // 网络刷新在锁外；提交段持锁并重读校验（S05 ④，关闭覆盖新登录/复活已删凭证窗口）
+    const baseAccessToken = tokens.access_token;
     try {
       const next = await refreshTokens({
         issuer: this.issuer,
@@ -286,19 +294,33 @@ export class BridgeAuthManager extends EventEmitter {
         refresh_token: next.refresh_token || tokens.refresh_token,
         account_id: tokens.account_id,
       });
-      const updated: AuthDotJson = {
-        ...auth,
-        tokens: {
-          id_token: next.id_token,
-          access_token: next.access_token,
-          refresh_token: next.refresh_token || tokens.refresh_token,
-          account_id: accountId ?? tokens.account_id,
+      const outcome = await commitAuthRefresh(
+        this.codexHome,
+        {
+          baseAccessToken,
+          build: (current) => ({
+            ...current,
+            tokens: {
+              id_token: next.id_token,
+              access_token: next.access_token,
+              refresh_token: next.refresh_token || tokens.refresh_token,
+              account_id: accountId ?? current.tokens?.account_id ?? tokens.account_id,
+            },
+            last_refresh: new Date().toISOString(),
+          }),
         },
-        last_refresh: new Date().toISOString(),
-      };
-      await writeAuthStore(this.codexHome, updated);
+        this.lockOptions,
+      );
+      if (!outcome.committed) {
+        // 已删/已替换：丢弃写回，不得复活/覆盖
+        this.emit(
+          "warn",
+          `刷新结果提交被丢弃（凭证${outcome.reason === "deleted" ? "已删除" : "已被替换"}）`,
+        );
+        return false;
+      }
       this.needsReLogin = false;
-      this.emit("changed", this.getStatusSync(updated));
+      this.emit("changed", this.getStatusSync(outcome.auth));
       return true;
     } catch (err) {
       if (isPermanentRefreshFailure(err)) {
@@ -341,6 +363,22 @@ export class BridgeAuthManager extends EventEmitter {
     if (this.autoRefreshTimer) {
       clearInterval(this.autoRefreshTimer);
       this.autoRefreshTimer = null;
+    }
+  }
+
+  /**
+   * 等待在途刷新收敛（S05 auth-reset 协停）：`stopAutoRefresh()` 后调用，
+   * 处理期间新起的刷新也一并等待（有界重试，防持续新起的死循环）。
+   */
+  async waitForInflightRefresh(): Promise<void> {
+    for (let i = 0; i < 8; i += 1) {
+      const inflight = this.refreshInFlight;
+      if (!inflight) return;
+      try {
+        await inflight;
+      } catch {
+        // 刷新失败也不阻塞 reset
+      }
     }
   }
 

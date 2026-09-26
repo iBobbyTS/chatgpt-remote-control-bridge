@@ -2,6 +2,11 @@
 
 日期：2026-09-25 · 状态：✅ 已接真实 wham 后端并验证
 
+> **已于正式化移除（S05）**：本文描述的 `src/sim/*` 入口（`SimWhamServer` / `src/sim/cli.ts`）
+> 与 `npm run sim` 脚本在正式化后已删除；模拟层迁入 `src/agents/sim/*`，由 daemon 经注册表
+> 创建实例、`cgrcb serving-agent sim` 管理。下文保留研究阶段记录（入口名/命令已失效）。
+> 正式化架构见 [08-formalization.md](08-formalization.md)。
+
 ## 定位
 
 ```
@@ -14,6 +19,9 @@
 它是后续 ZCode 驱动层的直接骨架（方法分发 + 信封层不变，只换 handler 实现）。
 
 ## 运行
+
+> 已于正式化移除：`npm run sim` / `src/sim/cli.ts` 不再存在。现用
+> `cgrcb serving-agent sim enable`（daemon 在线时自动 init + 打印配对码）。
 
 ```bash
 npm run sim                    # enroll → WSS → 打印配对码 → 轮询 claim → 持续服务

@@ -1,0 +1,23 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "declaration": false,
+    "sourceMap": false,
+    "resolveJsonModule": true
+  },
+  "include": [
+    "src/cli/**/*.ts",
+    "src/daemon/**/*.ts",
+    "src/agents/**/*.ts",
+    "src/auth/**/*.ts",
+    "src/wham/tunnel.ts",
+    "src/wham/client.ts",
+    "src/wham/rest.ts",
+    "src/wham/protocol.ts"
+  ]
+}

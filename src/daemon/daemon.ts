@@ -9,8 +9,7 @@
  *   （避免双写冲突；文件由实例生命周期保证存在）。
  * - **lifecycle.json**：实例目录首次创建时（daemon 亲历 mkdir）写 {everEnrolled:false}；
  *   首个 enrollment 事件置 true，此后不重置/删除；已有目录缺失该文件时 enable 不补写。
- * - 本节 enable/disable 不实现配对吊销（S04）；pair/pair-status/auth-reset 仅分发骨架，
- *   返回 INTERNAL "not implemented"。agent-init/agent-reset 实装（S03）：
+ * - 配对生命周期（S04）、agent-init/agent-reset（S03）、auth-reset（S05，见 doAuthReset）：
  *   agent 模块以可选钩子 onInit/onReset 声明语义，daemon 只做通用分发（不硬编码 sim）；
  *   无钩子的模块保持 "not implemented" 占位语义。
  *
@@ -124,10 +123,6 @@ class InstanceCancelledError extends Error {
 }
 
 const DAEMON_STOPPED_MESSAGE = "daemon 已停止，请创建新实例";
-
-const NOT_IMPLEMENTED_OPS = new Set<IpcRequest["op"]>([
-  "auth-reset",
-]);
 
 export class CgrcbDaemon {
   readonly paths: CgrcbPaths;
@@ -853,10 +848,9 @@ export class CgrcbDaemon {
           return await this.withAgentLock(request.agent, () =>
             this.doAgentInitReset(request.agent, "reset"),
           );
+        case "auth-reset":
+          return await this.doAuthReset();
         default:
-          if (NOT_IMPLEMENTED_OPS.has(request.op)) {
-            return { ok: false, error: "INTERNAL", message: "not implemented" };
-          }
           return {
             ok: false,
             error: "INTERNAL",
@@ -1082,6 +1076,27 @@ export class CgrcbDaemon {
       await module.onReset!(ctx, app);
     }
     return { ok: true, data: await this.agentStatus(id) };
+  }
+
+  /**
+   * IPC auth-reset（S05 ④）：chatgpt reset/logout 的在线路径。
+   * 停 autoRefresh → 等待在途刷新收敛（refreshInFlight flush）→ 持锁删除凭证
+   * （store.deleteAuthStoreLocked；刷新提交段的重读校验保证在途刷新不复活凭证）。
+   * 删除后若 daemon 仍在运行则恢复巡检；下游实例/身份/配对一律不动。
+   */
+  private async doAuthReset(): Promise<IpcResponse> {
+    const auth = this.authManager;
+    if (!auth) {
+      return { ok: false, error: "INTERNAL", message: "daemon 未就绪" };
+    }
+    auth.stopAutoRefresh();
+    await auth.waitForInflightRefresh();
+    const removed = await auth.logout();
+    if (this.running && !this.stopping) {
+      auth.startAutoRefresh();
+    }
+    this.logLine(`auth-reset：凭证${removed ? "已删除" : "本就未登录"}（下游实例不受影响）`);
+    return { ok: true, data: { removed, auth: await auth.getStatus() } };
   }
 
   /** 同 agent 的 enable/disable 经 per-agent 队列串行化，避免半状态。 */
