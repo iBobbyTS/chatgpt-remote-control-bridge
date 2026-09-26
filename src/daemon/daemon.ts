@@ -23,6 +23,7 @@
  */
 import { mkdir, rm } from "node:fs/promises";
 import { hostname } from "node:os";
+import { join } from "node:path";
 import type { AgentApp } from "../agents/types.ts";
 import {
   getAgent,
@@ -510,7 +511,8 @@ export class CgrcbDaemon {
       name,
       appServerVersion: this.opts.appServerVersion,
       installationDir: dir,
-      jsonlPath: this.opts.jsonlPath,
+      // 帧级日志默认落实例目录（真机问题定位依赖双向帧记录；可用 opts.jsonlPath 覆盖）
+      jsonlPath: this.opts.jsonlPath ?? join(dir, "frames.jsonl"),
       log: (line) => this.logLine(`[${inst.id}] ${line}`),
       reconnectDelayMs: this.opts.reconnectDelayMs,
       pingIntervalMs: this.opts.pingIntervalMs,

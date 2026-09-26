@@ -371,3 +371,48 @@ vendored 源码 `reference/codex/codex-rs` 为准。
   具体错误文案未逐一核对。originUrl 不做远端消毒。
 - backgroundTerminals/* 同时接受带 `thread/` 前缀的权威方法名与裸名别名。
 - projectId 空字符串按清除处理（对齐 v2 注释"use an empty string to clear it"）。
+
+## 2026-09-26 真机 queue 复测截断：根因与修复（流生命周期）
+
+### 症状与证据链
+
+真机 `test queue` 排队一条消息后，后续每条消息"不完整、截断位置随机"（如 3/3 停在
+"若有排队消息它"）；服务器侧 state.json 文本完整；daemon 无 pending 溢出 WARN。
+9/25 真机抓包（.agent-work/tmp/sim/frames-*.jsonl）证实：wham 与手机**逐帧 ack（含
+pong，跳 seq 累积确认）**、手机流短命（每流 6~71 帧）、`client_closed` 频繁、**尾部
+残留为 0**（ack 追平到最大 seq）。今晨日志显示手机反复 initialize 重连，wss 多次
+1012 断开——每代流留在 streams 里。
+
+### 根因
+
+fanOut 向 streams 里**所有**（含已死/僵尸）流广播通知副本；僵尸流永不 ack，其副本
+持续占据全局 128 未 ack 缓冲 → 活跃流 delta 帧被背压滞留 → 手机拼接出随机前缀。
+渐进形态与转录吻合（1/3 完整、2/3 丢尾句、3/3 丢更多）。无 pending 溢出 WARN 是
+因为每流 pending 仅几十帧（远小于 256）。
+
+### codex 对应（client_tracker.rs / websocket.rs）
+
+- 只有 ClientMessage/Initialize **注册连接**（`clients.insert`），此后才接收通知；
+  ping/ack 不注册（Ping 对未注册 client 只回一次性 Pong Unknown，client_tracker.rs
+  :222-242）。
+- 空闲回收：`REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT=10min` + 30s 扫描
+  `close_expired_clients`（:27-28/:295-310，websocket.rs:1155 消费）。
+- 通知出站只经活跃连接的 writer（连接关闭/过期即无新增帧）。
+- 背压=停读上游 channel（websocket.rs:1010-1019），不丢不截。
+
+### 修复（src/wham/tunnel.ts）
+
+- StreamState 增 `registered`（client_message/分片重组到达即注册）与
+  `lastInboundAt`（入站续命；ping 只给已注册流续命）。
+- fanOut 只发注册流（ping/ack-only 流不收副本）。
+- `sweepIdleStreams`（挂 ping 定时器）：空闲 ≥10min 整流回收（删流/归还容量/
+  forgetClient，对齐 codex）；全局背压且有积压流静默 ≥60s 时**加速回收**（自设止损：
+  防僵尸流饿死活跃流；活跃流有 ≤10s ping 续命不会误伤），回收后立即跨流排空。
+- daemon 帧级 jsonl 日志默认落实例目录 `frames.jsonl`（本次定位受限于无帧记录）。
+- 测试：T9（僵尸流饿死复现+修复，旧实现反向证伪失败确认）、T10（ping-only 不
+  fan-out）、T11（空闲回收闭环）；全量 173/173。
+
+### 真机复测
+
+重跑 `test queue`：排队后手机消息应完整（即便中途锁屏/切换致 wss 断代，最长 60s
+自愈）；`~/.cgrcb/instances/sim/frames.jsonl` 可核对双向帧与 ack。

@@ -140,6 +140,11 @@ export class MockWhamServer {
    * 保持原样（含重放造成的重复），供既有断言与重放计数。
    */
   readonly dedupedNotifications: Array<{ seqId: number; method: string; params: unknown }> = [];
+  /**
+   * 按 stream_id 分组的去重通知（多流 fan-out 与流生命周期测试断言用；
+   * 重放重复同样按 (client,stream,seq) 去重）。
+   */
+  readonly dedupedByStream = new Map<string, Array<{ seqId: number; method: string }>>();
   private readonly dedupedNotificationKeys = new Set<string>();
   /**
    * server_message 到达时序（响应/服务器请求/通知同序记录，测试断言
@@ -741,6 +746,9 @@ export class MockWhamServer {
                 method: message.method,
                 params: message.params,
               });
+              const byStream = this.dedupedByStream.get(envelope.stream_id) ?? [];
+              byStream.push({ seqId: envelope.seq_id, method: message.method });
+              this.dedupedByStream.set(envelope.stream_id, byStream);
             }
           }
           this.log(

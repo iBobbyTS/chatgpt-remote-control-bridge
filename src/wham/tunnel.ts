@@ -21,6 +21,10 @@
  *   重放缓冲（含 pong）再补发 pending（seq 单调连续）。pending 每流上限 256，溢出先合并
  *   相邻同 itemId delta（pong 不合并），仍溢出才丢最旧（未分配 seq，无空洞）。
  *   订阅游标：任意入站信封 cursor last-writer-wins，重连握手带 x-codex-subscribe-cursor。
+ * - 流生命周期（对齐 client_tracker.rs）：只有收到过请求（client_message/分片重组）的流才是
+ *   "已注册连接"、接收通知 fan-out（ping/ack-only 流不注册）。空闲 10 分钟整流回收；
+ *   全局背压时有积压且静默 ≥60s 的流加速回收——不回收时死/僵尸流的副本会永久占据全局
+ *   未 ack 缓冲，把活跃流的通知饿成随机截断（真机 queue 复测根因）。
  *
  * 与具体下游解耦：只依赖 AgentApp 接口（src/agents/types.ts）。
  *
@@ -75,8 +79,20 @@ export interface WhamTunnelOptions {
   reconnectDelayMs?: number;
   /** token 剩余寿命低于该值即续期。默认 60s。 */
   refreshThresholdMs?: number;
-  /** ping/临期检查定时器周期。默认 10_000ms。 */
+  /** ping/临期检查/空闲回收扫描定时器周期。默认 10_000ms。 */
   pingIntervalMs?: number;
+  /**
+   * 流空闲回收阈值：某 (client,stream) 超过该时长无入站活动即整流回收
+   * （删流状态/未 ack 缓冲/pending，forgetClient）。对齐 codex
+   * client_tracker.rs REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT=10min。默认 600_000ms。
+   */
+  streamIdleTimeoutMs?: number;
+  /**
+   * 全局背压时（未 ack 缓冲满 128）对有积压流的加速回收阈值：无入站活动超过该时长
+   * 即回收，防止不 ack 的死/僵尸流永久占据全局容量饿死活跃流（真机 queue 复测截断
+   * 根因）。默认 60_000ms；活跃流有周期 ping（≤10s）刷新活跃，不会被误回收。
+   */
+  backpressureIdleTimeoutMs?: number;
   /** WSS 握手 UA 后缀标识。默认 "bridge"。 */
   agentLabel?: string;
   /** 实例故障回调（内部 API，S02 消费）：异步链错误/handleRequest rejection。 */
@@ -98,6 +114,10 @@ type Enrollment = EnrollRemoteServerResponse;
 const OUTBOUND_BUFFER_CAPACITY = 128;
 /** 每流 pending（未分配 seq）上限；溢出先合并相邻同 itemId delta，仍溢出才丢最旧。 */
 const OUTBOUND_PENDING_CAPACITY = 256;
+/** 流空闲回收阈值（对齐 codex client_tracker.rs REMOTE_CONTROL_CLIENT_IDLE_TIMEOUT）。 */
+const STREAM_IDLE_TIMEOUT_MS = 10 * 60_000;
+/** 全局背压时有积压流的加速回收阈值（自设止损：真机死/僵尸流饿死活跃流的截断根因）。 */
+const BACKPRESSURE_IDLE_TIMEOUT_MS = 60_000;
 
 /**
  * pending 队列元素：server_message 载荷或 pong。两者走同一有界可靠层（对齐 codex
@@ -113,6 +133,14 @@ interface StreamState {
   streamId: string;
   lastAckedSeq: number;
   sentSeq: number;
+  /**
+   * 是否为"已注册连接"（该流收到过 client_message / 分片重组完成的请求）。
+   * 对齐 codex client_tracker.rs：只有 ClientMessage/Initialize 注册连接、才接收
+   * 通知 fan-out；ping/ack 不注册（免得仅探活流吃通知副本）。
+   */
+  registered: boolean;
+  /** 最近一次入站活动时刻（client_message/chunk/ack，或已注册流的 ping）。 */
+  lastInboundAt: number;
   /** 已发送未 ack 的出站帧（seq 升序、整帧含 seq_id）：重连时原样重放（含 pong）。 */
   buffer: Array<{ seq: number; frame: Record<string, unknown> }>;
   /** WS 未就绪/缓冲满时暂存的出站事件（未分配 seq，server_message 可合并/丢弃）。 */
@@ -145,6 +173,8 @@ export class WhamTunnel extends EventEmitter {
   private readonly reconnectDelayMs: number;
   private readonly refreshThresholdMs: number;
   private readonly pingIntervalMs: number;
+  private readonly streamIdleTimeoutMs: number;
+  private readonly backpressureIdleTimeoutMs: number;
   private readonly agentLabel: string;
   private readonly onFault?: (err: unknown, context: string) => void;
   private readonly jsonlPath?: string;
@@ -188,6 +218,9 @@ export class WhamTunnel extends EventEmitter {
     this.reconnectDelayMs = opts.reconnectDelayMs ?? 2000;
     this.refreshThresholdMs = opts.refreshThresholdMs ?? 60_000;
     this.pingIntervalMs = opts.pingIntervalMs ?? 10_000;
+    this.streamIdleTimeoutMs = opts.streamIdleTimeoutMs ?? STREAM_IDLE_TIMEOUT_MS;
+    this.backpressureIdleTimeoutMs =
+      opts.backpressureIdleTimeoutMs ?? BACKPRESSURE_IDLE_TIMEOUT_MS;
     this.agentLabel = opts.agentLabel ?? "bridge";
     this.onFault = opts.onFault;
     this.jsonlPath = opts.jsonlPath;
@@ -452,6 +485,7 @@ export class WhamTunnel extends EventEmitter {
         return;
       }
       ws.ping();
+      this.sweepIdleStreams();
       // 临期检查（S01 新契约）：WSS 长连接期间也必须刷新 token
       void this.ensureFreshEnrollment().catch((err) => this.fault(err, "expiry-renew"));
     }, this.pingIntervalMs);
@@ -462,6 +496,46 @@ export class WhamTunnel extends EventEmitter {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
+  }
+
+  /**
+   * 空闲流回收（对齐 codex client_tracker.rs close_expired_clients：10 分钟空闲，
+   * 周期扫描挂在 ping 定时器）。全局背压（未 ack 缓冲满 128）时对"有积压且静默超过
+   * backpressureIdleTimeoutMs"的流加速回收——真机复现的死/僵尸流（wss 断代或换流后
+   * 不再 ack）会永久占据全局容量，把活跃流的 delta 饿成随机截断；活跃流有周期
+   * ping（≤10s）续命，加速档不会误伤。
+   */
+  private sweepIdleStreams(): void {
+    if (this.stopped || this.streams.size === 0) return;
+    const now = Date.now();
+    const backpressure = this.bufferedUsed >= OUTBOUND_BUFFER_CAPACITY;
+    let reaped = false;
+    for (const [key, state] of this.streams) {
+      const idleMs = now - state.lastInboundAt;
+      const hasBacklog = state.pending.length > 0 || state.buffer.length > 0;
+      if (idleMs >= this.streamIdleTimeoutMs) {
+        this.reapStream(key, state, `空闲 ${Math.round(idleMs / 1000)}s 回收`);
+        reaped = true;
+      } else if (backpressure && hasBacklog && idleMs >= this.backpressureIdleTimeoutMs) {
+        this.reapStream(key, state, `背压 + 静默 ${Math.round(idleMs / 1000)}s 加速回收`);
+        reaped = true;
+      }
+    }
+    // 回收释放了全局容量：立即跨流排空，活跃流积压的 pending 不等下一次 ack。
+    if (reaped) this.drainPendingAcrossStreams();
+  }
+
+  /** 整流回收：删流状态与分片重组、归还全局容量、通知下游 forgetClient。 */
+  private reapStream(key: string, state: StreamState, reason: string): void {
+    this.bufferedUsed -= state.buffer.length;
+    this.streams.delete(key);
+    this.chunkReassembler.delete(key);
+    this.app.forgetClient({ clientId: state.clientId, streamId: state.streamId });
+    const via = reason.startsWith("背压") ? this.warn.bind(this) : this.log.bind(this);
+    via(
+      `流回收 ${state.clientId}/${state.streamId}（${reason}；释放缓冲 ${state.buffer.length}、` +
+        `丢弃 pending ${state.pending.length}）`,
+    );
   }
 
   private scheduleReconnect(): void {
@@ -528,6 +602,15 @@ export class WhamTunnel extends EventEmitter {
     // 订阅游标：任意入站 client 信封的 cursor 都记为隧道单一最近值（last-writer-wins）
     if (envelope.cursor !== undefined) {
       this.subscribeCursor = envelope.cursor;
+    }
+    // 入站活动续命（空闲回收判据）：client_message/chunk/ack 一律刷新；ping 只给
+    // 已注册连接续命（对齐 codex client_tracker.rs Ping 分支——未注册探活不续命，
+    // 否则仅 ping 的流永不回收、其未 ack pong 会慢性占满全局缓冲）。
+    if (envelope.type !== "client_closed" && envelope.type !== "ping") {
+      this.streamState(envelope).lastInboundAt = Date.now();
+    } else if (envelope.type === "ping") {
+      const pinged = this.streams.get(`${envelope.client_id}/${envelope.stream_id ?? ""}`);
+      if (pinged?.registered) pinged.lastInboundAt = Date.now();
     }
     switch (envelope.type) {
       case "client_message": {
@@ -606,6 +689,10 @@ export class WhamTunnel extends EventEmitter {
       // 手机对我们发起的请求（attestation 等）的响应；本实现不主动发请求，忽略
       return;
     }
+    // 请求到达即注册连接（对齐 codex：Initialize/ClientMessage 才注册，此后该流接收
+    // 通知 fan-out；ping/ack-only 的流不注册、不吃通知副本）。
+    const dispatchState = this.streamState(envelope);
+    dispatchState.registered = true;
     const method = message.method;
     const key = { clientId: envelope.client_id, streamId: envelope.stream_id ?? "" };
     let outcome: JsonRpcOutcome;
@@ -636,14 +723,14 @@ export class WhamTunnel extends EventEmitter {
 
   private fanOut(event: AgentNotification): void {
     try {
-      for (const key of this.streams.keys()) {
-        const separator = key.indexOf("/");
-        const clientId = key.slice(0, separator);
-        const streamId = key.slice(separator + 1);
-        const clientState = this.app.clientState({ clientId, streamId });
+      for (const state of this.streams.values()) {
+        // 只发"已注册连接"（收到过该流请求）。未注册流（仅 ping/ack）不收通知副本，
+        // 否则其副本占用全局未 ack 缓冲且永无 ack，会把活跃流饿死（真机截断根因）。
+        if (!state.registered) continue;
+        const clientState = this.app.clientState({ clientId: state.clientId, streamId: state.streamId });
         if (clientState.optOut.has(event.method)) continue;
         if (event.threadId && clientState.unsubscribed.has(event.threadId)) continue;
-        this.sendEnvelope(clientId, streamId, {
+        this.sendEnvelope(state.clientId, state.streamId, {
           type: "server_message",
           message: {
             method: event.method,
@@ -668,6 +755,8 @@ export class WhamTunnel extends EventEmitter {
         streamId,
         lastAckedSeq: 0,
         sentSeq: 0,
+        registered: false,
+        lastInboundAt: Date.now(),
         buffer: [],
         pending: [],
       };

@@ -181,6 +181,8 @@ async function startStubTunnel(opts: {
   logs?: string[];
   pingIntervalMs?: number;
   reconnectDelayMs?: number;
+  streamIdleTimeoutMs?: number;
+  backpressureIdleTimeoutMs?: number;
   onFault?: (err: unknown, context: string) => unknown;
 }): Promise<{ tunnel: WhamTunnel; app: StubAgentApp; home: string; authManager: BridgeAuthManager }> {
   const { authManager, home } = await makeAuthManager();
@@ -192,6 +194,8 @@ async function startStubTunnel(opts: {
     installationDir: home,
     reconnectDelayMs: opts.reconnectDelayMs ?? 0,
     pingIntervalMs: opts.pingIntervalMs ?? 10_000,
+    streamIdleTimeoutMs: opts.streamIdleTimeoutMs,
+    backpressureIdleTimeoutMs: opts.backpressureIdleTimeoutMs,
     refreshThresholdMs: 60_000,
     log: (line) => opts.logs?.push(line),
     onFault: opts.onFault,
@@ -1467,6 +1471,154 @@ test("B4 关 autoAck 手动 ack pong：未 ack 缓冲下降且后续帧可发出
     app.emit("event", { method: "b4/after", params: {} } satisfies AgentNotification);
     await waitFor(() => server.receivedSeqIds.includes(3), 5000, "后续帧应以 seq 3 发出");
     assert.equal(tunnel.outboundBacklog().buffered, 1, "后续通知入未 ack 缓冲");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T9 僵尸流副本不得饿死活跃流：背压加速回收后活流通知完整且 seq 连续（真机 queue 截断根因）", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const zombieStream = randomUUID();
+  const logs: string[] = [];
+  const { tunnel, app } = await startStubTunnel({
+    mock: server,
+    logs,
+    pingIntervalMs: 20, // sweep 周期
+    streamIdleTimeoutMs: 10_000, // 不走慢档
+    backpressureIdleTimeoutMs: 60, // 静默 60ms 即加速回收
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    // 两条已注册流：活流持续 ack；僵尸流发完 initialize 后静默且永不 ack
+    await server.rpc("initialize", { clientInfo: { name: "live" } });
+    await server.rpc("initialize", { clientInfo: { name: "zombie" } }, undefined, zombieStream);
+    const live = server.mobileStreamId;
+    const ackLive = () => {
+      for (const e of server.dedupedByStream.get(live) ?? []) server.ack(e.seqId, live);
+    };
+
+    // > 128 条通知：僵尸流副本必然把全局未 ack 缓冲打满（活流被背压）
+    const TOTAL = 200;
+    for (let i = 0; i < TOTAL; i += 1) {
+      app.emit("event", { method: `flood/${i}`, params: { n: i } } satisfies AgentNotification);
+    }
+    await waitFor(() => (server.dedupedByStream.get(live)?.length ?? 0) > 0, 5000);
+    // 模拟真机活流持续 ack（否则活流自身的未确认帧也会占满容量）
+    const ackTimer = setInterval(ackLive, 30);
+    try {
+      // sweep 应在 backpressureIdleTimeoutMs + sweep 周期内回收僵尸流并立即排空活流 pending
+      await waitFor(
+        () => (server.dedupedByStream.get(live)?.length ?? 0) >= TOTAL,
+        8000,
+        "活流未收齐全部通知（被僵尸流饿死）",
+      );
+    } finally {
+      clearInterval(ackTimer);
+    }
+    ackLive();
+    const liveEntries = server.dedupedByStream.get(live)!;
+    assert.equal(liveEntries.length, TOTAL, "活流应恰好收到每条通知一次");
+    for (let i = 0; i < liveEntries.length; i += 1) {
+      assert.equal(liveEntries[i].method, `flood/${i}`, `通知应按序到达（第 ${i} 条）`);
+    }
+    const seqs = liveEntries.map((e) => e.seqId);
+    assertContiguousSeqs(seqs, "T9 活流通知 seq");
+    assert.ok(logs.some((l) => l.includes("流回收")), "僵尸流回收应留日志");
+    // 僵尸流被回收后不再接收后续通知副本
+    const zombieCount = server.dedupedByStream.get(zombieStream)?.length ?? 0;
+    app.emit("event", { method: "after/reap", params: {} } satisfies AgentNotification);
+    await waitFor(() => (server.dedupedByStream.get(live)?.some((e) => e.method === "after/reap") ?? false), 5000);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(
+      server.dedupedByStream.get(zombieStream)?.length ?? 0,
+      zombieCount,
+      "回收后的僵尸流不得再收通知副本",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T10 ping/ack-only 流不注册：pong 照回但不接收通知 fan-out 副本", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    const probe = randomUUID();
+    server.sendPing(probe); // 仅探活流：不发任何请求
+    await waitFor(
+      () => server.receivedPongs.some((p) => p.stream_id === probe),
+      5000,
+      "未注册流的 ping 仍应回 pong",
+    );
+    await server.rpc("initialize", { clientInfo: { name: "live" } });
+    app.emit("event", { method: "pingonly/x", params: {} } satisfies AgentNotification);
+    await waitFor(
+      () => server.dedupedByStream.get(server.mobileStreamId)?.some((e) => e.method === "pingonly/x") ?? false,
+      5000,
+      "注册流应收到通知",
+    );
+    assert.equal(
+      (server.dedupedByStream.get(probe) ?? []).filter((e) => e.method === "pingonly/x").length,
+      0,
+      "ping-only 流不得收到通知副本",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T11 空闲回收：注册流静默超时后整流回收（容量归还 + forgetClient + 不再 fan-out）", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const logs: string[] = [];
+  const { tunnel, app } = await startStubTunnel({
+    mock: server,
+    logs,
+    pingIntervalMs: 20,
+    streamIdleTimeoutMs: 80, // 静默 80ms 即回收
+    backpressureIdleTimeoutMs: 10_000,
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "live" } }); // 默认流注册并保持活跃
+    // 已注册流的周期 ping 续命（对齐真机活跃流），确保空闲回收只命中静默流
+    const keepAlive = setInterval(() => server.sendPing(), 20);
+    const idleStream = randomUUID();
+    await server.rpc("initialize", { clientInfo: { name: "idle" } }, undefined, idleStream);
+    app.emit("event", { method: "idle/x", params: {} } satisfies AgentNotification);
+    await waitFor(
+      () => (server.dedupedByStream.get(idleStream)?.length ?? 0) > 0,
+      5000,
+      "回收前该流应收到通知",
+    );
+    assert.ok(tunnel.outboundBacklog().buffered >= 1, "未 ack 帧占用全局缓冲");
+
+    // 静默（无 ack/ping/rpc）→ sweep 空闲回收（注意：活跃流的未 ack pong 仍占缓冲，
+    // 全局 buffered 不会归零，故以回收日志为准）
+    await waitFor(
+      () => logs.some((l) => l.includes("流回收") && l.includes(idleStream)),
+      5000,
+      "静默流未被空闲回收",
+    );
+    assert.ok(app.states.has(`${server.mobileClientId}/${idleStream}`) === false, "回收应 forgetClient");
+    app.emit("event", { method: "idle/y", params: {} } satisfies AgentNotification);
+    await waitFor(
+      () => server.dedupedByStream.get(server.mobileStreamId)?.some((e) => e.method === "idle/y") ?? false,
+      5000,
+      "默认流应继续收到通知",
+    );
+    assert.equal(
+      (server.dedupedByStream.get(idleStream) ?? []).filter((e) => e.method === "idle/y").length,
+      0,
+      "回收后的流不得再收通知",
+    );
+    clearInterval(keepAlive);
   } finally {
     await tunnel.stop();
     await server.stop();
