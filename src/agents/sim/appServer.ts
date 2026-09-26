@@ -450,22 +450,18 @@ export class SimApp extends EventEmitter implements AgentApp {
       this.persistState();
     }
     this.emitSoon("thread/started", { thread: this.serializeThread(thread, []) });
-    return { thread: this.serializeThread(thread, []) };
+    return this.threadContext(thread);
   }
 
-  private threadResume(p: AnyParams): unknown {
-    const state = this.threadState(p);
-    if (p.cwd) {
-      state.thread.cwd = p.cwd;
-      state.thread.environments = [
-        { environmentId: "local", cwd: p.cwd, runtimeWorkspaceRoots: [p.cwd] },
-      ];
-    }
-    if (p.model) state.thread.model = p.model;
-    this.persistState();
-    const thread = this.serializeThread(state.thread, []);
+  /**
+   * thread/start 与 thread/resume 共用的会话上下文响应形状
+   * （真实抓包 2026-09-25T18:38:02Z：thread 外还有 13 个顶层键）。
+   * thread/start 只回 {thread} 会让手机 Swift 必填字段解码失败
+   * →「无法解码Codex响应」，发消息流程在 turn/start 之前中止。
+   */
+  private threadContext(thread: ThreadRecord): Record<string, unknown> {
     return {
-      thread,
+      thread: this.serializeThread(thread, []),
       model: thread.model,
       modelProvider: "openai",
       serviceTier: null,
@@ -483,9 +479,24 @@ export class SimApp extends EventEmitter implements AgentApp {
         excludeSlashTmp: false,
       },
       activePermissionProfile: null,
-      reasoningEffort: state.thread.reasoningEffort,
-      collaborationMode: { mode: "default", settings: { model: thread.model, reasoning_effort: "medium" } },
+      reasoningEffort: thread.reasoningEffort,
       multiAgentMode: "explicitRequestOnly",
+    };
+  }
+
+  private threadResume(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    if (p.cwd) {
+      state.thread.cwd = p.cwd;
+      state.thread.environments = [
+        { environmentId: "local", cwd: p.cwd, runtimeWorkspaceRoots: [p.cwd] },
+      ];
+    }
+    if (p.model) state.thread.model = p.model;
+    this.persistState();
+    return {
+      ...this.threadContext(state.thread),
+      collaborationMode: { mode: "default", settings: { model: state.thread.model, reasoning_effort: "medium" } },
       initialTurnsPage: null,
       // 非空 cursor：手机据此调用 turns/items list 拉取历史；null 会让手机认为没有历史
       turnsBackwardsCursor: this.cursorFor(state.thread.id, state.thread.turns.length, "turns"),

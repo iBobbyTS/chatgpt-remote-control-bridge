@@ -195,6 +195,27 @@ thread/start 的 cwd——服务端没有任何「默认目录」接口。模拟
 → 修复（2026-09-25 深夜三）：两字段 `Math.round()` 取整；picker 回归测试加
 整毫秒断言（$HOME 的 stat 即小数毫秒，本机可证伪）。
 
+### 新线程发消息报「无法解码Codex响应」（2026-09-25 深夜四）
+
+文件夹与整毫秒修通后，用户新建线程发普通消息必报「无法解码Codex响应」。
+日志特征：发送链路停在 `config/read → configRequirements/read →
+collaborationMode/list → (thread/start) → process/spawn` 之后，`turn/start`
+从未出现；且隧道日志**零错误行**（`✗` 只记到达后失败的方法）——即手机在
+发出 turn/start 之前就放弃了。
+
+根因：真实 codex 的 `thread/start` 响应有 **14 个顶层键**（抓包
+2026-09-25T18:38:02Z：thread + model/modelProvider/serviceTier/
+disabledPluginIds/cwd/runtimeWorkspaceRoots/instructionSources/approvalPolicy/
+approvalsReviewer/sandbox/activePermissionProfile/reasoningEffort/
+multiAgentMode），模拟层只回 `{thread}`。手机 Swift 把这些会话上下文当必填
+字段，解码失败即中止发送。旧流程（打开预置线程）走 `thread/resume`，其响应
+本就带全键，所以此前从未暴露——`thread/start` 是发消息链路里唯一没被真机
+验证过形状的方法。
+
+→ 修复：抽 `threadContext()` 共用构造器（`thread/resume` 原有键集为蓝本），
+`thread/start` 返回全套上下文；回归测试断言响应键集与真实抓包一致（14 键
+deepEqual + sandbox/approvalPolicy 抽查），stash 证伪通过。
+
 ## 对齐 codex 线程生命周期（源码实证）
 
 codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁盘 rollout；

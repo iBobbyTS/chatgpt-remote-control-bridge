@@ -129,9 +129,36 @@ test("回环：initialize / thread/list（固定列表）/ thread/start / turn �
     const started = (await loop.mock.rpc("thread/start", {
       cwd: "/Users/ibobby/Documents/Codex/2026-09-25/sim-test",
       threadSource: "user",
-    })) as { result: { thread: { id: string; cwd: string } } };
+    })) as {
+      result: { thread: { id: string; cwd: string }; sandbox: { type: string }; approvalPolicy: string } &
+        Record<string, unknown>;
+    };
     const threadId = started.result.thread.id;
     assert.equal(started.result.thread.cwd, "/Users/ibobby/Documents/Codex/2026-09-25/sim-test");
+    // 真实 thread/start 响应共 14 个顶层键（thread + 13 个会话上下文字段，抓包
+    // 2026-09-25T18:38:02Z）。只回 {thread} 手机 Swift 必填字段解码失败 →
+    // 「无法解码Codex响应」，发消息在 turn/start 之前中止（2026-09-25 真机复现）
+    assert.deepEqual(
+      Object.keys(started.result).sort(),
+      [
+        "activePermissionProfile",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "disabledPluginIds",
+        "instructionSources",
+        "model",
+        "modelProvider",
+        "multiAgentMode",
+        "reasoningEffort",
+        "runtimeWorkspaceRoots",
+        "sandbox",
+        "serviceTier",
+        "thread",
+      ],
+    );
+    assert.equal(started.result.sandbox.type, "workspaceWrite");
+    assert.equal(started.result.approvalPolicy, "on-request");
 
     // turn/start → 通知事件流
     const turn = (await loop.mock.rpc("turn/start", {
