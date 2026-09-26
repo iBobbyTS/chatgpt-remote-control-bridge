@@ -20,7 +20,10 @@ import {
   PLUGINS,
   SECTIONS,
   SKILLS,
+  type CollaborationMode,
   type CommandExecutionItem,
+  type ContextCompactionItem,
+  defaultCollaborationMode,
   fixedThreads,
   makeAgentMessage,
   makeCommandExecution,
@@ -29,8 +32,11 @@ import {
   makeUserMessage,
   readConfig,
   type ItemEntry,
+  type SimGoal,
+  type SimGoalStatus,
   type SimItem,
   type TextContent,
+  type ThreadGitInfo,
   type ThreadRecord,
   type TurnRecord,
 } from "./data.ts";
@@ -77,6 +83,10 @@ export interface SimAppOptions {
   deltaChars?: number;
   /** 特殊指令模拟命令 "wait 15 seconds" 的真实等待时长。默认 15000ms（测试可调小）。 */
   commandWaitMs?: number;
+  /** compact 模拟耗时。默认 5000ms（测试可调小）。 */
+  compactWaitMs?: number;
+  /** thread/shellCommand 模拟耗时。默认 2000ms（测试可调小）。 */
+  shellWaitMs?: number;
   /** 服务器信息（remoteControl/status/changed 通知用），由 server 注入。 */
   getServerInfo?: () => { serverName: string; installationId: string; environmentId: string } | null;
   accountInfo?: { authMode: string; planType: string | null };
@@ -99,6 +109,20 @@ interface SimTurnRuntime {
   timers: Set<NodeJS.Timeout>;
   steerInputs: Array<{ text: string; clientUserMessageId: string | null }>;
   ended: boolean;
+  /**
+   * turn 种类（S03）：normal=普通/shell 轻量 turn；compact=thread/compact/start
+   * 创建的压缩 turn。compact turn 不可 steer、不可被 turn/start 接管
+   * （对齐 codex TaskKind::Compact，turn_input.rs:660-680）。
+   */
+  kind: "normal" | "compact";
+}
+
+/** thread/shellCommand 登记的后台终端条目（v2/thread.rs:1215-1224）。 */
+interface BackgroundTerminalEntry {
+  itemId: string;
+  processId: string;
+  command: string;
+  cwd: string;
 }
 
 interface ThreadState {
@@ -106,6 +130,17 @@ interface ThreadState {
   items: ItemEntry[];
   queue: QueuedSubmission[];
   sim: SimTurnRuntime | null;
+  /** 线程目标（v2/thread.rs:813），持久化；旧快照缺字段按 null。 */
+  goal: SimGoal | null;
+  /** compact 刚完成标记（内存态，不持久化）；下一个普通 turn 回复首行提示后清除。 */
+  justCompacted: boolean;
+  /** 后台终端（不持久化）：thread/shellCommand 完成后登记。 */
+  backgroundTerminals: BackgroundTerminalEntry[];
+}
+
+/** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
+function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
+  return { thread, items, queue: [], sim: null, goal: null, justCompacted: false, backgroundTerminals: [] };
 }
 
 type AnyParams = Record<string, any>;
@@ -119,6 +154,14 @@ const HELP_TEXT = [
   "help: 输出本条帮助信息",
   'test steer：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试steer强制插入消息的效果。',
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
+  "",
+  "模拟功能（对齐 codex）：",
+  "goal 设置后 turn 结束自动清除",
+  "compact 约 5 秒完成且下一条回复标记",
+  "Plan 模式回复带前缀",
+  "shell 命令生成模拟命令条目",
+  "branch 经 thread/metadata/update 设置、fork 复制历史",
+  "消息含 $技能名 会确认加载",
 ].join("\n");
 
 /** 特殊指令识别：trim + 大小写不敏感的完全匹配。 */
@@ -137,7 +180,10 @@ export class SimApp extends EventEmitter implements AgentApp {
   private readonly overlayDirs = new Set<string>();
   private readonly overlayChildren = new Map<string, Set<string>>();
   private readonly opts: Required<
-    Pick<SimAppOptions, "codexHome" | "stepDelayMs" | "deltaIntervalMs" | "deltaChars" | "commandWaitMs">
+    Pick<
+      SimAppOptions,
+      "codexHome" | "stepDelayMs" | "deltaIntervalMs" | "deltaChars" | "commandWaitMs" | "compactWaitMs" | "shellWaitMs"
+    >
   > &
     SimAppOptions;
   private closed = false;
@@ -155,6 +201,8 @@ export class SimApp extends EventEmitter implements AgentApp {
       deltaIntervalMs: 90,
       deltaChars: 8,
       commandWaitMs: 15_000,
+      compactWaitMs: 5_000,
+      shellWaitMs: 2_000,
       ...opts,
     };
     if (this.opts.statePath) {
@@ -169,7 +217,7 @@ export class SimApp extends EventEmitter implements AgentApp {
   private seedPresetThreads(): void {
     this.threads.clear();
     for (const [id, fixed] of fixedThreads()) {
-      this.threads.set(id, { thread: fixed.thread, items: fixed.items, queue: [], sim: null });
+      this.threads.set(id, makeThreadState(fixed.thread, fixed.items));
     }
   }
 
@@ -184,18 +232,26 @@ export class SimApp extends EventEmitter implements AgentApp {
       return; // 无存档：首次启动
     }
     try {
-      const parsed = JSON.parse(raw) as Array<{ thread: ThreadRecord; items: ItemEntry[] }>;
+      const parsed = JSON.parse(raw) as Array<{
+        thread: ThreadRecord;
+        items: ItemEntry[];
+        goal?: SimGoal | null;
+      }>;
       for (const entry of parsed) {
         if (entry?.thread?.id) {
           if ((entry.thread.turns ?? []).length === 0) {
             continue; // 零 turn 线程不跨重启存活（对齐 codex shutdown 清理）
           }
-          this.threads.set(entry.thread.id, {
-            thread: entry.thread,
-            items: entry.items ?? [],
-            queue: [],
-            sim: null,
-          });
+          // 旧快照兼容：S03 之前的存档无 collaborationMode / gitInfo 等新字段
+          if (!entry.thread.collaborationMode) {
+            entry.thread.collaborationMode = defaultCollaborationMode(entry.thread.model ?? DEFAULT_MODEL);
+          }
+          entry.thread.forkedFromId ??= null;
+          entry.thread.projectId ??= null;
+          entry.thread.gitInfo ??= null;
+          const state = makeThreadState(entry.thread, entry.items ?? []);
+          state.goal = entry.goal ?? null;
+          this.threads.set(entry.thread.id, state);
         }
       }
     } catch (err) {
@@ -204,12 +260,13 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /** 落盘快照：非 ephemeral 线程（persistState 与 reset 显式写共用同一形状）。 */
-  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[] }> {
+  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[]; goal: SimGoal | null }> {
     return [...this.threads.values()]
       .filter((t) => !t.thread.ephemeral)
       .map((t) => ({
         thread: t.thread,
         items: t.items,
+        goal: t.goal,
       }));
   }
 
@@ -370,8 +427,12 @@ export class SimApp extends EventEmitter implements AgentApp {
         return this.itemsList(p);
       case "threadSection/list":
         return SECTIONS;
+      case "thread/goal/set":
+        return this.goalSet(p);
       case "thread/goal/get":
-        return { goal: null };
+        return this.goalGet(p);
+      case "thread/goal/clear":
+        return this.goalClear(p);
       case "turn/start":
         return this.turnStart(p);
       case "turn/steer":
@@ -392,7 +453,36 @@ export class SimApp extends EventEmitter implements AgentApp {
       case "thread/queue/delete":
         return this.queueDelete(p);
       case "thread/compact/start":
+        return this.compactStart(p);
+      case "thread/shellCommand":
+        return this.shellCommand(p);
+      // codex 权威方法名带 thread/ 前缀（common.rs:737-753）；裸名作兼容别名
+      case "thread/backgroundTerminals/list":
+      case "backgroundTerminals/list":
+        return this.backgroundTerminalsList(p);
+      case "thread/backgroundTerminals/terminate":
+      case "backgroundTerminals/terminate":
+        return this.backgroundTerminalsTerminate(p);
+      case "thread/backgroundTerminals/clean":
+      case "backgroundTerminals/clean":
+        return this.backgroundTerminalsClean(p);
+      case "thread/metadata/update":
+        return this.metadataUpdate(p);
+      case "thread/fork":
+        return this.threadFork(p);
+      case "server/diagnostics":
+        return this.diagnostics();
+      case "remoteControl/status/read":
+        return this.remoteControlStatusRead();
+      case "memory/status":
+        // v2/memory.rs:20-23：{v2ConsolidatedThreads, v2Ready}
+        return { v2ConsolidatedThreads: 0, v2Ready: false };
+      case "skills/extraRoots/set":
         return {};
+      case "skills/config/write":
+        return this.skillsConfigWrite(p);
+      case "plugin/skill/read":
+        return this.pluginSkillRead(p);
       case "thread/settings/update":
         return this.settingsUpdate(p);
       case "fs/readDirectory":
@@ -473,7 +563,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     // ephemeral:true = 手机端的「起名线程」：仅内存、不落盘、不进列表
     thread.ephemeral = p.ephemeral === true;
     if (p.model) thread.model = p.model;
-    this.threads.set(thread.id, { thread, items: [], queue: [], sim: null });
+    this.threads.set(thread.id, makeThreadState(thread, []));
     if (!thread.ephemeral) {
       this.persistState();
     }
@@ -522,9 +612,27 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     if (p.model) state.thread.model = p.model;
     this.persistState();
+    // MB5：resume 响应先行，随后用**宏任务**补发 goal 快照（对齐
+    // thread_processor.rs:4181-4187 emit_resume_goal_snapshot）。禁用 emitSoon
+    // 微任务：微任务可能仍先于 dispatchMessage 写响应（appServer.ts:674 注释记录的
+    // 「响应先行陷阱」）。有 goal → thread/goal/updated；无 → thread/goal/cleared。
+    this.schedule(null, () => {
+      if (this.closed) return;
+      const current = this.threads.get(state.thread.id);
+      if (!current) return;
+      if (current.goal) {
+        this.emit("event", this.notification("thread/goal/updated", {
+          threadId: current.thread.id,
+          turnId: null,
+          goal: current.goal,
+        }, current.thread.id));
+      } else {
+        this.emit("event", this.notification("thread/goal/cleared", { threadId: current.thread.id }, current.thread.id));
+      }
+    }, 0);
     return {
       ...this.threadContext(state.thread),
-      collaborationMode: { mode: "default", settings: { model: state.thread.model, reasoning_effort: "medium" } },
+      collaborationMode: state.thread.collaborationMode,
       initialTurnsPage: null,
       // 非空 cursor：手机据此调用 turns/items list 拉取历史；null 会让手机认为没有历史
       turnsBackwardsCursor: this.cursorFor(state.thread.id, state.thread.turns.length, "turns"),
@@ -577,6 +685,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (p.model) state.thread.model = p.model;
     if (p.effort) state.thread.reasoningEffort = p.effort;
     if (p.cwd) state.thread.cwd = p.cwd;
+    this.applyCollaborationMode(state, p);
     this.persistState();
     this.emitSoon(
       "thread/settings/updated",
@@ -596,11 +705,50 @@ export class SimApp extends EventEmitter implements AgentApp {
           },
           activePermissionProfile: null,
           model: state.thread.model,
+          // ThreadSettings.collaboration_mode 非 optional（v2/thread.rs:304-335）
+          collaborationMode: state.thread.collaborationMode,
         },
       },
       state.thread.id,
     );
     return {};
+  }
+
+  /**
+   * 解析并落线程 collaborationMode（turn/start 与 thread/settings/update 共用）。
+   * 形状校验：mode 只取 plan/default，非法 -32600（v2/turn.rs:263-267、
+   * v2/thread.rs:281-285；wire 字段为 snake_case，见 config_types.rs:780）。
+   * 未提供（undefined/null）→ 不变。
+   */
+  private applyCollaborationMode(state: ThreadState, p: AnyParams): void {
+    if (!("collaborationMode" in p) || p.collaborationMode === null || p.collaborationMode === undefined) {
+      return;
+    }
+    const raw = p.collaborationMode as { mode?: unknown; settings?: Record<string, unknown> };
+    const mode = raw.mode;
+    if (mode !== "plan" && mode !== "default") {
+      throw new SimMethodError(-32600, `invalid collaboration mode: ${String(mode)}`);
+    }
+    const settings = raw.settings ?? {};
+    const current = state.thread.collaborationMode.settings;
+    state.thread.collaborationMode = {
+      mode,
+      settings: {
+        model: typeof settings.model === "string" ? settings.model : current.model,
+        reasoning_effort:
+          settings.reasoning_effort === null
+            ? null
+            : typeof settings.reasoning_effort === "string"
+              ? settings.reasoning_effort
+              : current.reasoning_effort,
+        developer_instructions:
+          settings.developer_instructions === null
+            ? null
+            : typeof settings.developer_instructions === "string"
+              ? settings.developer_instructions
+              : current.developer_instructions,
+      },
+    };
   }
 
   // ------------------------------------------------------------- turn 模拟
@@ -609,6 +757,15 @@ export class SimApp extends EventEmitter implements AgentApp {
     const state = this.threadState(p);
     const input = normalizeInput(p.input);
     const clientUserMessageId = p.clientUserMessageId ?? null;
+    // compact 进行中：turn/start 不可接管 compact turn。对齐 codex
+    // start_or_steer_turn 遇 TaskKind::Compact → NotSubmittedReason::
+    // ActiveTurnNotSteerable{turn_kind:Compact}（turn_input.rs:660-680），
+    // turn_processor.rs:675-684 映射为 internal_error(format!("failed to submit
+    // turn input: {reason:?}"))，此处按 Debug 形状取文案。
+    if (state.sim && !state.sim.ended && state.sim.kind === "compact") {
+      throw new SimMethodError(-32603, "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Compact }");
+    }
+    this.applyCollaborationMode(state, p);
     if (state.sim && !state.sim.ended) {
       // 活动期 turn/start 转 steer：对齐 codex start_or_steer_turn
       // （turn_processor.rs:651-684，TurnInputSubmission::Steered）——输入注入当前
@@ -626,6 +783,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     const input = normalizeInput(p.input);
     const clientUserMessageId = p.clientUserMessageId ?? null;
     if (state.sim && !state.sim.ended) {
+      // compact turn 不可 steer（turn_processor.rs:1101-1111：
+      // NonSteerableTurnKind::Compact → -32600 "cannot steer a compact turn"）
+      if (state.sim.kind === "compact") {
+        throw new SimMethodError(-32600, "cannot steer a compact turn");
+      }
       state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
       return { turnId: p.expectedTurnId ?? state.sim.turn.id };
     }
@@ -683,12 +845,14 @@ export class SimApp extends EventEmitter implements AgentApp {
     const userText = input.map((c) => c.text).join("");
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "normal" };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
     state.thread.preview = userText.slice(0, 80) || state.thread.preview;
 
+    // Plan 模式在 turn 开始时快照（对齐 codex turn_context 快照语义）
+    const planMode = state.thread.collaborationMode.mode === "plan";
     const userItem = makeUserMessage(userText, clientUserMessageId);
     const startedAtMs = Date.now();
     state.items.push({ turnId: turn.id, item: userItem, startedAtMs, completedAtMs: startedAtMs });
@@ -727,6 +891,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       this.schedule(sim, () => {
         const finishTurn = () => {
           this.processSteers(state, sim, () => {
+            if (planMode) this.emitPlanNotifications(state, sim);
             this.finishSimTurn(state, "completed");
             this.consumeQueue(state);
           });
@@ -736,7 +901,7 @@ export class SimApp extends EventEmitter implements AgentApp {
           this.runScriptedTurn(state, sim, special, finishTurn);
           return;
         }
-        const reply = this.buildReply(userText, state.thread);
+        const reply = this.composeReply(state, userText);
         this.streamAgentMessage(state, sim, reply, finishTurn);
       }, this.opts.stepDelayMs);
     }, 0);
@@ -915,7 +1080,12 @@ export class SimApp extends EventEmitter implements AgentApp {
       threadId: state.thread.id,
       status: { type: "idle" },
     }, state.thread.id));
-    this.emit("event", this.notification("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id));
+    // turn 结束清除 goal（对齐抓包：真实会话每次 turn 结束发 cleared，因 goal 存在）。
+    // 条件化：无 goal 不发（避免对未设置 goal 的会话发送误导性清除通知）。
+    if (state.goal) {
+      state.goal = null;
+      this.emit("event", this.notification("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id));
+    }
     this.emit("event", this.notification("thread/tokenUsage/updated", {
       threadId: state.thread.id,
       turnId: sim.turn.id,
@@ -958,6 +1128,12 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.emit("event", this.notification("thread/queue/changed", { threadId: state.thread.id }, state.thread.id));
     this.schedule(null, () => {
       if (this.closed) return;
+      // MB3 回调竞态：若等待窗口内已有活动 turn（如 compact/start 接管），不得
+      // 覆盖 state.sim——把消息放回队首，交由当前 turn 的收尾链再消费。
+      if (state.sim && !state.sim.ended) {
+        state.queue.unshift(next);
+        return;
+      }
       this.beginSimTurn(state, next.input, next.clientUserMessageId);
     }, this.opts.stepDelayMs);
   }
@@ -984,6 +1160,487 @@ export class SimApp extends EventEmitter implements AgentApp {
       "",
       "用于验证手机 → wham 后端 → 桥 → 手机的完整数据链路。",
     ].join("\n");
+  }
+
+  /**
+   * 组装普通 turn 的 agentMessage 文本：在 buildReply 正文前按序叠加模拟钩子行。
+   * - justCompacted：compact 后**下一条**普通 turn 的首行「刚刚经历过compact」，用后即清；
+   * - Plan 模式：线程 collaborationMode.mode==="plan" 时前缀「【Plan 模式（模拟）】」；
+   * - 技能：输入含 `$名` 且名 ∈ SKILLS → 一行「已加载技能 $名（模拟）。」。
+   * help 与 ephemeral 起名回复保持原样（不叠加钩子，既有断言不受影响）。
+   */
+  private composeReply(state: ThreadState, userText: string): string {
+    const base = this.buildReply(userText, state.thread);
+    if (specialCommandOf(userText) === "help" || state.thread.ephemeral) {
+      return base;
+    }
+    const lines: string[] = [];
+    if (state.justCompacted) {
+      lines.push("刚刚经历过compact");
+      state.justCompacted = false;
+    }
+    if (state.thread.collaborationMode.mode === "plan") {
+      lines.push("【Plan 模式（模拟）】");
+    }
+    const skillLine = this.skillLineFor(userText);
+    if (skillLine) lines.push(skillLine);
+    return lines.length > 0 ? `${lines.join("\n")}\n${base}` : base;
+  }
+
+  /** $技能名 钩子：命中 data.ts 现有技能列表则确认加载。 */
+  private skillLineFor(userText: string): string | null {
+    for (const group of SKILLS.data) {
+      for (const skill of group.skills) {
+        if (userText.includes(`$${skill.name}`)) {
+          return `已加载技能 $${skill.name}（模拟）。`;
+        }
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Plan 模式通知（流式完成后）：
+   * - item/plan/delta：v2/item.rs:1444-1454 PlanDeltaNotification
+   *   {threadId, turnId, itemId, delta}（experimental，注释明确「客户端不应假设
+   *   拼接 delta 等于 completed plan item 内容」，故模拟发分片文本即可）；
+   * - turn/plan/updated：v2/turn.rs:568-573 {threadId, turnId, explanation, plan}，
+   *   plan 元素 {step, status}，status 取 TurnPlanStepStatus
+   *   （v2/turn.rs:583-590：pending|inProgress|completed）。
+   */
+  private emitPlanNotifications(state: ThreadState, sim: SimTurnRuntime): void {
+    const plan = [
+      { step: "第一步：梳理任务", status: "completed" as const },
+      { step: "第二步：等待用户确认", status: "pending" as const },
+    ];
+    const itemId = uuidv7();
+    for (const step of plan) {
+      this.emit("event", this.notification("item/plan/delta", {
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        itemId,
+        delta: `${step.step}（${step.status}）\n`,
+      }, state.thread.id));
+    }
+    this.emit("event", this.notification("turn/plan/updated", {
+      threadId: state.thread.id,
+      turnId: sim.turn.id,
+      explanation: "模拟计划：展示 plan 通知形状",
+      plan,
+    }, state.thread.id));
+  }
+
+  // ---------------------------------------------------------------- goal 模拟
+
+  /**
+   * thread/goal/set（v2/thread.rs:847-871）：
+   * - objective 单层 Option：缺省/null = 保留已有（无则空串）；
+   * - status 缺省 = 已有或 "active"；
+   * - tokenBudget 双层 Option：省略 = 不变，null = 清除，数字 = 设置；
+   * upsert 后持久化并 emit thread/goal/updated {threadId, turnId:null, goal}
+   * （v2/thread.rs:2008 ThreadGoalUpdatedNotification）。
+   */
+  private goalSet(p: AnyParams): { goal: SimGoal } {
+    const state = this.threadState(p);
+    const now = Math.floor(Date.now() / 1000);
+    const existing = state.goal;
+    const objective =
+      p.objective === undefined || p.objective === null ? (existing?.objective ?? "") : String(p.objective);
+    const status: SimGoalStatus =
+      p.status === undefined || p.status === null ? (existing?.status ?? "active") : (p.status as SimGoalStatus);
+    let tokenBudget = existing?.tokenBudget ?? null;
+    if ("tokenBudget" in p) {
+      tokenBudget = p.tokenBudget === null || p.tokenBudget === undefined ? null : Number(p.tokenBudget);
+    }
+    const goal: SimGoal = {
+      threadId: state.thread.id,
+      objective,
+      status,
+      tokenBudget,
+      tokensUsed: existing?.tokensUsed ?? 0,
+      timeUsedSeconds: existing?.timeUsedSeconds ?? 0,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    };
+    state.goal = goal;
+    this.persistState();
+    this.emitSoon("thread/goal/updated", { threadId: state.thread.id, turnId: null, goal }, state.thread.id);
+    return { goal };
+  }
+
+  private goalGet(p: AnyParams): { goal: SimGoal | null } {
+    return { goal: this.threadState(p).goal };
+  }
+
+  /** thread/goal/clear（v2/thread.rs:887）：无 goal {cleared:false}；有则清除并 emit。 */
+  private goalClear(p: AnyParams): { cleared: boolean } {
+    const state = this.threadState(p);
+    if (!state.goal) return { cleared: false };
+    state.goal = null;
+    this.persistState();
+    this.emitSoon("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id);
+    return { cleared: true };
+  }
+
+  // -------------------------------------------------------------- compact 模拟
+
+  /**
+   * thread/compact/start（v2/thread.rs:1148-1156 → {}）：对齐 codex
+   * session/handlers.rs:244-251——先 abort_all_tasks(Replaced) 打断活动 turn
+   * （无 busy 报错），再 spawn CompactTask。
+   *
+   * 打断**不得**走 beginSimTurn 的收尾链、不触发 consumeQueue（S01 同类孤儿定时器
+   * 缺陷不复燃）：直接 finishSimTurn(state, "interrupted")；随后 compact turn 完成时
+   * 由自身收尾链 consumeQueue 恢复队列消费。
+   *
+   * compact turn：新 sim(kind compact)+turn 记录，emit thread/status/changed(active)
+   * + turn/started（items 空，同 beginSimTurn 发射模式）→ item/started
+   * {item:{type:"contextCompaction",id}} → schedule(compactWaitMs) → item/completed
+   * → finishSimTurn(completed) → state.justCompacted=true → consumeQueue。
+   */
+  private compactStart(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    if (state.sim && !state.sim.ended) {
+      this.finishSimTurn(state, "interrupted");
+    }
+    const turn = makeTurn("inProgress");
+    turn.items = [];
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "compact" };
+    state.sim = sim;
+    state.thread.turns.push(turn);
+    state.thread.status = { type: "active", activeFlags: [] };
+
+    this.schedule(sim, () => {
+      this.emit("event", this.notification("thread/status/changed", {
+        threadId: state.thread.id,
+        status: { type: "active", activeFlags: [] },
+      }, state.thread.id));
+      this.emit("event", this.notification("turn/started", {
+        threadId: state.thread.id,
+        turn: { ...this.serializeTurn(turn), items: [], itemsView: "notLoaded" as const },
+      }, state.thread.id));
+      const item: ContextCompactionItem = { type: "contextCompaction", id: uuidv7() };
+      const startedAtMs = Date.now();
+      this.emit("event", this.notification("item/started", {
+        item,
+        threadId: state.thread.id,
+        turnId: turn.id,
+        startedAtMs,
+      }, state.thread.id));
+      this.schedule(sim, () => {
+        if (sim.ended) return;
+        const completedAtMs = Date.now();
+        this.emit("event", this.notification("item/completed", {
+          item,
+          threadId: state.thread.id,
+          turnId: turn.id,
+          completedAtMs,
+        }, state.thread.id));
+        state.items.push({ turnId: turn.id, item, startedAtMs, completedAtMs });
+        turn.items.push(item);
+        this.finishSimTurn(state, "completed");
+        state.justCompacted = true;
+        this.consumeQueue(state);
+      }, this.opts.compactWaitMs);
+    }, 0);
+    return {};
+  }
+
+  // ----------------------------------------------------------- shell / 后台终端
+
+  /**
+   * thread/shellCommand（v2/thread.rs:1160-1178）：空 command → -32600
+   * "command must not be empty"；有效命令立即回 {}，随后异步下发 commandExecution
+   * item 事件流（item/started → outputDelta → item/completed，exitCode 0）。
+   * 归属：无活动 turn 时创建轻量 shell turn（同 compact 机制，kind normal，含
+   * status active/turn/started…turn/completed 全序）；有活动 turn 时条目直接挂当前
+   * turn（不发 turn/started）。
+   */
+  private shellCommand(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    const command = typeof p.command === "string" ? p.command : "";
+    if (command.length === 0) {
+      throw new SimMethodError(-32600, "command must not be empty");
+    }
+    const item = makeCommandExecution(command, state.thread.cwd);
+    const attached = state.sim && !state.sim.ended ? state.sim : null;
+    const sim = attached ?? this.beginShellTurn(state);
+    const turnId = sim.turn.id;
+    const startedAtMs = Date.now();
+    this.schedule(sim, () => {
+      if (!attached) {
+        this.emit("event", this.notification("thread/status/changed", {
+          threadId: state.thread.id,
+          status: { type: "active", activeFlags: [] },
+        }, state.thread.id));
+        this.emit("event", this.notification("turn/started", {
+          threadId: state.thread.id,
+          turn: { ...this.serializeTurn(sim.turn), items: [], itemsView: "notLoaded" as const },
+        }, state.thread.id));
+      }
+      this.emit("event", this.notification("item/started", {
+        item,
+        threadId: state.thread.id,
+        turnId,
+        startedAtMs,
+      }, state.thread.id));
+      this.schedule(sim, () => {
+        if (sim.ended) return;
+        const output = `（模拟 shell）$ ${command}\n（未调用真实 shell）`;
+        const completedAtMs = Date.now();
+        this.emit("event", this.notification("item/commandExecution/outputDelta", {
+          threadId: state.thread.id,
+          turnId,
+          itemId: item.id,
+          delta: output,
+        }, state.thread.id));
+        const completed: CommandExecutionItem = {
+          ...item,
+          status: "completed",
+          aggregatedOutput: output,
+          exitCode: 0,
+          durationMs: Math.max(1, completedAtMs - startedAtMs),
+        };
+        this.emit("event", this.notification("item/completed", {
+          item: completed,
+          threadId: state.thread.id,
+          turnId,
+          completedAtMs,
+        }, state.thread.id));
+        state.items.push({ turnId, item: completed, startedAtMs, completedAtMs });
+        sim.turn.items.push(completed);
+        state.backgroundTerminals.push({
+          itemId: item.id,
+          processId: item.processId,
+          command,
+          cwd: state.thread.cwd,
+        });
+        if (!attached) {
+          this.finishSimTurn(state, "completed");
+          this.consumeQueue(state);
+        }
+      }, this.opts.shellWaitMs);
+    }, 0);
+    return {};
+  }
+
+  /** 无活动 turn 时的轻量 shell turn：不造 userMessage，仅承载 commandExecution 条目。 */
+  private beginShellTurn(state: ThreadState): SimTurnRuntime {
+    const turn = makeTurn("inProgress");
+    turn.items = [];
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "normal" };
+    state.sim = sim;
+    state.thread.turns.push(turn);
+    state.thread.status = { type: "active", activeFlags: [] };
+    return sim;
+  }
+
+  /** thread/backgroundTerminals/list（v2/thread.rs:1209-1243）。 */
+  private backgroundTerminalsList(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    return {
+      data: state.backgroundTerminals.map((t) => ({
+        itemId: t.itemId,
+        processId: t.processId,
+        command: t.command,
+        cwd: t.cwd,
+        osPid: null,
+        cpuPercent: null,
+        rssKb: null,
+      })),
+      nextCursor: null,
+    };
+  }
+
+  /** thread/backgroundTerminals/terminate（v2/thread.rs:1245-1253）：processId 必须为整数串。 */
+  private backgroundTerminalsTerminate(p: AnyParams): { terminated: boolean } {
+    const state = this.threadState(p);
+    const pid = p.processId;
+    if (typeof pid !== "string" || !/^-?\d+$/.test(pid)) {
+      throw new SimMethodError(-32600, `invalid process id: ${String(pid)}`);
+    }
+    const index = state.backgroundTerminals.findIndex((t) => t.processId === pid);
+    if (index < 0) return { terminated: false };
+    state.backgroundTerminals.splice(index, 1);
+    return { terminated: true };
+  }
+
+  /** thread/backgroundTerminals/clean（v2/thread.rs:1197）。 */
+  private backgroundTerminalsClean(p: AnyParams): unknown {
+    this.threadState(p).backgroundTerminals.length = 0;
+    return {};
+  }
+
+  // --------------------------------------------------------------- 分支 / 元数据
+
+  /**
+   * thread/metadata/update（v2/thread.rs:1008-1067）：三字段全缺 → -32600；
+   * gitInfo 存在但三字段全缺 → -32600；projectId 非空字符串 → -32600
+   * "project not found: {id}"（sim 无 projects）；sha/branch/originUrl 双层
+   * （缺省=不变、null=清除、非空字符串=设置；空串报错，sim 近似）。
+   * originUrl 不做远端消毒（记录偏差）。
+   */
+  private metadataUpdate(p: AnyParams): { thread: ThreadRecord } {
+    const state = this.threadState(p);
+    const hasProject = "projectId" in p;
+    const hasGit = "gitInfo" in p;
+    const hasDaybreak = "daybreakEnabled" in p;
+    if (!hasProject && !hasGit && !hasDaybreak) {
+      throw new SimMethodError(-32600, "thread metadata update must include at least one field");
+    }
+
+    const previousProjectId = state.thread.projectId;
+    if (hasGit) {
+      const raw = p.gitInfo as Record<string, unknown> | null;
+      if (raw === null || raw === undefined) {
+        state.thread.gitInfo = null;
+      } else {
+        const keys = ["sha", "branch", "originUrl"] as const;
+        if (!keys.some((k) => k in raw)) {
+          throw new SimMethodError(-32600, "gitInfo must include at least one field");
+        }
+        const next: ThreadGitInfo = {
+          sha: state.thread.gitInfo?.sha ?? null,
+          branch: state.thread.gitInfo?.branch ?? null,
+          originUrl: state.thread.gitInfo?.originUrl ?? null,
+        };
+        for (const key of keys) {
+          if (!(key in raw)) continue;
+          const value = raw[key];
+          if (value === null) {
+            next[key] = null;
+          } else if (typeof value === "string") {
+            if (value.length === 0) {
+              throw new SimMethodError(-32600, `gitInfo.${key} must not be empty`);
+            }
+            next[key] = value;
+          } else {
+            throw new SimMethodError(-32600, `gitInfo.${key} must be a string or null`);
+          }
+        }
+        state.thread.gitInfo = next;
+      }
+    }
+    if (hasProject) {
+      const value = p.projectId;
+      if (value === null || value === undefined || value === "") {
+        state.thread.projectId = null;
+      } else {
+        throw new SimMethodError(-32600, `project not found: ${String(value)}`);
+      }
+    }
+    if (hasDaybreak) {
+      state.thread.daybreakEnabled = p.daybreakEnabled === null || p.daybreakEnabled === undefined
+        ? state.thread.daybreakEnabled
+        : Boolean(p.daybreakEnabled);
+    }
+    this.persistState();
+    if (state.thread.projectId !== previousProjectId) {
+      this.emitSoon(
+        "thread/project/updated",
+        { threadId: state.thread.id, projectId: state.thread.projectId },
+        state.thread.id,
+      );
+    }
+    return { thread: this.serializeThread(state.thread, []) };
+  }
+
+  /**
+   * thread/fork（v2/thread.rs:544-678）：新线程继承 name/cwd/model/reasoningEffort/
+   * gitInfo/collaborationMode/projectId，forkedFromId=源 id；历史按 lastTurnId 截断
+   * （含该 turn），不给则全量；队列不复制。ephemeral=true 仅内存、不进列表。
+   * ForkResponse 无 collaborationMode 字段（v2/thread.rs:632-678），此处直接复用
+   * threadContext 形状。
+   */
+  private threadFork(p: AnyParams): unknown {
+    const source = this.threadState(p);
+    const fork = makeThread({ cwd: p.cwd ?? source.thread.cwd });
+    fork.name = source.thread.name;
+    fork.model = p.model ?? source.thread.model;
+    fork.reasoningEffort = source.thread.reasoningEffort;
+    fork.gitInfo = source.thread.gitInfo ? { ...source.thread.gitInfo } : null;
+    fork.collaborationMode = {
+      mode: source.thread.collaborationMode.mode,
+      settings: { ...source.thread.collaborationMode.settings },
+    };
+    fork.projectId = source.thread.projectId;
+    fork.forkedFromId = source.thread.id;
+    fork.ephemeral = p.ephemeral === true;
+
+    let sourceTurns = source.thread.turns;
+    if (p.lastTurnId !== undefined && p.lastTurnId !== null) {
+      const index = sourceTurns.findIndex((t) => t.id === p.lastTurnId);
+      if (index < 0) {
+        // 近似：真实 codex 报 invalid_request；模拟层同码同文案
+        throw new SimMethodError(-32600, `unknown turn id: ${String(p.lastTurnId)}`);
+      }
+      sourceTurns = sourceTurns.slice(0, index + 1);
+    }
+    const turnIds = new Set(sourceTurns.map((t) => t.id));
+    fork.turns = sourceTurns.map((t) => ({ ...t, items: [...t.items] }));
+    const items = source.items
+      .filter((e) => turnIds.has(e.turnId))
+      .map((e) => ({ ...e, item: e.item }));
+
+    this.threads.set(fork.id, makeThreadState(fork, items));
+    if (!fork.ephemeral) {
+      this.persistState();
+    }
+    this.emitSoon("thread/started", { thread: this.serializeThread(fork, []) });
+    // threadContext 固定以 turns:[] 序列化（thread/start 用）；fork 需带回截断历史，
+    // 故覆盖 thread 为实值，保持 ForkResponse 其余 13 键形状不变。
+    const context = this.threadContext(fork);
+    context.thread = this.serializeThread(fork, fork.turns);
+    return context;
+  }
+
+  // ---------------------------------------------------------------- 状态 / 技能
+
+  /** server/diagnostics（v2/diagnostics.rs:14-38）。 */
+  private diagnostics(): unknown {
+    return {
+      process: {
+        id: process.pid,
+        residentMemoryBytes: process.memoryUsage().rss,
+        physicalFootprintBytes: null,
+      },
+      gauges: [],
+    };
+  }
+
+  /** remoteControl/status/read（v2/remote_control.rs:60-66）：复用 initialize 注入的服务器信息。 */
+  private remoteControlStatusRead(): unknown {
+    const info = this.opts.getServerInfo?.();
+    if (info) {
+      return {
+        status: "connected",
+        serverName: info.serverName,
+        installationId: info.installationId,
+        environmentId: info.environmentId,
+      };
+    }
+    return { status: "disabled", serverName: "", installationId: "", environmentId: null };
+  }
+
+  /** skills/config/write（v2/plugin.rs:933-950；catalog_processor.rs:699-700）。 */
+  private skillsConfigWrite(p: AnyParams): { effectiveEnabled: boolean } {
+    const hasPath = typeof p.path === "string" && p.path.length > 0;
+    const hasName = typeof p.name === "string" && p.name.length > 0;
+    if (hasPath === hasName) {
+      throw new SimMethodError(-32602, "skills/config/write requires exactly one of path or name");
+    }
+    return { effectiveEnabled: p.enabled === true };
+  }
+
+  /** plugin/skill/read（v2/plugin.rs:268-281）。 */
+  private pluginSkillRead(p: AnyParams): { contents: string } {
+    const skillName = typeof p.skillName === "string" ? p.skillName : "";
+    if (skillName.length === 0) {
+      throw new SimMethodError(-32600, "skillName must not be empty");
+    }
+    return {
+      contents: `# ${skillName}\n\n（模拟 SKILL.md：来自 ${p.remotePluginId}@${p.remoteMarketplaceName}）`,
+    };
   }
 
   // ------------------------------------------------------------------ 虚拟 FS

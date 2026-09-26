@@ -265,3 +265,109 @@ codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁�
 - 未实现出站重传（未 ack 的 server_message 不缓存重发；codex 侧有 outbound_buffer）。
 - `subscribe_cursor` 未使用（重连后从头开始，不回放错过的通知）。
 - attestation 由手机端对 codex 的请求改为可选——模拟层收到即回模拟 token。
+
+## 对齐 codex 可达功能（goal/compact/plan/status/side/branch/skill）（2026-09-25）
+
+本节记录模拟层对 codex app-server 7 族方法的形状对齐与验证钩子。所有形状出处以
+vendored 源码 `reference/codex/codex-rs` 为准。
+
+### A. goal（thread/goal/set|get|clear）
+
+- 形状：`ThreadGoalStatus`/`ThreadGoal` v2/thread.rs:800-840（Unix 秒）；set 参数
+  单层 objective + 缺省 status + **双层** tokenBudget（v2/thread.rs:847-871）；get
+  `{goal|null}`（:873）；clear `{cleared}`（:887）。通知 thread/goal/updated
+  `{threadId, turnId:string|null, goal}`（:2008）、thread/goal/cleared `{threadId}`（:2017）。
+- 钩子语义：set 后持久化；**每个 turn 结束清除 goal**（对齐抓包真实会话每轮发
+  cleared）；resume **响应先行**，随后以**宏任务**补发快照（有→updated、无→cleared，
+  对齐 thread_processor.rs:4181-4187 `emit_resume_goal_snapshot`）。禁用 emitSoon
+  微任务（appServer.ts:674 记录的响应先行陷阱）。
+- 真机复测：goal 面板设置 objective+budget → 发一条消息 → 应收到 thread/goal/cleared
+  且 get 为 null。
+
+### B. compact（thread/compact/start）
+
+- 形状：`{threadId}` → `{}`（v2/thread.rs:1148-1156）；`contextCompaction` item
+  v2/item.rs:425-427。core 语义：先 abort_all_tasks(Replaced) 打断活动 turn（无 busy
+  报错），再 spawn CompactTask（core/src/session/handlers.rs:244-251）。
+- 钩子语义：compactWaitMs（默认 5s）后 item/completed + turn/completed，
+  `state.justCompacted=true` → **下一条普通 turn** 回复首行「刚刚经历过compact」，
+  用后即清。活动期 compact 打断原 turn（interrupted），**不触发** consumeQueue；
+  compact 自身收尾链恢复队列消费（MB3：consumeQueue 回调若遇活动 turn 则把消息放回
+  队首，避免覆盖 state.sim）。双入口拒绝：compact 中 turn/steer → -32600
+  "cannot steer a compact turn"（turn_processor.rs:1101-1111）；turn/start → -32603
+  `failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Compact }`
+  （turn_input.rs:660-680 → turn_processor.rs:675-684 的 `{reason:?}` 文本）。
+- 真机复测：点 compact 按钮 → 约 5 秒 → 下一条回复首行带标记；下一条恢复普通回复。
+
+### C. plan（collaborationMode 闭环）
+
+- 形状：`CollaborationMode` = `{mode, settings:{model, reasoning_effort,
+  developer_instructions}}`，**wire 为 snake_case**（config_types.rs:708-783；:780
+  Settings 无 camelCase 重命名）。turn/start.collaborationMode（v2/turn.rs:263-267）
+  与 thread/settings/update.collaborationMode（v2/thread.rs:281-285）→ 存线程；
+  ThreadSettings.collaboration_mode 非 optional（v2/thread.rs:304-335）；
+  thread/resume.collaborationMode 返回实值（v2/thread.rs:467）。
+- 钩子语义：mode==="plan" 的普通 turn 回复前缀「【Plan 模式（模拟）】」；流式完成后
+  emit turn/plan/updated（v2/turn.rs:568-573）与 item/plan/delta（common.rs:1962 →
+  v2/item.rs:1444-1454 `{threadId, turnId, itemId, delta}`）。`TurnPlanStepStatus`
+  实际枚举 v2/turn.rs:583-590：**pending | inProgress | completed**（模拟用
+  completed/pending 子集；未用 inProgress）。
+- 真机复测：切 Plan 模式 → 发消息 → 回复带前缀且收到 plan 通知；切回 Default 不再带。
+
+### D. status（server/diagnostics、remoteControl/status/read、memory/status）
+
+- 形状：server/diagnostics `{process:{id, residentMemoryBytes, physicalFootprintBytes},
+  gauges:[]}`（v2/diagnostics.rs:14-38）；remoteControl/status/read `{status,
+  serverName, installationId, environmentId}`（v2/remote_control.rs:60-66）；memory/status
+  `{v2ConsolidatedThreads, v2Ready}`（v2/memory.rs:20-23）。connected/disabled 复用
+  initialize 注入的 getServerInfo（隧道身份）。
+- 真机复测：设置页/诊断入口读取，不应出现解码失败。
+
+### E. side（thread/shellCommand + backgroundTerminals）
+
+- 形状：shellCommand `{threadId, command, timeoutMs?}` → `{}` 立即，空命令
+  "command must not be empty"（v2/thread.rs:1160-1178）；后台终端 list
+  `{data:[{itemId, processId, command, cwd, osPid, cpuPercent, rssKb}], nextCursor}`
+  （v2/thread.rs:1209-1243，统计字段模拟为 null）；terminate `{terminated}`（:1245-1253，
+  processId parse 整数，非法 -32600）；clean `{}`（:1197）。
+- 钩子语义：命令完成后登记 backgroundTerminals（processId 用 makeCommandExecution
+  的模拟进程号）；无活动 turn 时创建轻量 shell turn（kind normal，全序
+  status active/turn/started…turn/completed），有活动 turn 时条目直接挂当前 turn。
+- 真机复测：发送 shell 命令 → 出现 commandExecution 条目 → 后台终端列表可见 /
+  terminate / clean。
+
+### F. branch（thread/metadata/update + thread/fork）
+
+- 形状：ThreadMetadataUpdateParams `{threadId, projectId?, gitInfo?,
+  daybreakEnabled?}`（v2/thread.rs:1008-1029）；gitInfo sha/branch/originUrl 均**双层**
+  Option（:1031-1064）；响应 `{thread}`（:1067）。错误文案对齐 thread_processor.rs:1914-2050：
+  全缺 → "thread metadata update must include at least one field"；gitInfo 全缺 →
+  "gitInfo must include at least one field"；projectId 非空 → "project not found: {id}"
+  （sim 无 projects）。ThreadForkParams/Response（:544-678，ForkResponse 无
+  collaborationMode）；forkedFromId；thread/started 通知。
+- 钩子语义：gitInfo 双层（缺省=不变、null=清除、非空串=设置）；fork 继承
+  name/cwd/model/reasoningEffort/gitInfo/collaborationMode/projectId，lastTurnId 截断
+  历史（含该 turn），ephemeral fork 不进列表。
+- 真机复测：分支/元数据设置 → resume 回读；fork 后新会话历史截断正确。
+
+### G. skill（extraRoots/set、config/write、plugin/skill/read、$技能名）
+
+- 形状：skills/extraRoots/set `{}`（v2/plugin.rs:40-49）；skills/config/write
+  path/name 恰一，否则 -32602 "skills/config/write requires exactly one of path or
+  name"（v2/plugin.rs:933-950；catalog_processor.rs:699-700）→ `{effectiveEnabled}`；
+  plugin/skill/read → `{contents}`（v2/plugin.rs:268-281）。
+- 钩子语义：消息含 `$名`（名 ∈ data.ts SKILLS）→ 回复首部一行「已加载技能 $名（模拟）。」。
+- 真机复测：输入含 `$bridge-sim-demo` → 回复确认加载；技能开关写入返回 effectiveEnabled。
+
+### 已知偏差（模拟近似，非协议错误）
+
+- turn/start 遇 compact 的文案按 Debug 形状近似：真实为
+  `failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Compact }`（Rust
+  Debug 输出，turn_processor.rs:675-684），非稳定 wire 文案，仅关键字对齐。
+- item/plan/delta 属 experimental（源码注释：客户端不应假设 delta 拼接等于 completed
+  plan item 内容），模拟发 1-2 条与 turn/plan/updated 内容一致的分片。
+- metadata/update 的 sha/branch/originUrl 空字符串报 -32600（消息形如
+  "gitInfo.branch must not be empty"）为模拟近似；真实 codex 空串应视为非法替换但
+  具体错误文案未逐一核对。originUrl 不做远端消毒。
+- backgroundTerminals/* 同时接受带 `thread/` 前缀的权威方法名与裸名别名。
+- projectId 空字符串按清除处理（对齐 v2 注释"use an empty string to clear it"）。

@@ -53,7 +53,67 @@ export interface CommandExecutionItem {
   durationMs: number | null;
 }
 
-export type SimItem = UserMessageItem | AgentMessageItem | CommandExecutionItem;
+/**
+ * contextCompaction 条目：compact 期间下发的上下文压缩项。
+ * 蓝本 v2/item.rs:425-427（{"type":"contextCompaction","id": uuidv7}）。
+ */
+export interface ContextCompactionItem {
+  type: "contextCompaction";
+  id: string;
+}
+
+export type SimItem =
+  | UserMessageItem
+  | AgentMessageItem
+  | CommandExecutionItem
+  | ContextCompactionItem;
+
+/**
+ * 协作模式：wire 字段名 **snake_case**（config_types.rs:708-783；:780 的 Settings
+ * 无 camelCase 重命名）。settings.developer_instructions 为 null = 使用所选模式的
+ * 内置指令（config_types.rs 注释）。
+ */
+export interface CollaborationModeSettings {
+  model: string;
+  reasoning_effort: string | null;
+  developer_instructions: string | null;
+}
+
+export interface CollaborationMode {
+  mode: "plan" | "default";
+  settings: CollaborationModeSettings;
+}
+
+/** 线程 Git 元数据（v2/thread_data.rs:171-176，字段 camelCase 由 serde 统一转换）。 */
+export interface ThreadGitInfo {
+  sha: string | null;
+  branch: string | null;
+  originUrl: string | null;
+}
+
+export type SimGoalStatus =
+  | "active"
+  | "paused"
+  | "blocked"
+  | "usageLimited"
+  | "budgetLimited"
+  | "complete";
+
+/**
+ * 线程目标（v2/thread.rs:800-840）：ThreadGoalStatus 枚举 + ThreadGoal。
+ * tokenBudget number|null；tokensUsed/timeUsedSeconds/createdAt/updatedAt 为
+ * Unix 秒（v2/thread.rs:813-840）。
+ */
+export interface SimGoal {
+  threadId: string;
+  objective: string;
+  status: SimGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
+}
 
 export interface TurnRecord {
   id: string;
@@ -71,17 +131,19 @@ export interface ThreadRecord {
   environments: Array<{ environmentId: string; cwd: string; runtimeWorkspaceRoots: string[] }>;
   extra: null;
   sessionId: string;
-  forkedFromId: null;
+  forkedFromId: string | null;
   parentThreadId: null;
   preview: string;
   ephemeral: boolean;
   section: null;
   sectionEnteredAt: null;
-  projectId: null;
+  projectId: string | null;
   historyMode: "paginated";
   modelProvider: "openai";
   model: string;
   reasoningEffort: string;
+  /** 生效协作模式（thread/settings/update 或 turn/start 写入；resume 返回实值）。 */
+  collaborationMode: CollaborationMode;
   createdAt: number;
   updatedAt: number;
   recencyAt: number;
@@ -95,9 +157,9 @@ export interface ThreadRecord {
   threadSource: string;
   agentNickname: null;
   agentRole: null;
-  gitInfo: null;
+  gitInfo: ThreadGitInfo | null;
   name: null;
-  daybreakEnabled: null;
+  daybreakEnabled: boolean | null;
   turns: TurnRecord[];
 }
 
@@ -111,6 +173,14 @@ export interface ItemEntry {
 export const CLI_VERSION = "0.157.0";
 export const DEFAULT_MODEL = "gpt-6-luna";
 export const MODEL_CONTEXT_WINDOW = 258_400;
+
+/** 默认协作模式（mode default，settings.model 取线程模型，reasoning_effort medium）。 */
+export function defaultCollaborationMode(model: string): CollaborationMode {
+  return {
+    mode: "default",
+    settings: { model, reasoning_effort: "medium", developer_instructions: null },
+  };
+}
 
 // ------------------------------------------------------------- 固定目录数据
 
@@ -217,6 +287,7 @@ export function makeThread(args: {
     modelProvider: "openai",
     model: DEFAULT_MODEL,
     reasoningEffort: "medium",
+    collaborationMode: defaultCollaborationMode(DEFAULT_MODEL),
     createdAt: args.createdAt ?? now,
     updatedAt: args.createdAt ?? now,
     recencyAt: args.createdAt ?? now,

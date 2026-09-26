@@ -68,7 +68,16 @@ interface Loop {
   authHome: string;
 }
 
-async function startLoop(simExtra: { commandWaitMs?: number } = {}): Promise<Loop> {
+async function startLoop(
+  simExtra: {
+    commandWaitMs?: number;
+    stepDelayMs?: number;
+    deltaIntervalMs?: number;
+    deltaChars?: number;
+    compactWaitMs?: number;
+    shellWaitMs?: number;
+  } = {},
+): Promise<Loop> {
   const authHome = await tempDir("home");
   await writeAuthStore(authHome, fakeAuth());
   const authManager = new BridgeAuthManager({ codexHome: authHome });
@@ -1343,6 +1352,829 @@ test("回环：thread/resume 重订阅（清除 unsubscribe 标记，通知恢�
       8000,
       "resume 后 item/started 未恢复",
     );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+// ------------------------------------------- S03：模拟层对齐 codex 可达功能
+
+type Notif = { method: string; params: Record<string, any> };
+const isNotif = (n: { method: string; params: unknown }, method: string): n is Notif =>
+  n.method === method;
+/** 查找通知并按 Notif 收窄类型（find 的布尔谓词不会收窄，故显式谓词）。 */
+const findNotif = (
+  loop: Loop,
+  method: string,
+  extra?: (p: Record<string, any>) => boolean,
+): Notif | undefined =>
+  loop.mock.receivedNotifications.find(
+    (n): n is Notif => isNotif(n, method) && (extra ? extra(n.params) : true),
+  );
+
+test("S03-A goal：set/get 全键、tokenBudget 双层、clear、turn 结束条件清除", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/goal" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    const set = (await loop.mock.rpc("thread/goal/set", {
+      threadId,
+      objective: "完成 S03",
+      tokenBudget: 5000,
+    })) as { result: { goal: Record<string, any> } };
+    const goal = set.result.goal;
+    assert.deepEqual(Object.keys(goal).sort(), [
+      "createdAt",
+      "objective",
+      "status",
+      "threadId",
+      "timeUsedSeconds",
+      "tokenBudget",
+      "tokensUsed",
+      "updatedAt",
+    ]);
+    assert.equal(goal.objective, "完成 S03");
+    assert.equal(goal.status, "active");
+    assert.equal(goal.tokenBudget, 5000);
+    assert.equal(goal.tokensUsed, 0);
+    assert.ok(Number.isInteger(goal.createdAt) && Number.isInteger(goal.updatedAt));
+
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/goal/updated")),
+      2000,
+      "thread/goal/updated 未收到",
+    );
+    const updated = findNotif(loop, "thread/goal/updated")!;
+    assert.equal(updated.params.turnId, null, "goal/updated 的 turnId 应为 null");
+    assert.equal(updated.params.goal.objective, "完成 S03");
+
+    const get = (await loop.mock.rpc("thread/goal/get", { threadId })) as {
+      result: { goal: Record<string, any> };
+    };
+    assert.deepEqual(get.result.goal, goal, "get 应回读全键");
+
+    // tokenBudget:null 清除；objective 缺省保留
+    const clearedBudget = (await loop.mock.rpc("thread/goal/set", { threadId, tokenBudget: null })) as {
+      result: { goal: Record<string, any> };
+    };
+    assert.equal(clearedBudget.result.goal.tokenBudget, null);
+    assert.equal(clearedBudget.result.goal.objective, "完成 S03", "objective 缺省应保留");
+
+    loop.mock.receivedNotifications.length = 0;
+    const c1 = (await loop.mock.rpc("thread/goal/clear", { threadId })) as { result: { cleared: boolean } };
+    assert.deepEqual(c1.result, { cleared: true });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/goal/cleared")),
+      2000,
+      "thread/goal/cleared 未收到",
+    );
+    const c2 = (await loop.mock.rpc("thread/goal/clear", { threadId })) as { result: { cleared: boolean } };
+    assert.deepEqual(c2.result, { cleared: false }, "无 goal 再 clear 应 false");
+
+    // set 后跑一轮 turn：turn 结束条件清除
+    await loop.mock.rpc("thread/goal/set", { threadId, objective: "turn 清目标" });
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "goal-turn" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.status === "completed",
+        ),
+      8000,
+      "goal-turn 未完成",
+    );
+    assert.ok(
+      loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/goal/cleared")),
+      "turn 结束应发 thread/goal/cleared",
+    );
+    const get2 = (await loop.mock.rpc("thread/goal/get", { threadId })) as {
+      result: { goal: unknown };
+    };
+    assert.equal(get2.result.goal, null, "turn 结束后 goal 应为 null");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-A resume 快照：响应先于 goal 通知上线（updated / cleared）", async () => {
+  const loop = await startLoop({ stepDelayMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/goal-resume" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    await loop.mock.rpc("thread/goal/set", { threadId, objective: "resume 快照" });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/goal/updated")),
+      2000,
+      "set 的 goal/updated 未到",
+    );
+
+    loop.mock.receivedEnvelopeLog.length = 0;
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId })) as { id: number; result: any };
+    await waitFor(
+      () =>
+        loop.mock.receivedEnvelopeLog.some(
+          (e) => e.kind === "notification" && e.method === "thread/goal/updated",
+        ),
+      2000,
+      "resume 快照 goal/updated 未到",
+    );
+    const log = loop.mock.receivedEnvelopeLog;
+    const respIdx = log.findIndex((e) => e.kind === "response" && String(e.id) === String(resumed.id));
+    const goalIdx = log.findIndex((e) => e.kind === "notification" && e.method === "thread/goal/updated");
+    assert.ok(respIdx >= 0, "resume 响应应在时序日志中");
+    assert.ok(goalIdx > respIdx, "goal 快照通知必须晚于 resume 响应上线");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-B compact：contextCompaction 条目 + 下一条回复标记（用后即清）", async () => {
+  const loop = await startLoop({ compactWaitMs: 30, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/compact" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    const compact = (await loop.mock.rpc("thread/compact/start", { threadId })) as { result: unknown };
+    assert.deepEqual(compact.result, {});
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/completed") && n.params.item.type === "contextCompaction",
+        ),
+      5000,
+      "contextCompaction completed 未收到",
+    );
+    assert.ok(
+      loop.mock.receivedNotifications.some(
+        (n) => isNotif(n, "item/started") && n.params.item.type === "contextCompaction",
+      ),
+      "contextCompaction started 未收到",
+    );
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.status === "completed",
+        ),
+      5000,
+      "compact turn 未完成",
+    );
+
+    // 下一条普通 turn：首行「刚刚经历过compact」
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "after-compact" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/completed") && n.params.item.type === "agentMessage",
+        ),
+      5000,
+      "compact 后回复未到",
+    );
+    const firstReply = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.equal(
+      String(firstReply.params.item.text).split("\n")[0],
+      "刚刚经历过compact",
+      "compact 后首条回复首行应为标记",
+    );
+
+    // 第二条不再带
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "second" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/completed") && n.params.item.type === "agentMessage",
+        ),
+      5000,
+      "第二条回复未到",
+    );
+    const secondReply = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.ok(
+      !String(secondReply.params.item.text).startsWith("刚刚经历过compact"),
+      "标记用后即清（第二条不得再带）",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-B compact 双入口拒绝：steer -32600 / turn-start -32603", async () => {
+  const loop = await startLoop({ compactWaitMs: 500 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/compact-reject" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    await loop.mock.rpc("thread/compact/start", { threadId });
+
+    const steer = (await loop.mock.rpc("turn/steer", {
+      threadId,
+      expectedTurnId: "01a0dc13-0000-0000-0000-000000000000",
+      input: [{ type: "text", text: "中途" }],
+    })) as { error?: { code: number; message: string } };
+    assert.equal(steer.error?.code, -32600);
+    assert.equal(steer.error?.message, "cannot steer a compact turn");
+
+    const start = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "接管" }],
+    })) as { error?: { code: number; message: string } };
+    assert.equal(start.error?.code, -32603);
+    assert.match(String(start.error?.message), /^failed to submit turn input: .*Compact/);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-B compact 打断活动 turn：原 turn interrupted，compact 完成后 idle", async () => {
+  const loop = await startLoop({ commandWaitMs: 5000, compactWaitMs: 20, stepDelayMs: 10, deltaIntervalMs: 1 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/compact-interrupt" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "test queue" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/started") && n.params.item.type === "commandExecution",
+        ),
+      8000,
+      "活动 turn 的模拟命令未进入 inProgress",
+    );
+    await loop.mock.rpc("thread/compact/start", { threadId });
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.status === "interrupted",
+        ),
+      5000,
+      "原 turn 未 interrupted",
+    );
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.status === "completed",
+        ),
+      5000,
+      "compact turn 未完成",
+    );
+    const statuses = loop.mock.receivedNotifications.filter((n) => isNotif(n, "thread/status/changed"));
+    assert.equal(
+      (statuses[statuses.length - 1]!.params.status as { type: string }).type,
+      "idle",
+      "compact 完成后最后状态应为 idle",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-B 队列不因 compact 打断丢失：完成后排队消息开跑", async () => {
+  const loop = await startLoop({ commandWaitMs: 5000, compactWaitMs: 30, stepDelayMs: 10, deltaIntervalMs: 1 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/compact-queue" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "test queue" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/started") && n.params.item.type === "commandExecution",
+        ),
+      8000,
+      "活动 turn 未进入等待",
+    );
+    await loop.mock.rpc("thread/queue/add", {
+      threadId,
+      input: [{ type: "text", text: "排队C" }],
+      clientUserMessageId: "q-c",
+    });
+    await loop.mock.rpc("thread/compact/start", { threadId });
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "userMessage" &&
+            n.params.item.content?.[0]?.text === "排队C",
+        ),
+      8000,
+      "排队消息未在 compact 后开跑",
+    );
+    const notifs = loop.mock.receivedNotifications;
+    const compactStarted = findNotif(loop, "item/started", (p) => p.item.type === "contextCompaction")!;
+    const compactTurnId = compactStarted.params.turnId as string;
+    const compactDoneIdx = notifs.findIndex(
+      (n) => isNotif(n, "turn/completed") && n.params.turn.id === compactTurnId,
+    );
+    const queuedIdx = notifs.findIndex(
+      (n) =>
+        isNotif(n, "item/completed") &&
+        n.params.item.type === "userMessage" &&
+        n.params.item.content?.[0]?.text === "排队C",
+    );
+    assert.ok(compactDoneIdx >= 0, "compact turn 应完成");
+    assert.ok(queuedIdx > compactDoneIdx, "排队消息应在 compact 完成后才开跑");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-B consumeQueue 竞态 MB3：compact 接管窗口内排队消息不被覆盖/丢失", async () => {
+  // stepDelayMs=500 制造 turn 完成 → 队列续跑之间的等待窗口；compactWaitMs=800
+  // 令 compact 跨越该窗口，触发 consumeQueue 回调的 MB3 检查。
+  const loop = await startLoop({ stepDelayMs: 500, deltaIntervalMs: 1, deltaChars: 64, compactWaitMs: 800 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/compact-race" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    await loop.mock.rpc("thread/queue/add", {
+      threadId,
+      input: [{ type: "text", text: "排队M" }],
+      clientUserMessageId: "q-m",
+    });
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "主任务" }] });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.status === "completed",
+        ),
+      5000,
+      "主 turn 未完成",
+    );
+    // 主 turn 完成后 consumeQueue 已排下续跑计时器（stepDelayMs=500ms 窗口）；
+    // 该窗口内 compact 接管
+    await loop.mock.rpc("thread/compact/start", { threadId });
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "userMessage" &&
+            n.params.item.content?.[0]?.text === "排队M",
+        ),
+      8000,
+      "排队消息未在 compact 后开跑",
+    );
+    const notifs = loop.mock.receivedNotifications;
+    const compactStarted = findNotif(loop, "item/started", (p) => p.item.type === "contextCompaction")!;
+    const compactTurnId = compactStarted.params.turnId as string;
+    const compactDoneIdx = notifs.findIndex(
+      (n) => isNotif(n, "turn/completed") && n.params.turn.id === compactTurnId,
+    );
+    assert.ok(compactDoneIdx >= 0, "compact turn 未被覆盖，应正常完成");
+    const queuedUserIdx = notifs.findIndex(
+      (n) =>
+        isNotif(n, "item/completed") &&
+        n.params.item.type === "userMessage" &&
+        n.params.item.content?.[0]?.text === "排队M",
+    );
+    assert.ok(queuedUserIdx > compactDoneIdx, "排队消息应在 compact 完成后开跑");
+    assert.equal(
+      notifs.filter(
+        (n) =>
+          isNotif(n, "item/started") &&
+          n.params.item.type === "userMessage" &&
+          n.params.item.content?.[0]?.text === "排队M",
+      ).length,
+      1,
+      "排队消息应恰好开跑一次",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-C plan：collaborationMode 闭环 + 回复前缀 + turn/plan/updated", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/plan" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("thread/settings/update", {
+      threadId,
+      collaborationMode: {
+        mode: "plan",
+        settings: { model: "gpt-6-luna", reasoning_effort: "medium", developer_instructions: null },
+      },
+    });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/settings/updated")),
+      2000,
+      "thread/settings/updated 未到",
+    );
+    const settingsUpdated = findNotif(loop, "thread/settings/updated")!;
+    assert.equal(settingsUpdated.params.threadSettings.collaborationMode.mode, "plan");
+
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId })) as {
+      result: { collaborationMode: { mode: string; settings: Record<string, unknown> } };
+    };
+    assert.equal(resumed.result.collaborationMode.mode, "plan");
+    assert.ok("developer_instructions" in resumed.result.collaborationMode.settings);
+
+    // plan 下 turn：前缀 + plan 通知
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "做个计划" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/plan/updated")),
+      5000,
+      "turn/plan/updated 未到",
+    );
+    const reply = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.equal(String(reply.params.item.text).split("\n")[0], "【Plan 模式（模拟）】");
+    const planUpdated = findNotif(loop, "turn/plan/updated")!;
+    assert.deepEqual(planUpdated.params.plan, [
+      { step: "第一步：梳理任务", status: "completed" },
+      { step: "第二步：等待用户确认", status: "pending" },
+    ]);
+    assert.equal(planUpdated.params.explanation, "模拟计划：展示 plan 通知形状");
+    assert.equal(planUpdated.params.turnId, reply.params.turnId);
+    assert.ok(
+      loop.mock.receivedNotifications.some((n) => isNotif(n, "item/plan/delta")),
+      "应下发 item/plan/delta",
+    );
+
+    // turn/start collaborationMode(default) 切回：不再前缀
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "切回默认" }],
+      collaborationMode: {
+        mode: "default",
+        settings: { model: "gpt-6-luna", reasoning_effort: "medium", developer_instructions: null },
+      },
+    });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/completed") && n.params.item.type === "agentMessage",
+        ),
+      5000,
+      "切回后回复未到",
+    );
+    const reply2 = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.ok(!String(reply2.params.item.text).startsWith("【Plan 模式（模拟）】"));
+    assert.ok(
+      !loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/plan/updated")),
+      "default 模式不应发 turn/plan/updated",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-D status：server/diagnostics、remoteControl/status/read、memory/status", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+
+    const diag = (await loop.mock.rpc("server/diagnostics", {})) as {
+      result: { process: Record<string, unknown>; gauges: unknown[] };
+    };
+    assert.deepEqual(Object.keys(diag.result).sort(), ["gauges", "process"]);
+    assert.equal(typeof diag.result.process.id, "number");
+    assert.ok(Array.isArray(diag.result.gauges));
+
+    const rc = (await loop.mock.rpc("remoteControl/status/read", {})) as {
+      result: { status: string; serverName: unknown; installationId: unknown; environmentId: unknown };
+    };
+    assert.deepEqual(Object.keys(rc.result).sort(), ["environmentId", "installationId", "serverName", "status"]);
+    assert.equal(rc.result.status, "disabled");
+    assert.equal(rc.result.environmentId, null);
+
+    const mem = (await loop.mock.rpc("memory/status", {})) as {
+      result: { v2ConsolidatedThreads: number; v2Ready: boolean };
+    };
+    assert.deepEqual(mem.result, { v2ConsolidatedThreads: 0, v2Ready: false });
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-E side：shellCommand 命令条目 + backgroundTerminals list/terminate/clean", async () => {
+  const loop = await startLoop({ shellWaitMs: 20, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/shell" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    const empty = (await loop.mock.rpc("thread/shellCommand", { threadId, command: "" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(empty.error?.code, -32600);
+    assert.equal(empty.error?.message, "command must not be empty");
+
+    const ok = (await loop.mock.rpc("thread/shellCommand", { threadId, command: "echo hi" })) as {
+      result: unknown;
+    };
+    assert.deepEqual(ok.result, {}, "shellCommand 应立即返回 {}");
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "commandExecution" &&
+            n.params.item.status === "completed",
+        ),
+      5000,
+      "shell commandExecution completed 未到",
+    );
+    const completed = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "commandExecution" && p.item.status === "completed",
+    )!;
+    assert.equal(completed.params.item.exitCode, 0);
+    assert.ok(String(completed.params.item.aggregatedOutput).includes("（未调用真实 shell）"));
+    assert.ok(
+      loop.mock.receivedNotifications.some((n) => isNotif(n, "item/commandExecution/outputDelta")),
+      "应下发 outputDelta",
+    );
+
+    const list = (await loop.mock.rpc("thread/backgroundTerminals/list", { threadId })) as {
+      result: { data: Array<Record<string, unknown>>; nextCursor: unknown };
+    };
+    assert.equal(list.result.nextCursor, null);
+    assert.equal(list.result.data.length, 1);
+    const entry = list.result.data[0]!;
+    assert.deepEqual(Object.keys(entry).sort(), [
+      "command",
+      "cpuPercent",
+      "cwd",
+      "itemId",
+      "osPid",
+      "processId",
+      "rssKb",
+    ]);
+    assert.equal(entry.command, "echo hi");
+    assert.equal(entry.osPid, null);
+    assert.equal(entry.cpuPercent, null);
+    assert.equal(entry.rssKb, null);
+
+    const processId = String(entry.processId);
+    const hit = (await loop.mock.rpc("thread/backgroundTerminals/terminate", { threadId, processId })) as {
+      result: { terminated: boolean };
+    };
+    assert.deepEqual(hit.result, { terminated: true });
+    const miss = (await loop.mock.rpc("thread/backgroundTerminals/terminate", {
+      threadId,
+      processId: "999999999",
+    })) as { result: { terminated: boolean } };
+    assert.deepEqual(miss.result, { terminated: false });
+    const bad = (await loop.mock.rpc("thread/backgroundTerminals/terminate", {
+      threadId,
+      processId: "not-a-number",
+    })) as { error?: { code: number } };
+    assert.equal(bad.error?.code, -32600);
+
+    const clean = (await loop.mock.rpc("thread/backgroundTerminals/clean", { threadId })) as {
+      result: unknown;
+    };
+    assert.deepEqual(clean.result, {});
+    const list2 = (await loop.mock.rpc("thread/backgroundTerminals/list", { threadId })) as {
+      result: { data: unknown[] };
+    };
+    assert.equal(list2.result.data.length, 0, "clean 后列表应为空");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-F branch：metadata/update 双层语义、错误文案、fork 截断历史", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/branch" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    // 设 sha+branch
+    const m1 = (await loop.mock.rpc("thread/metadata/update", {
+      threadId,
+      gitInfo: { sha: "abc123", branch: "main" },
+    })) as { result: { thread: { gitInfo: Record<string, unknown> } } };
+    assert.deepEqual(m1.result.thread.gitInfo, { sha: "abc123", branch: "main", originUrl: null });
+
+    // resume 返回带 gitInfo
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId })) as {
+      result: { thread: { gitInfo: Record<string, unknown> } };
+    };
+    assert.deepEqual(resumed.result.thread.gitInfo, { sha: "abc123", branch: "main", originUrl: null });
+
+    // branch:null 清除、sha 缺省保留
+    const m2 = (await loop.mock.rpc("thread/metadata/update", {
+      threadId,
+      gitInfo: { branch: null },
+    })) as { result: { thread: { gitInfo: Record<string, unknown> } } };
+    assert.deepEqual(m2.result.thread.gitInfo, { sha: "abc123", branch: null, originUrl: null });
+
+    // 错误文案
+    const none = (await loop.mock.rpc("thread/metadata/update", { threadId })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(none.error?.code, -32600);
+    assert.equal(none.error?.message, "thread metadata update must include at least one field");
+    const emptyGit = (await loop.mock.rpc("thread/metadata/update", { threadId, gitInfo: {} })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(emptyGit.error?.code, -32600);
+    assert.equal(emptyGit.error?.message, "gitInfo must include at least one field");
+    const proj = (await loop.mock.rpc("thread/metadata/update", { threadId, projectId: "p1" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(proj.error?.code, -32600);
+    assert.equal(proj.error?.message, "project not found: p1");
+
+    // 两轮 turn
+    const t1 = (await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "第一轮" }] })) as {
+      result: { turn: { id: string } };
+    };
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.id === t1.result.turn.id,
+        ),
+      5000,
+      "第一轮未完成",
+    );
+    const t2 = (await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "第二轮" }] })) as {
+      result: { turn: { id: string } };
+    };
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.id === t2.result.turn.id,
+        ),
+      5000,
+      "第二轮未完成",
+    );
+
+    // fork 截至第一轮
+    const fork = (await loop.mock.rpc("thread/fork", { threadId, lastTurnId: t1.result.turn.id })) as {
+      result: { thread: { id: string; turns: unknown[]; forkedFromId: string } } & Record<string, unknown>;
+    };
+    assert.notEqual(fork.result.thread.id, threadId);
+    assert.equal(fork.result.thread.forkedFromId, threadId);
+    assert.equal(fork.result.thread.turns.length, 1, "fork 应截至第一轮（含）");
+    assert.deepEqual(
+      Object.keys(fork.result).sort(),
+      [
+        "activePermissionProfile",
+        "approvalPolicy",
+        "approvalsReviewer",
+        "cwd",
+        "disabledPluginIds",
+        "instructionSources",
+        "model",
+        "modelProvider",
+        "multiAgentMode",
+        "reasoningEffort",
+        "runtimeWorkspaceRoots",
+        "sandbox",
+        "serviceTier",
+        "thread",
+      ],
+      "ForkResponse 顶层 14 键",
+    );
+    const badTurn = (await loop.mock.rpc("thread/fork", { threadId, lastTurnId: "unknown-turn" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(badTurn.error?.code, -32600);
+    assert.equal(badTurn.error?.message, "unknown turn id: unknown-turn");
+
+    // ephemeral fork 不进列表
+    const eph = (await loop.mock.rpc("thread/fork", { threadId, ephemeral: true })) as {
+      result: { thread: { id: string; ephemeral: boolean } };
+    };
+    assert.equal(eph.result.thread.ephemeral, true);
+    const list = (await loop.mock.rpc("thread/list", {})) as { result: { data: Array<{ id: string }> } };
+    assert.ok(!list.result.data.some((t) => t.id === eph.result.thread.id), "ephemeral fork 不应进列表");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("S03-G skill：extraRoots/configWrite/skillRead + $技能名 钩子", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/skill" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    const extra = (await loop.mock.rpc("skills/extraRoots/set", { extraRoots: ["/tmp/extra"] })) as {
+      result: unknown;
+    };
+    assert.deepEqual(extra.result, {});
+
+    const both = (await loop.mock.rpc("skills/config/write", {
+      path: "/tmp/a/SKILL.md",
+      name: "bridge-sim-demo",
+      enabled: true,
+    })) as { error?: { code: number; message: string } };
+    assert.equal(both.error?.code, -32602);
+    assert.equal(both.error?.message, "skills/config/write requires exactly one of path or name");
+    const noneSel = (await loop.mock.rpc("skills/config/write", { enabled: true })) as {
+      error?: { code: number };
+    };
+    assert.equal(noneSel.error?.code, -32602);
+    const single = (await loop.mock.rpc("skills/config/write", { name: "bridge-sim-demo", enabled: true })) as {
+      result: { effectiveEnabled: boolean };
+    };
+    assert.deepEqual(single.result, { effectiveEnabled: true });
+
+    const read = (await loop.mock.rpc("plugin/skill/read", {
+      remoteMarketplaceName: "openai",
+      remotePluginId: "bridge",
+      skillName: "bridge-sim-demo",
+    })) as { result: { contents: string } };
+    assert.ok(read.result.contents.includes("# bridge-sim-demo"));
+    assert.ok(read.result.contents.includes("bridge@openai"));
+
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "用 $bridge-sim-demo 做点事" }],
+    });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/completed") && n.params.item.type === "agentMessage",
+        ),
+      5000,
+      "$技能名 回复未到",
+    );
+    const reply = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.equal(String(reply.params.item.text).split("\n")[0], "已加载技能 $bridge-sim-demo（模拟）。");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
