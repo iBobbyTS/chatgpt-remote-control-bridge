@@ -94,6 +94,8 @@ class InstanceCancelledError extends Error {
   }
 }
 
+const DAEMON_STOPPED_MESSAGE = "daemon 已停止，请创建新实例";
+
 const NOT_IMPLEMENTED_OPS = new Set<IpcRequest["op"]>([
   "pair",
   "pair-status",
@@ -150,21 +152,26 @@ export class CgrcbDaemon {
   /**
    * 加载配置 → 起 IPC → 逐 enabled agent 建实例（经 per-agent 队列）。
    * 与 shutdown() 同一 lifecycle 队列串行（B-1）；start 每个 await 后复查 stopRequested。
+   * 本对象单次生命周期：已停止后再次 start 显式 reject（请创建新实例）。
    */
   start(): Promise<void> {
-    if (!this.startPromise) {
-      this.startPromise = this.lifecycleChain.then(() => this.doStart());
-      this.lifecycleChain = this.startPromise.then(
-        () => undefined,
-        () => undefined,
-      );
+    if (this.startPromise) {
+      if (this.stopRequested) {
+        return Promise.reject(new Error(DAEMON_STOPPED_MESSAGE));
+      }
+      return this.startPromise;
     }
+    this.startPromise = this.lifecycleChain.then(() => this.doStart());
+    this.lifecycleChain = this.startPromise.then(
+      () => undefined,
+      () => undefined,
+    );
     return this.startPromise;
   }
 
   private async doStart(): Promise<void> {
     if (this.stopRequested) {
-      throw new Error("daemon 已请求停止，start 被取消");
+      throw new Error(DAEMON_STOPPED_MESSAGE);
     }
     this.stopping = false;
     await mkdir(this.paths.root, { recursive: true });

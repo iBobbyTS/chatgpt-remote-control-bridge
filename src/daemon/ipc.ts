@@ -18,6 +18,7 @@
  *   一律抛错拒绝接管，绝不删除他人的活 socket。
  */
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { chmod, link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
@@ -170,6 +171,8 @@ export class IpcServer {
   private readonly sockets = new Set<Socket>();
   private server: Server | null = null;
   private lockAcquired = false;
+  /** 本实例写入锁文件的确切内容（释放时做所有权校验，防删他人锁）。 */
+  private lockContent: string | null = null;
 
   constructor(opts: IpcServerOptions) {
     this.socketPath = opts.socketPath;
@@ -213,7 +216,12 @@ export class IpcServer {
    */
   private async acquireLock(): Promise<void> {
     const startedAt = await processStartIdentity(process.pid);
-    const payload = JSON.stringify({ pid: process.pid, startedAt });
+    // owner 唯一随机串：区分同进程内不同 daemon 实例（pid+startedAt 相同）
+    const payload = JSON.stringify({
+      pid: process.pid,
+      startedAt,
+      owner: randomBytes(8).toString("hex"),
+    });
     let parseRetries = 0;
     let orphanGrace = 0;
     for (let attempt = 0; attempt < 10; attempt += 1) {
@@ -234,6 +242,7 @@ export class IpcServer {
       await rm(tmp, { force: true });
       if (linked) {
         this.lockAcquired = true;
+        this.lockContent = payload;
         return;
       }
 
@@ -281,7 +290,22 @@ export class IpcServer {
 
   private async releaseLock(): Promise<void> {
     if (!this.lockAcquired) return;
+    const expected = this.lockContent;
     this.lockAcquired = false;
+    this.lockContent = null;
+    if (!expected) return;
+    // 所有权校验：仅当锁内容仍是本实例写入的（pid+startedAt+owner）才 unlink，
+    // 避免旧持有者 close() 删掉新持有者的锁。
+    let current: string;
+    try {
+      current = await readFile(this.lockPath, "utf8");
+    } catch {
+      return; // 锁已不存在
+    }
+    if (current !== expected) {
+      this.log("锁已被他人替换，跳过释放（所有权校验）");
+      return;
+    }
     await rm(this.lockPath, { force: true }).catch(() => {});
   }
 

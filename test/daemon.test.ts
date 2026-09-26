@@ -1193,3 +1193,38 @@ test("NIT3 停止中的 enable/disable 返回 DAEMON_BUSY", async () => {
     await mock.stop();
   }
 });
+
+// --------------------------------------------------- S02 三波微修（锁释放所有权 / 二次 start）
+
+test("三波1 锁释放所有权校验：锁被他人替换后 shutdown() 不删除该锁", async () => {
+  const home = await tempDir("lockown");
+  const paths = cgrcbPaths(home);
+  const lock = `${paths.socketPath}.lock`;
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  await daemon.start();
+  assert.equal(existsSync(lock), true, "启动后应持锁");
+  // 模拟锁被他人（不同持有者）覆盖
+  const foreign = JSON.stringify({
+    pid: 999999,
+    startedAt: "Thu Jan  1 00:00:00 1970",
+    owner: "someone-else",
+  });
+  await writeFile(lock, foreign);
+  await daemon.shutdown();
+  assert.equal(existsSync(lock), true, "旧持有者 close() 不得删除新持有者的锁");
+  assert.equal(await readFile(lock, "utf8"), foreign, "他人锁内容不得被改写");
+});
+
+test("三波2 二次 start 显式拒绝：shutdown 后不再静默返回成功", async () => {
+  const home = await tempDir("twice");
+  const paths = cgrcbPaths(home);
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  await daemon.start();
+  await daemon.shutdown();
+  await assert.rejects(
+    () => daemon.start(),
+    /daemon 已停止，请创建新实例/,
+  );
+  assert.equal(daemon.isRunning, false);
+  assert.equal(existsSync(paths.socketPath), false);
+});
