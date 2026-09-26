@@ -6,7 +6,7 @@
  * .agent-work/tmp/sim-layer/catalog*.json）。
  */
 import { EventEmitter } from "node:events";
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import { readdir, rename, stat, writeFile } from "node:fs/promises";
 import { homedir, release } from "node:os";
 import { join } from "node:path";
@@ -868,8 +868,11 @@ export class SimApp extends EventEmitter implements AgentApp {
         isDirectory: s.isDirectory(),
         isFile: s.isFile(),
         isSymlink: s.isSymbolicLink(),
-        createdAtMs: s.birthtimeMs,
-        modifiedAtMs: s.mtimeMs,
+        // 真实 codex（Rust）返回整毫秒；Node stat 的纳秒精度带小数，
+        // 手机 Swift 解码器按整数解码小数毫秒即「无法解码Codex响应」
+        // （2026-09-25 真机复现：仅时间戳恰为整秒的目录能显示）
+        createdAtMs: Math.round(s.birthtimeMs),
+        modifiedAtMs: Math.round(s.mtimeMs),
       };
     } catch {
       if (this.overlayDirs.has(path)) {
@@ -905,22 +908,39 @@ export class SimApp extends EventEmitter implements AgentApp {
     const script = command.join(" ");
     const handle = p.processHandle ?? `sim-${uuidv7()}`;
     let stdout = "";
+    let stderr = "";
+    let exitCode = 0;
     const taskDir = this.emulateTaskDirMkdir(script);
     if (taskDir) {
       // 手机端新建任务：解析 stdout 拿任务目录路径（真实脚本 printf candidate）
       stdout = `${taskDir}\n`;
+    } else if (script.includes('cd "$HOME" && pwd -P')) {
+      // 工作文件夹选择器入口：手机靠该脚本拿 HOME 物理路径，空 stdout 会让
+      // 选择器直接判「远程文件夹加载失败」（2026-09-25 真机复现，docs/research/07）
+      stdout = `${realpathSync(homedir())}\n`;
+    } else if (script.includes("CODEX_DRAFT_OUTPUT_CURRENT")) {
+      // 选中目录后的 git 分支探测（draft/分支选择）。手机可接受「非 git 目录」
+      // 形状并继续 thread/start（真实抓包 2026-09-25T19:23:04Z）；CODEX_DRAFT_OUTPUT_*
+      // 标记值由 codex 进程注入、抓包未能观测到，故 git 仓库目录也按此形状应答
+      // （draft 分支列表不可用，不影响文件夹选择本身）。
+      exitCode = 128;
+      stderr = "fatal: not a git repository (or any of the parent directories): .git\n";
     } else if (/\bmkdir\b/.test(script)) {
       // 其他 mkdir：登记到覆盖层，不真正执行
       for (const m of script.matchAll(/\bmkdir\s+(?:-[a-zA-Z]+\s+)*(~[^\s'";|&]+|\/[^\s'";|&]+)/g)) {
         this.overlayMkdir(m[1]);
       }
+    } else if (!script.includes("collecting a workspace diff")) {
+      // 周期性 workspace-diff 快照不记日志（约 30s 一次会刷屏）；其余未识别脚本
+      // 留痕，便于真机出现新脚本模式时定位（当前以空 stdout / exit 0 兜底应答）
+      this.opts.log?.(`spawn 未识别脚本（空 stdout 应答）: ${script.slice(0, 80)}`);
     }
     this.emit("event", this.notification("process/exited", {
       processHandle: handle,
-      exitCode: 0,
+      exitCode,
       stdout,
       stdoutCapReached: false,
-      stderr: "",
+      stderr,
       stderrCapReached: false,
     }));
     return {};

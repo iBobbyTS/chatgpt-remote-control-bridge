@@ -8,6 +8,7 @@
  * （与 daemon 经注册表创建实例的接线一致）；断言语义与原测试完全一致。
  */
 import assert from "node:assert/strict";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -480,6 +481,84 @@ test("回环：fs 虚拟目录 + process/spawn mkdir 覆盖层", async () => {
       result: { isDirectory: boolean };
     };
     assert.equal(meta.result.isDirectory, true);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：工作文件夹选择器（pwd -P / git draft 探测 / getMetadata 整毫秒）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+
+    // picker 入口脚本（真实形状，2026-09-25T19:22:52Z 抓包）：stdout 必须是 HOME 物理路径。
+    // 修复前这里回空 stdout，手机选择器直接判「远程文件夹加载失败」，连 fs/* 都不会发。
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("process/spawn", {
+      command: ["/bin/sh", "-lc", 'cd "$HOME" && pwd -P'],
+      processHandle: "picker-pwd",
+    });
+    const findExited = (handle: string) =>
+      loop.mock.receivedNotifications.find(
+        (n) =>
+          n.method === "process/exited" &&
+          (n.params as { processHandle: string }).processHandle === handle,
+      );
+    await waitFor(
+      () => findExited("picker-pwd") !== undefined,
+      5000,
+      "pwd process/exited 未收到",
+    );
+    const pwdExited = findExited("picker-pwd")!;
+    assert.equal((pwdExited.params as { exitCode: number }).exitCode, 0);
+    assert.equal(
+      (pwdExited.params as { stdout: string }).stdout,
+      `${realpathSync(homedir())}\n`,
+      "pwd -P 应回真实 HOME 物理路径",
+    );
+
+    // HOME 元数据形状对齐真实抓包（5 键）
+    const homeMeta = (await loop.mock.rpc("fs/getMetadata", { path: homedir() }, 10_000)) as {
+      result: Record<string, unknown>;
+    };
+    assert.deepEqual(
+      Object.keys(homeMeta.result).sort(),
+      ["createdAtMs", "isDirectory", "isFile", "isSymlink", "modifiedAtMs"],
+    );
+    assert.equal(homeMeta.result.isDirectory, true);
+    // 真实 codex 返回整毫秒；小数毫秒（Node stat 纳秒精度）会被手机按整数解码
+    // 失败 →「无法解码Codex响应」。$HOME 的 stat 在本机即为小数毫秒，可证伪。
+    assert.ok(
+      Number.isInteger(homeMeta.result.createdAtMs) &&
+        Number.isInteger(homeMeta.result.modifiedAtMs),
+      "createdAtMs/modifiedAtMs 必须是整毫秒",
+    );
+
+    // 选中目录后的 git 分支探测：按真实「非 git 目录」形状（exit 128 + fatal stderr，
+    // 手机接受并继续 thread/start）
+    const draftScript =
+      'set -eu\ncurrent_branch="$(git branch --show-current)"\n' +
+      'printf \'%s\\t%s\\n\' "$CODEX_DRAFT_OUTPUT_CURRENT" "$current_branch"\n' +
+      'printf \'%s\\t%s\\n\' "$CODEX_DRAFT_OUTPUT_DEFAULT" ""';
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("process/spawn", {
+      command: ["/bin/sh", "-lc", draftScript],
+      cwd: homedir(),
+      processHandle: "picker-draft",
+    });
+    await waitFor(
+      () => findExited("picker-draft") !== undefined,
+      5000,
+      "draft process/exited 未收到",
+    );
+    const draftExited = findExited("picker-draft")!;
+    assert.equal((draftExited.params as { exitCode: number }).exitCode, 128);
+    assert.equal((draftExited.params as { stdout: string }).stdout, "");
+    assert.equal(
+      (draftExited.params as { stderr: string }).stderr,
+      "fatal: not a git repository (or any of the parent directories): .git\n",
+    );
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();

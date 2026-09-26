@@ -155,6 +155,46 @@ clientUserMessageId）与服务器 item（item.clientId 对账）合并，顺序
 只经 item 事件下发）。回归测试两道：应用层「turn/start 派发期间零通知」+
 隧道线上时序「响应信封先于全部 turn 通知」（mockServer 增 receivedEnvelopeLog）。
 
+## 工作文件夹选择：真实流程、默认目录机制与「加载失败」根因（2026-09-25 深夜二）
+
+原始抓包（`.agent-work/tmp/wham-probe/real-*.jsonl`，双向帧）完整记录了一次
+真实的手动选目录流程（19:22:52–19:23:08Z，选中 `~/AUAV`）：
+
+1. `process/spawn` `/bin/sh -lc 'cd "$HOME" && pwd -P'`（cwd `/`）→ 手机靠
+   **stdout** 拿 HOME 物理路径（真实应答 `/Users/ibobby\n`，~15ms）。
+2. `fs/getMetadata {path}` → `{isDirectory,isFile,isSymlink,createdAtMs,modifiedAtMs}`；
+   `fs/readDirectory {path}` → `{entries:[{fileName,isDirectory,isFile}]}`（含点文件）。
+3. 选中目录后再来一轮 getMetadata+readDirectory，随后 `process/spawn` git 分支
+   探测脚本（`CODEX_DRAFT_OUTPUT_*`，draft/worktree 分支选择用）——**非阻塞**：
+   真实应答即 exit 128 + `fatal: not a git repository …` stderr，手机照常继续。
+4. `thread/start {cwd:<选中目录>, threadSource:"user"}`（+ 同 cwd 的 ephemeral
+   起名线程）。
+
+**默认文件夹的决定机制**（手机端逻辑，全部在远端脚本内计算）：不手动选目录时，
+手机直接下发 mkdir 脚本，路径 = `$HOME/Documents/Codex/<远端 date +%Y-%m-%d>/<任务名 slug>`
+（slug 由任务名生成，重名加 `-N` 后缀，唯一性循环上限 1000），以 stdout 路径作
+thread/start 的 cwd——服务端没有任何「默认目录」接口。模拟层 `emulateTaskDirMkdir`
+已按此模拟（覆盖层，不落盘）。
+
+「远程文件夹加载失败」根因：模拟层 `processSpawn` 对未识别脚本一律回
+**空 stdout / exit 0**——第 1 步 `pwd -P` 拿到空路径，手机选择器直接失败中止，
+连 fs/* 请求都不发（当晚 daemon 日志：122 次 spawn 全 ✓ 但零 fs 调用）。
+
+→ 修复（2026-09-25 深夜二）：`processSpawn` 新增两个识别分支——
+`cd "$HOME" && pwd -P` → stdout=realpath(HOME)；`CODEX_DRAFT_OUTPUT_CURRENT`
+脚本 → 按真实「非 git 目录」形状（exit 128 + fatal stderr；git 仓库目录同样
+按此应答，draft 分支列表不可用，不影响选目录）。另对未识别的非 diff 脚本留
+日志（此前日志只记方法名不记参数，真机排障全靠猜）。回归测试一道（picker 全
+链路形状断言，stash 可证伪）。fs/getMetadata/readDirectory 形状经比对已一致，未改。
+
+选择器入口修通后暴露第二层问题：目录列表报「无法解码Codex响应」，仅 `/`
+能显示（点 2 次上级才成功）。根因：`fsGetMetadata` 直接返回 Node stat 的
+`birthtimeMs/mtimeMs`——APFS 纳秒精度带**小数毫秒**（如
+`1747760284363.8718`）；真实 codex（Rust）返回**整毫秒**，手机 Swift 按整数
+解码，遇到小数点即失败。`/` 的时间戳恰为整秒（…5000）所以唯一能解码。
+→ 修复（2026-09-25 深夜三）：两字段 `Math.round()` 取整；picker 回归测试加
+整毫秒断言（$HOME 的 stat 即小数毫秒，本机可证伪）。
+
 ## 对齐 codex 线程生命周期（源码实证）
 
 codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁盘 rollout；

@@ -4,3 +4,4 @@ node_modules/
 var/
 .agent-work/
 dist/
+.codegraph
