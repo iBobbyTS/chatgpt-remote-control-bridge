@@ -546,3 +546,23 @@ goal turn 为 `wait 30 seconds`，其余（第 1、3、4…个）为 `wait 10 se
 规则在等待边界生效，中途停止按该轮终态 blocked/complete 收尾）。两个 goal 回归
 测试补 wait 条目断言（每轮恰 1 个、10/30 秒标签、与 test queue 用户 turn 的
 wait 按 turnId 区分），全量 182/182。
+
+### 追记：goal 生命周期改为 4 个链式 goal turn（澄清）（同日）
+
+用户澄清上一轮需求：不是「每轮 3 条消息挤在一个 turn 里」，而是——**整个目标生命
+周期共 4 个 goal turn，每个 turn = 1 个模拟 wait + 1 条 agentMessage**：
+
+- 首轮阶段（激活）：goal turn 1（wait 10s，输出 1/3）→ 结束保持 active → 经
+  on_thread_idle 链式自动续跑 → goal turn 2（wait **30s**，输出 2/3，即 blocked
+  前那个）→ goal turn 3（wait 10s，输出 3/3）→ 标记 **blocked**；
+- 再启阶段（blocked → active）：goal turn 4（wait 10s，1 条输出）→ **complete**。
+
+实现：`ThreadState.goalPhaseIndex`（阶段内轮序，每次 goalSet active 归零）；
+`goalEndStatus` 语义扩展——null=保持 active（finishSimTurn 只在非空时写终态，
+计量照常发 thread/goal/updated{turnId}）；阶段内前 2 轮 goalEndStatus=null，
+链式续跑复用既有 consumeQueue → continueGoalIfIdle 路径（对齐 codex on_thread_idle
+循环，goal 不因 turn 结束而停）。wait 规则不变：goalTurnCount 第 2 个 = 30 秒，
+其余 10 秒——在 4-turn 结构下即 blocked 前那一轮。计量每 goal turn 1234：blocked
+时 3702（3 turn），complete 时 4936（4 turn）。steer/stop 只终止当前 goal turn，
+goal 仍 active 时继续续跑（对齐 codex：turn 停 ≠ goal 停）。测试重写为
+waitForGoalTurn 辅助 + 4 turn 链式断言，全量 182/182。

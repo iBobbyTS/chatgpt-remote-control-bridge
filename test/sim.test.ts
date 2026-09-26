@@ -1442,7 +1442,56 @@ const findNotif = (
     (n): n is Notif => isNotif(n, method) && (extra ? extra(n.params) : true),
   );
 
-test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮 3 条→blocked、再启 1 条→complete", async () => {
+/**
+ * 等待「下一个」goal turn（不在 knownIds 中的 turn/started）完成，并校验其形状：
+ * 恰 1 个 wait 命令条目（标签）、恰 1 条 agentMessage、goal 计量更新（终态与
+ * 累计 tokensUsed）。返回 turn id 与消息文本。
+ */
+async function waitForGoalTurn(
+  loop: Awaited<ReturnType<typeof startLoop>>,
+  knownIds: string[],
+  expect: { wait: string; endStatus: string; tokens: number },
+): Promise<{ turnId: string; msgText: string }> {
+  await waitFor(
+    () =>
+      loop.mock.receivedNotifications.some(
+        (n) => isNotif(n, "turn/started") && !knownIds.includes(n.params.turn.id),
+      ),
+    2000,
+    "下一个 goal turn 未自动开始",
+  );
+  const turnId = (loop.mock.receivedNotifications.filter(
+    (n) => isNotif(n, "turn/started"),
+  ) as Notif[])
+    .map((n) => n.params.turn.id as string)
+    .find((id) => !knownIds.includes(id))!;
+  await waitFor(
+    () =>
+      loop.mock.receivedNotifications.some(
+        (n) => isNotif(n, "turn/completed") && n.params.turn.id === turnId,
+      ),
+    8000,
+    "goal turn 未完成",
+  );
+  const msgs = loop.mock.receivedNotifications.filter(
+    (n) => isNotif(n, "item/completed") && n.params.turnId === turnId && n.params.item?.type === "agentMessage",
+  ) as Notif[];
+  const waits = loop.mock.receivedNotifications.filter(
+    (n) => isNotif(n, "item/completed") && n.params.turnId === turnId && n.params.item?.type === "commandExecution",
+  ) as Notif[];
+  assert.equal(msgs.length, 1, "每个 goal turn 应输出 1 条 agentMessage");
+  assert.equal(waits.length, 1, "每个 goal turn 应有 1 个 wait 命令");
+  assert.equal(waits[0].params.item.command, expect.wait, "wait 时长标签");
+  const upd = (loop.mock.receivedNotifications.filter(
+    (n) => isNotif(n, "thread/goal/updated"),
+  ) as Notif[]).find((n) => n.params.turnId === turnId);
+  assert.ok(upd, "goal turn 结束应发带 turnId 的计量更新");
+  assert.equal(upd.params.goal.status, expect.endStatus, "goal turn 结束终态");
+  assert.equal(upd.params.goal.tokensUsed, expect.tokens, "goal 计量累计");
+  return { turnId, msgText: String(msgs[0].params.item.text) };
+}
+
+test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮阶段 3 turn 链式→blocked、再启 1 turn→complete", async () => {
   const loop = await startLoop({ commandWaitMs: 150, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
   try {
     await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
@@ -1483,40 +1532,37 @@ test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮 3 条→
     assert.equal(updated.params.turnId, null, "goal/updated 的 turnId 应为 null");
     assert.equal(updated.params.goal.objective, "完成 S03");
 
-    // 首轮：active goal 空闲线程自动开跑 goal turn（continue_if_idle 语义）：
-    // 无 userMessage item，输出 3 条 agentMessage，结束后 goal 标记 blocked
+    // 首轮阶段：active goal 空闲线程自动开跑 3 个 goal turn（continue_if_idle +
+    // on_thread_idle 链式续跑），每个 turn = 1 个 wait + 1 条输出，无 userMessage
     await waitFor(
       () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/started")),
       2000,
       "goal set 后应自动 turn/started",
     );
-    const goalTurnStarted = findNotif(loop, "turn/started")!;
-    assert.equal(goalTurnStarted.params.turn.items.length, 0, "goal turn/started 不带 items");
-    const goalTurnId = goalTurnStarted.params.turn.id;
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/completed") && n.params.turn.id === goalTurnId,
-        ),
-      8000,
-      "goal 续跑 turn 未完成",
+    assert.equal(findNotif(loop, "turn/started")!.params.turn.items.length, 0, "goal turn/started 不带 items");
+    const t1 = await waitForGoalTurn(loop, [], { wait: "wait 10 seconds", endStatus: "active", tokens: 1234 });
+    assert.ok(t1.msgText.includes("（goal 1/3）"));
+    const t2 = await waitForGoalTurn(loop, [t1.turnId], { wait: "wait 30 seconds", endStatus: "active", tokens: 2468 });
+    assert.ok(t2.msgText.includes("（goal 2/3）"));
+    const t3 = await waitForGoalTurn(loop, [t1.turnId, t2.turnId], { wait: "wait 10 seconds", endStatus: "blocked", tokens: 3702 });
+    assert.ok(t3.msgText.includes("（goal 3/3）"));
+
+    const get = (await loop.mock.rpc("thread/goal/get", { threadId })) as {
+      result: { goal: Record<string, any> };
+    };
+    assert.equal(get.result.goal.status, "blocked");
+    assert.equal(get.result.goal.tokensUsed, 3702);
+    assert.equal(get.result.goal.objective, "完成 S03", "计量不应改写 objective");
+    assert.equal(get.result.goal.tokenBudget, 5000, "计量不应改写 tokenBudget");
+
+    // 再次启动（仅 status active，objective 沿用）：第 4 个 goal turn → complete
+    await loop.mock.rpc("thread/goal/set", { threadId, status: "active" });
+    const t4 = await waitForGoalTurn(
+      loop,
+      [t1.turnId, t2.turnId, t3.turnId],
+      { wait: "wait 10 seconds", endStatus: "complete", tokens: 4936 },
     );
-    const agentMsgs = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === goalTurnId && n.params.item?.type === "agentMessage",
-    ) as Notif[];
-    assert.equal(agentMsgs.length, 3, "首轮 goal turn 应输出 3 条 agentMessage");
-    assert.ok(String(agentMsgs[0].params.item.text).includes("（goal 1/3）"));
-    const goalWaits = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === goalTurnId && n.params.item?.type === "commandExecution",
-    ) as Notif[];
-    assert.equal(goalWaits.length, 1, "首轮应插入 1 个 wait 命令");
-    assert.equal(goalWaits[0].params.item.command, "wait 10 seconds", "第 1 个 goal turn 的 wait 为 10 秒");
-    const accounted = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "thread/goal/updated"))
-      .find((n) => n.params.turnId === goalTurnId);
-    assert.ok(accounted, "turn 结束应发带 turnId 的 thread/goal/updated");
-    assert.equal(accounted.params.goal.status, "blocked", "首轮 goal turn 结束应标记 blocked");
-    assert.equal(accounted.params.goal.tokensUsed, 1234, "goal 计量应累加模拟 token 数");
+    assert.ok(t4.msgText.includes("已重新启动目标"));
     assert.ok(
       !loop.mock.receivedNotifications.some((n) => isNotif(n, "thread/goal/cleared")),
       "turn 结束不应发 thread/goal/cleared（仅 clear RPC 发）",
@@ -1524,52 +1570,7 @@ test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮 3 条→
     const userItems = loop.mock.receivedNotifications.filter(
       (n) => isNotif(n, "item/started") && n.params.item?.type === "userMessage",
     );
-    assert.equal(userItems.length, 0, "goal 续跑 turn 不应产生 userMessage item");
-
-    const get = (await loop.mock.rpc("thread/goal/get", { threadId })) as {
-      result: { goal: Record<string, any> };
-    };
-    assert.equal(get.result.goal.status, "blocked");
-    assert.equal(get.result.goal.tokensUsed, 1234);
-    assert.equal(get.result.goal.objective, "完成 S03", "计量不应改写 objective");
-    assert.equal(get.result.goal.tokenBudget, 5000, "计量不应改写 tokenBudget");
-
-    // 再次启动（仅 status active，objective 沿用）：续跑轮输出 1 条 → complete
-    await loop.mock.rpc("thread/goal/set", { threadId, status: "active" });
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/started") && n.params.turn.id !== goalTurnId,
-        ),
-      2000,
-      "续跑 goal turn 未自动开始",
-    );
-    const resumeTurnId = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "turn/started"))
-      .find((n) => n.params.turn.id !== goalTurnId)!.params.turn.id;
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/completed") && n.params.turn.id === resumeTurnId,
-        ),
-      8000,
-      "续跑 goal turn 未完成",
-    );
-    const resumeMsgs = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === resumeTurnId && n.params.item?.type === "agentMessage",
-    );
-    assert.equal(resumeMsgs.length, 1, "续跑轮应输出 1 条 agentMessage");
-    const resumeWaits = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === resumeTurnId && n.params.item?.type === "commandExecution",
-    ) as Notif[];
-    assert.equal(resumeWaits.length, 1, "续跑轮应插入 1 个 wait 命令");
-    assert.equal(resumeWaits[0].params.item.command, "wait 30 seconds", "第 2 个 goal turn 的 wait 为 30 秒");
-    const resumeAccounted = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "thread/goal/updated"))
-      .find((n) => n.params.turnId === resumeTurnId);
-    assert.ok(resumeAccounted, "续跑轮结束应发计量更新");
-    assert.equal(resumeAccounted.params.goal.status, "complete", "续跑轮结束应标记 complete");
-    assert.equal(resumeAccounted.params.goal.tokensUsed, 2468, "两轮各计量 1234");
+    assert.equal(userItems.length, 0, "goal turn 不应产生 userMessage item");
 
     // tokenBudget:null 清除；objective 缺省保留（status 默认沿用 complete，不再续跑）
     const clearedBudget = (await loop.mock.rpc("thread/goal/set", { threadId, tokenBudget: null })) as {
@@ -1580,8 +1581,8 @@ test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮 3 条→
     await new Promise((r) => setTimeout(r, 80));
     assert.equal(
       loop.mock.receivedNotifications.filter((n) => isNotif(n, "turn/started")).length,
-      2,
-      "complete 后不应再自动开跑",
+      4,
+      "complete 后不应再自动开跑（共 4 个 goal turn）",
     );
 
     loop.mock.receivedNotifications.length = 0;
@@ -1600,7 +1601,7 @@ test("S03-A goal：set/get 全键、tokenBudget 双层、clear、首轮 3 条→
   }
 });
 
-test("S03-A goal：用户 turn 运行中 set active → 计量后续跑首轮 3 条→blocked，再启 1 条→complete", async () => {
+test("S03-A goal：用户 turn 运行中 set active → 计量后续跑首轮阶段 3 turn→blocked，再启 1 turn→complete", async () => {
   const loop = await startLoop({ commandWaitMs: 300, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
   try {
     await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
@@ -1638,86 +1639,27 @@ test("S03-A goal：用户 turn 运行中 set active → 计量后续跑首轮 3 
     assert.ok(userAccounted, "用户 turn 结束应发带 turnId 的 goal 计量更新");
     assert.equal(userAccounted.params.goal.status, "active", "用户 turn 结束 goal 仍为 active");
 
-    // 线程空闲 → 自动续跑首轮 goal turn（3 条输出）→ blocked
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/started") && n.params.turn.id !== userTurnId,
-        ),
-      2000,
-      "goal 续跑 turn 未自动开始",
-    );
-    const goalTurnId = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "turn/started"))
-      .find((n) => n.params.turn.id !== userTurnId)!.params.turn.id;
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/completed") && n.params.turn.id === goalTurnId,
-        ),
-      8000,
-      "goal 续跑 turn 未完成",
-    );
-    const goalMsgs = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === goalTurnId && n.params.item?.type === "agentMessage",
-    );
-    assert.equal(goalMsgs.length, 3, "首轮 goal turn 应输出 3 条");
-    const goalWaits = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === goalTurnId && n.params.item?.type === "commandExecution",
-    ) as Notif[];
-    assert.equal(goalWaits.length, 1, "首轮应插入 1 个 wait 命令");
-    assert.equal(goalWaits[0].params.item.command, "wait 10 seconds", "第 1 个 goal turn 的 wait 为 10 秒");
-    const goalAccounted = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "thread/goal/updated"))
-      .find((n) => n.params.turnId === goalTurnId);
-    assert.ok(goalAccounted, "goal turn 结束应发计量更新");
-    assert.equal(goalAccounted.params.goal.status, "blocked");
-    assert.equal(goalAccounted.params.goal.tokensUsed, 2468, "用户 turn 与首轮 goal turn 各计量 1234");
+    // 线程空闲 → 首轮阶段 3 个 goal turn 链式续跑（wait 10/30/10 秒）→ blocked
+    const g1 = await waitForGoalTurn(loop, [userTurnId], { wait: "wait 10 seconds", endStatus: "active", tokens: 2468 });
+    assert.ok(g1.msgText.includes("（goal 1/3）"));
+    const g2 = await waitForGoalTurn(loop, [userTurnId, g1.turnId], { wait: "wait 30 seconds", endStatus: "active", tokens: 3702 });
+    assert.ok(g2.msgText.includes("（goal 2/3）"));
+    const g3 = await waitForGoalTurn(loop, [userTurnId, g1.turnId, g2.turnId], { wait: "wait 10 seconds", endStatus: "blocked", tokens: 4936 });
+    assert.ok(g3.msgText.includes("（goal 3/3）"));
 
-    // 再次启动：续跑轮 1 条输出 → complete
+    // 再次启动：第 4 个 goal turn（wait 10 秒 + 1 条输出）→ complete
     await loop.mock.rpc("thread/goal/set", { threadId, status: "active" });
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) =>
-            isNotif(n, "turn/started") &&
-            n.params.turn.id !== userTurnId &&
-            n.params.turn.id !== goalTurnId,
-        ),
-      2000,
-      "续跑 goal turn 未自动开始",
+    const g4 = await waitForGoalTurn(
+      loop,
+      [userTurnId, g1.turnId, g2.turnId, g3.turnId],
+      { wait: "wait 10 seconds", endStatus: "complete", tokens: 6170 },
     );
-    const resumeTurnId = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "turn/started"))
-      .find((n) => n.params.turn.id !== userTurnId && n.params.turn.id !== goalTurnId)!.params.turn.id;
-    await waitFor(
-      () =>
-        loop.mock.receivedNotifications.some(
-          (n) => isNotif(n, "turn/completed") && n.params.turn.id === resumeTurnId,
-        ),
-      8000,
-      "续跑 goal turn 未完成",
-    );
-    const resumeMsgs = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === resumeTurnId && n.params.item?.type === "agentMessage",
-    );
-    assert.equal(resumeMsgs.length, 1, "续跑轮应输出 1 条");
-    const resumeWaits = loop.mock.receivedNotifications.filter(
-      (n) => isNotif(n, "item/completed") && n.params.turnId === resumeTurnId && n.params.item?.type === "commandExecution",
-    ) as Notif[];
-    assert.equal(resumeWaits.length, 1, "续跑轮应插入 1 个 wait 命令");
-    assert.equal(resumeWaits[0].params.item.command, "wait 30 seconds", "第 2 个 goal turn 的 wait 为 30 秒");
-    const resumeAccounted = loop.mock.receivedNotifications
-      .filter((n) => isNotif(n, "thread/goal/updated"))
-      .find((n) => n.params.turnId === resumeTurnId);
-    assert.ok(resumeAccounted, "续跑轮结束应发计量更新");
-    assert.equal(resumeAccounted.params.goal.status, "complete", "续跑轮结束应标记 complete");
-    assert.equal(resumeAccounted.params.goal.tokensUsed, 3702, "三轮各计量 1234");
+    assert.ok(g4.msgText.includes("已重新启动目标"));
 
     // 循环有界：complete 后不再有新 turn
     await new Promise((r) => setTimeout(r, 80));
     const turnStarts = loop.mock.receivedNotifications.filter((n) => isNotif(n, "turn/started"));
-    assert.equal(turnStarts.length, 3, "complete 后不应再自动开跑");
+    assert.equal(turnStarts.length, 5, "用户 turn + 4 个 goal turn 后不应再自动开跑");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
