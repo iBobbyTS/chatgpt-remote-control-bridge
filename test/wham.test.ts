@@ -535,11 +535,13 @@ test("MATERIAL safeEmit 捕获异步监听器：reject 不产生 unhandledReject
   const { server } = await startMock();
   const { tunnel } = await startStubTunnel({ mock: server, logs });
   let secondCalls = 0;
+  let listenerThis: unknown;
   // enrollment 在 start() 内发出：首个 async 监听器 reject，第二个仍必须被调用
   tunnel.on("enrollment", async () => {
     throw new Error("listener boom");
   });
-  tunnel.on("enrollment", () => {
+  tunnel.on("enrollment", function (this: unknown) {
+    listenerThis = this;
     secondCalls += 1;
   });
   try {
@@ -547,6 +549,7 @@ test("MATERIAL safeEmit 捕获异步监听器：reject 不产生 unhandledReject
     await waitFor(() => tunnel.connected, 5000);
     await new Promise((r) => setTimeout(r, 100));
     assert.ok(secondCalls >= 1, "首个监听器失败不得阻断后续订阅者");
+    assert.equal(listenerThis, tunnel, "监听器 this 应绑定到 tunnel（对齐 emit 语义）");
     assert.deepEqual(unhandled, [], "监听器 rejection 不得成为 unhandledRejection");
     assert.ok(
       logs.some((l) => l.includes("emit enrollment async")),
