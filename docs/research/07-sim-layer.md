@@ -516,3 +516,18 @@ budget/objective 保持 → clear true/false）；新增忙时用例（test queu
 set active → 用户 turn 结束计量仍 active → 自动续跑 goal turn → complete，共 2 轮
 计量 2468，bounded 断言无第三轮）；resume 快照用例改 `status:"paused"` 消除自动
 续跑与 envelope 时序的竞态。全量 182/182。
+
+### 追记：目标模拟脚本改为「首轮 3 条 → blocked，再启 1 条 → complete」（同日）
+
+用户规则更新：goal 激活后的续跑 turn 不再一次输出即 complete，而是——首轮激活输出
+3 条文本后把 goal 标记 **blocked**；用户从 blocked 再次启动（`thread/goal/set`
+status active）后续跑轮输出 1 条后标记 **complete**。
+
+实现：轮种在 goalSet 结果为 active 时按**先前状态**判定（`existing?.status ===
+"blocked"` → 续跑轮，其余（新目标 / paused / complete / active 重设）→ 首轮），存
+内存态 `ThreadState.goalRunResume`（不持久化——goal 的持久化状态本身足以在重启后
+恢复判定）；`SimTurnRuntime.goalEndStatus`（blocked/complete）由 `beginGoalTurn`
+按轮种写入，`finishSimTurn` 计量后统一应用；首轮 3 条消息在消息边界排水 steer
+（同 runScriptedTurn，stop 规则生效——中途停止按首轮终态 blocked 收尾）。计量仍
+每 goal turn 1234 token。真机推论：blocked 后手机 goal 卡片应出现「继续/重试」
+入口，点击即走续跑轮。

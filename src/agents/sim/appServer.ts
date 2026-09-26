@@ -124,6 +124,11 @@ interface SimTurnRuntime {
    * turn_input.rs:660-680）。
    */
   kind: "normal" | "compact" | "goal";
+  /**
+   * goal turn 结束时写入 goal 的模拟终态：首轮 3 条输出 → "blocked"，从 blocked
+   * 再次激活的续跑轮 1 条输出 → "complete"。仅 kind==="goal" 使用。
+   */
+  goalEndStatus: "blocked" | "complete" | null;
 }
 
 /** thread/shellCommand 登记的后台终端条目（v2/thread.rs:1215-1224）。 */
@@ -141,6 +146,12 @@ interface ThreadState {
   sim: SimTurnRuntime | null;
   /** 线程目标（v2/thread.rs:813），持久化；旧快照缺字段按 null。 */
   goal: SimGoal | null;
+  /**
+   * goal 模拟轮种（内存态，不持久化）：true=从 blocked 再次激活的续跑轮
+   * （1 条输出 → complete）；false=首轮（3 条输出 → blocked）。每次 goalSet
+   * 结果为 active 时按先前状态重判，goal 持久化状态本身已足以在重启后恢复判定。
+   */
+  goalRunResume: boolean;
   /** compact 刚完成标记（内存态，不持久化）；下一个普通 turn 回复首行提示后清除。 */
   justCompacted: boolean;
   /** 后台终端（不持久化）：thread/shellCommand 完成后登记。 */
@@ -149,7 +160,7 @@ interface ThreadState {
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, justCompacted: false, backgroundTerminals: [] };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, justCompacted: false, backgroundTerminals: [] };
 }
 
 type AnyParams = Record<string, any>;
@@ -178,7 +189,7 @@ const HELP_TEXT = [
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
   "",
   "模拟功能（对齐 codex）：",
-  "goal 启用后自动续跑一轮并标记完成",
+  "goal 启用后自动续跑：首轮输出3条后标记blocked，再次启动输出1条后标记complete",
   "compact 约 5 秒完成且下一条回复标记",
   "Plan 模式回复带前缀",
   "shell 命令生成模拟命令条目",
@@ -907,7 +918,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const userText = input.map((c) => c.text).join("");
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -1211,14 +1222,15 @@ export class SimApp extends EventEmitter implements AgentApp {
     }, state.thread.id));
     // goal 计量（extension.rs on_turn_stop → account_active_goal_progress）：active
     // goal 随 turn 累加用量并广播 thread/goal/updated（带 turnId）。goal turn 由
-    // sim 层代替 LLM 调 update_goal(complete)（tool.rs handle_update）标记完成；
-    // 非 active（paused/blocked/complete…）不计量不发。cleared 只来自
-    // thread/goal/clear RPC（thread_goal_processor.rs:294-299），turn 结束不发。
+    // sim 层代替 LLM 写入模拟终态（首轮 3 条输出 → blocked，续跑轮 1 条 →
+    // complete，代替 LLM 的 update_goal 调用）；非 active（paused/blocked/
+    // complete…）不计量不发。cleared 只来自 thread/goal/clear RPC
+    // （thread_goal_processor.rs:294-299），turn 结束不发。
     if (state.goal && state.goal.status === "active") {
       state.goal.tokensUsed += GOAL_TURN_TOKENS;
       state.goal.timeUsedSeconds += Math.max(0, completedAt - (sim.turn.startedAt ?? completedAt));
       if (sim.kind === "goal") {
-        state.goal.status = "complete";
+        state.goal.status = sim.goalEndStatus ?? "complete";
       }
       state.goal.updatedAt = completedAt;
       this.emit("event", this.notification("thread/goal/updated", {
@@ -1438,8 +1450,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     }, 0);
     // active goal 且线程空闲 → 立即自动续跑（runtime.rs apply_external_goal_set →
     // continue_if_idle → start_turn_if_idle，turn_trigger "goal"；忙时由当前 turn
-    // 收尾链的 consumeQueue 触发，对齐 on_thread_idle）。
+    // 收尾链的 consumeQueue 触发，对齐 on_thread_idle）。轮种：从 blocked 再次
+    // 激活 = 续跑轮（1 条输出 → complete），其余（新目标 / paused / complete /
+    // active 重设）= 首轮（3 条输出 → blocked）。
     if (goal.status === "active") {
+      state.goalRunResume = existing?.status === "blocked";
       this.continueGoalIfIdle(state);
     }
     return { goal };
@@ -1486,13 +1501,23 @@ export class SimApp extends EventEmitter implements AgentApp {
    * turn_trigger "goal"）：输入是隐藏内部上下文（steering.rs
    * continuation_steering_item → ContextualUserFragment，不下发客户端），故本
    * turn 无 userMessage item；手机端看到 turn/started → agentMessage →
-   * turn/completed。可被 steer（含 stop 规则），结束走统一收尾（finishSimTurn
-   * 内做 goal 计量并把 goal 标记 complete）。
+   * turn/completed。可被 steer（含 stop 规则，消息边界排水）。目标模拟脚本：
+   * 首轮激活输出 3 条后把 goal 标记 blocked；从 blocked 再次激活的续跑轮输出
+   * 1 条后标记 complete（轮种由 goalSet 写入 state.goalRunResume）。
    */
   private beginGoalTurn(state: ThreadState): SimTurnRuntime {
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "goal" };
+    const resume = state.goalRunResume;
+    const objective = state.goal?.objective ?? "";
+    const messages = resume
+      ? [`（goal）已重新启动目标：「${objective}」，sim 层续跑本轮；结束后将标记为 complete。`]
+      : [
+          `（goal 1/3）已接收目标：「${objective}」，开始执行。`,
+          "（goal 2/3）执行中……",
+          "（goal 3/3）本轮结束，目标标记为 blocked；再次启动目标将继续（1 条输出后完成）。",
+        ];
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "goal", goalEndStatus: resume ? "complete" : "blocked" };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -1506,14 +1531,21 @@ export class SimApp extends EventEmitter implements AgentApp {
         turn: { ...this.serializeTurn(turn), items: [], itemsView: "notLoaded" as const },
       }, state.thread.id));
       this.schedule(sim, () => {
-        const objective = state.goal?.objective ?? "";
-        const reply = `（goal）已接收目标：「${objective}」，sim 层自动续跑本轮；结束后目标将标记为 complete。`;
-        this.streamAgentMessage(state, sim, reply, () => {
-          this.processSteers(state, sim, () => {
-            this.finishSimTurn(state, "completed");
-            this.consumeQueue(state);
+        const step = (index: number): void => {
+          if (sim.ended) return;
+          this.streamAgentMessage(state, sim, messages[index]!, () => {
+            if (index === messages.length - 1) {
+              this.processSteers(state, sim, () => {
+                this.finishSimTurn(state, "completed");
+                this.consumeQueue(state);
+              });
+              return;
+            }
+            // 消息边界排水 steer（同 runScriptedTurn，stop 规则在此生效）
+            this.processSteers(state, sim, () => step(index + 1));
           });
-        });
+        };
+        step(0);
       }, this.opts.stepDelayMs);
     }, 0);
     return sim;
@@ -1542,7 +1574,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "compact" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "compact", goalEndStatus: null };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -1710,7 +1742,7 @@ export class SimApp extends EventEmitter implements AgentApp {
   private beginShellTurn(state: ThreadState): SimTurnRuntime {
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
