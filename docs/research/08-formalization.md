@@ -46,11 +46,14 @@ cgrcb CLI ──▶ CgrcbDaemon ──▶ registry 延迟工厂 ──▶ AgentM
   lifecycle.json 判定，绝不 fresh-enroll 伪造成功。
 - **三层 reset**：`chatgpt reset`（账号凭证）、`sim reset`（会话库预设态）、实例身份/配对
   互不越界。
-- **跨进程 auth 提交锁**（`src/auth/store.ts`）：`O_EXCL` 锁文件 `auth.lock`（pid+心跳 mtime，
-  陈旧检测不误伤活持有者）。登录写入、reset 删除、刷新提交三类提交共用；网络刷新在锁外、
-  仅提交段持锁并**重读校验**——已删除/已替换（新登录）则丢弃写回，关闭 TOCTOU 与
-  「旧刷新覆盖新登录」窗口。daemon 的 `auth-reset` 先停 autoRefresh → flush 在途刷新 →
-  持锁删除。
+- **跨进程 auth 提交锁**（`src/auth/store.ts`）：`O_EXCL` 锁文件 `auth.lock`（pid + 心跳 mtime）。
+  陈旧回收与释放采用 **rename-steal**：`rename(lock, lock.reclaim-<uniq>)` 原子抢占，成功者
+  重读偷得文件确认确属陈旧（死 pid/心跳过期）才删，实为活锁则还原重试；释放同协议
+  （偷到且 owner 匹配才删），无 read→rm TOCTOU。持有者侧 `guard.assertOwner()` 在提交前
+  重读校验，失主即**中止提交**（刷新丢弃 lock-lost、删除报错可重试），静默破坏变可检测安全失败。
+  登录写入、reset 删除、刷新提交三类共用；网络刷新在锁外、仅提交段持锁并重读校验——已删除/
+  已替换（新登录）/失锁则丢弃写回。daemon 的 `auth-reset` 先停 autoRefresh → flush 在途刷新 →
+  持锁删除（finally 恢复巡检）。
 - **构建/交付**：`tsconfig.build.json` emit（`rewriteRelativeImportExtensions` 处理 `.ts`
   导入说明符；blueprint JSON 随 tsc 复制到 dist）；`bin.cgrcb → dist/cli/main.js`；
   dist 白名单只含交付面，研究工具（wham proxy/probe-cli/mockServer/cli、旧 auth CLI）排除。

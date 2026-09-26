@@ -312,11 +312,14 @@ export class BridgeAuthManager extends EventEmitter {
         this.lockOptions,
       );
       if (!outcome.committed) {
-        // 已删/已替换：丢弃写回，不得复活/覆盖
-        this.emit(
-          "warn",
-          `刷新结果提交被丢弃（凭证${outcome.reason === "deleted" ? "已删除" : "已被替换"}）`,
-        );
+        // 已删/已替换/失锁：丢弃写回，不得复活/覆盖
+        const reason =
+          outcome.reason === "deleted"
+            ? "已删除"
+            : outcome.reason === "lock-lost"
+              ? "提交锁已丢失"
+              : "已被替换";
+        this.emit("warn", `刷新结果提交被丢弃（凭证${reason}）`);
         return false;
       }
       this.needsReLogin = false;

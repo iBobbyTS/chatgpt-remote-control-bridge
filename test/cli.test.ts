@@ -19,6 +19,7 @@ import type { FetchLike } from "../src/auth/oauth.ts";
 import {
   authJsonPath,
   authLockPath,
+  deleteAuthStoreLocked,
   readAuthStore,
   withAuthLock,
   writeAuthStore,
@@ -27,7 +28,7 @@ import {
 } from "../src/auth/store.ts";
 import { CgrcbDaemon } from "../src/daemon/daemon.ts";
 import { requestIpc } from "../src/daemon/ipc.ts";
-import { cgrcbPaths, instanceDirFor } from "../src/daemon/paths.ts";
+import { cgrcbPaths, instanceDirFor, instancePaths } from "../src/daemon/paths.ts";
 import { simStatePath } from "../src/agents/sim/store.ts";
 import {
   buildPlist,
@@ -35,6 +36,7 @@ import {
   commandsForRestart,
   commandsForStart,
   commandsForStop,
+  commandsForUninstall,
   LaunchdManager,
   parseLaunchctlPrint,
   plistEnvironment,
@@ -165,7 +167,8 @@ test("AC1 三组命令可达：install 写 plist、chatgpt status、serving-agen
   const plist = join(home, "Library", "LaunchAgents", "com.cgrcb.bridge.plist");
   assert.equal(existsSync(plist), true, "plist 应写入 CGRCB_HOME 内");
   const kinds = commands.map((c) => c[0]);
-  assert.ok(kinds.indexOf("bootout") >= 0 && kinds.indexOf("bootout") < kinds.indexOf("bootstrap"));
+  assert.ok(kinds.includes("bootstrap"), "install 应 bootstrap");
+  assert.equal(kinds.includes("bootout"), false, "旧服务未加载时不应 bootout");
 
   const cStatus = capture();
   assert.equal(await runCli(["chatgpt", "status"], { ...cStatus.sink, env }), 0);
@@ -173,11 +176,23 @@ test("AC1 三组命令可达：install 写 plist、chatgpt status、serving-agen
 
   const cInit = capture();
   assert.equal(await runCli(["serving-agent", "sim", "init"], { ...cInit.sink, env }), 0);
-  const state = JSON.parse(await readFile(simStatePath(instanceDirFor(home, "sim")), "utf8"));
+  const instDir = instanceDirFor(home, "sim");
+  const state = JSON.parse(await readFile(simStatePath(instDir), "utf8"));
   assert.ok(Array.isArray(state) && state.length > 0, "离线 init 应播种 state.json");
+  // NIT ②：离线首建实例目录同 daemon 语义写 lifecycle.json {everEnrolled:false}
+  const lc = JSON.parse(await readFile(instancePaths(instDir).lifecycle, "utf8"));
+  assert.equal(lc.everEnrolled, false);
+  // 已存在目录再 init 不重写 lifecycle（历史语义不补写）
+  await writeFile(instancePaths(instDir).lifecycle, JSON.stringify({ everEnrolled: true }));
+  const cInit2 = capture();
+  assert.equal(await runCli(["serving-agent", "sim", "init"], { ...cInit2.sink, env }), 0);
+  assert.equal(JSON.parse(await readFile(instancePaths(instDir).lifecycle, "utf8")).everEnrolled, true);
 
   const cOffline = capture();
-  assert.equal(await runCli(["serving-agent", "sim", "status"], { ...cOffline.sink, env }), 0);
+  assert.equal(
+    await runCli(["serving-agent", "sim", "status"], { ...cOffline.sink, env, launchctlRunner: runner }),
+    0,
+  );
   assert.match(cOffline.out.join("\n"), /daemon 未运行/);
 
   const cDaemonHelp = capture();
@@ -250,10 +265,15 @@ test("AC2 launchctl 命令序列：install 幂等刷新、stop→start 必重新
   const target = "gui/501/com.cgrcb.bridge";
   const plist = join("/tmp/cgrcb-test", "Library", "LaunchAgents", "com.cgrcb.bridge.plist");
 
-  const install = commandsForInstall(ctx);
-  assert.equal(install[0]!.args[0], "bootout");
-  assert.equal(install[0]!.ignoreFailure, true);
-  assert.deepEqual(install[1]!.args, ["bootstrap", "gui/501", plist]);
+  // 旧服务未加载：只 bootstrap（不无谓 bootout）
+  const installFresh = commandsForInstall(ctx, false);
+  assert.deepEqual(installFresh.map((s) => s.args[0]), ["bootstrap"]);
+  assert.deepEqual(installFresh[0]!.args, ["bootstrap", "gui/501", plist]);
+  assert.equal(installFresh[0]!.retries, 5);
+  // 旧服务已加载：bootout 后 bootstrap（真实失败不再被忽略）
+  const installRefresh = commandsForInstall(ctx, true);
+  assert.deepEqual(installRefresh.map((s) => s.args[0]), ["bootout", "bootstrap"]);
+  assert.equal(installRefresh[0]!.ignoreFailure, undefined);
 
   const startUnloaded = commandsForStart(ctx, false);
   assert.deepEqual(startUnloaded.map((s) => s.args[0]), ["bootstrap", "kickstart"]);
@@ -264,14 +284,50 @@ test("AC2 launchctl 命令序列：install 幂等刷新、stop→start 必重新
   assert.deepEqual(startLoaded.map((s) => s.args[0]), ["kickstart"]);
 
   // stop 用 bootout 移除服务定义 → stop 后 start 必须 bootstrap（不能只 kickstart）
-  const stop = commandsForStop(ctx);
+  const stop = commandsForStop(ctx, true);
   assert.deepEqual(stop.map((s) => s.args[0]), ["bootout"]);
+  assert.deepEqual(commandsForStop(ctx, false), [], "未加载 = 幂等成功（空序列）");
   const afterStopStart = commandsForStart(ctx, false);
   assert.equal(afterStopStart.some((s) => s.args[0] === "bootstrap"), true);
   assert.equal(afterStopStart.at(-1)!.args[0], "kickstart");
 
-  const restart = commandsForRestart(ctx);
+  const restart = commandsForRestart(ctx, true);
   assert.deepEqual(restart.map((s) => s.args[0]), ["bootout", "bootstrap", "kickstart"]);
+  assert.deepEqual(commandsForUninstall(ctx, false), [], "未加载卸载无命令");
+});
+
+test("AC2 launchd 执行：stop/uninstall bootout 真实失败报错、uninstall 不删 plist", async () => {
+  const home = await tempDir("d2f");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const ctx: LaunchdContext = { home, env, nodePath: "/usr/bin/node", daemonEntry: "/app/main.js", uid: 501 };
+  const plistFile = join(home, "Library", "LaunchAgents", "com.cgrcb.bridge.plist");
+  await mkdir(join(home, "Library", "LaunchAgents"), { recursive: true });
+  await writeFile(plistFile, "old");
+
+  // 已加载 + bootout 失败（非"未加载"）→ stop 报错
+  const failing: LaunchctlRunner = async (args) => {
+    if (args[0] === "print") return { code: 0, stdout: "state = running", stderr: "" };
+    if (args[0] === "bootout") return { code: 5, stdout: "", stderr: "Input/output error" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const manager = new LaunchdManager(ctx, failing, () => {}, { unloadTimeoutMs: 200 });
+  await assert.rejects(() => manager.stop(), /bootout 失败/);
+  // uninstall 在 stop 失败时不删 plist
+  await assert.rejects(() => manager.uninstall(), /bootout 失败/);
+  assert.equal(existsSync(plistFile), true, "stop 失败时不得删除 plist");
+});
+
+test("AC2 launchd 执行：bootout 成功但卸载超时 → 报错", async () => {
+  const home = await tempDir("d2t");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const ctx: LaunchdContext = { home, env, nodePath: "/usr/bin/node", daemonEntry: "/app/main.js", uid: 501 };
+  const runner: LaunchctlRunner = async (args) => {
+    if (args[0] === "print") return { code: 0, stdout: "state = running", stderr: "" }; // 永远"已加载"
+    if (args[0] === "bootout") return { code: 0, stdout: "", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const manager = new LaunchdManager(ctx, runner, () => {}, { unloadTimeoutMs: 150 });
+  await assert.rejects(() => manager.stop(), /仍未卸载/);
 });
 
 test("AC2 launchd 执行：restart 中 bootout 后 bootstrap 瞬时失败自动重试", async () => {
@@ -317,6 +373,13 @@ test("AC2 parseLaunchctlPrint：解析 pid/state/last exit code", () => {
 }`;
   assert.deepEqual(parseLaunchctlPrint(text), { pid: 4242, state: "running", lastExitCode: 0 });
   assert.deepEqual(parseLaunchctlPrint("not loaded"), { pid: null, state: null, lastExitCode: null });
+  // NIT ①：实测格式兼容 —— (never exited) → null；N (signal) → 数值
+  assert.deepEqual(parseLaunchctlPrint("last exit code = (never exited)"), {
+    pid: null,
+    state: null,
+    lastExitCode: null,
+  });
+  assert.equal(parseLaunchctlPrint("last exit code = -15 (signal)").lastExitCode, -15);
 });
 
 // -------------------------------------------------------------------- AC3
@@ -324,19 +387,56 @@ test("AC2 parseLaunchctlPrint：解析 pid/state/last exit code", () => {
 test("AC3 IPC 三态降级：在线/未运行(ENOENT)/未登录", async () => {
   const home = await tempDir("d3");
   const env = { ...process.env, CGRCB_HOME: home };
+  // NIT ③：status 一律注入假 launchctl 执行器，绝不真调系统 launchctl
+  const noLaunchd: LaunchctlRunner = async (args) =>
+    args[0] === "print"
+      ? { code: 3, stdout: "", stderr: "not found" }
+      : { code: 0, stdout: "", stderr: "" };
 
-  // 在线（注入）：status 成功
+  // 在线（注入）：status 成功；--json 形态含 auth
   const cOnline = capture();
   const onlineIpc = async () => ({ ok: true as const, data: { daemon: { running: true }, agents: {} } });
-  assert.equal(await runCli(["status"], { ...cOnline.sink, env, ipc: onlineIpc }), 0);
+  const cOnlineJson = capture();
+  assert.equal(
+    await runCli(["status", "--json"], { ...cOnlineJson.sink, env, ipc: onlineIpc, launchctlRunner: noLaunchd }),
+    0,
+  );
+  const onlineJson = JSON.parse(cOnlineJson.out.join("\n"));
+  assert.ok(onlineJson.auth, "在线 --json 应含 auth");
+  assert.equal(onlineJson.daemon.running, true);
+  assert.equal(
+    await runCli(["status"], { ...cOnline.sink, env, ipc: onlineIpc, launchctlRunner: noLaunchd }),
+    0,
+  );
   assert.match(cOnline.out.join("\n"), /daemon：运行中/);
+
+  // IPC 明确报错（INTERNAL）→ 不降级，退出 1 且保留信息
+  const cErr = capture();
+  const internalIpc = async () => ({ ok: false as const, error: "INTERNAL" as const, message: "boom-internal" });
+  assert.equal(
+    await runCli(["status"], { ...cErr.sink, env, ipc: internalIpc, launchctlRunner: noLaunchd }),
+    1,
+  );
+  assert.match(cErr.err.join("\n"), /boom-internal/);
+  assert.equal(cErr.out.length, 0, "错误分支不得输出降级静态信息");
 
   // 未运行（注入 ENOENT）：status 降级、enable 报错、init 离线
   const cDown = capture();
   const enoentIpc = async () => {
     throw Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
   };
-  assert.equal(await runCli(["status"], { ...cDown.sink, env, ipc: enoentIpc }), 0);
+  const cDownJson = capture();
+  assert.equal(
+    await runCli(["status", "--json"], { ...cDownJson.sink, env, ipc: enoentIpc, launchctlRunner: noLaunchd }),
+    0,
+  );
+  const downJson = JSON.parse(cDownJson.out.join("\n"));
+  assert.ok(downJson.auth, "离线 --json 应含 auth（与在线形态统一）");
+  assert.equal(downJson.daemon.running, false);
+  assert.equal(
+    await runCli(["status"], { ...cDown.sink, env, ipc: enoentIpc, launchctlRunner: noLaunchd }),
+    0,
+  );
   assert.match(cDown.out.join("\n"), /daemon：未运行/);
   assert.match(cDown.out.join("\n"), /静态信息/);
 
@@ -367,10 +467,17 @@ test("AC3 IPC 三态降级：在线/未运行(ENOENT)/未登录", async () => {
 test("AC3 真实 IPC：daemon 在线 status 汇总；enable 未登录返回 NOT_LOGGED_IN", async () => {
   const home = await tempDir("d3r");
   const env = { ...process.env, CGRCB_HOME: home };
+  const noLaunchd: LaunchctlRunner = async (args) =>
+    args[0] === "print"
+      ? { code: 3, stdout: "", stderr: "not found" }
+      : { code: 0, stdout: "", stderr: "" };
   const daemon = await startDaemon(home);
   try {
     const cStatus = capture();
-    assert.equal(await runCli(["status"], { ...cStatus.sink, env }), 0);
+    assert.equal(
+      await runCli(["status"], { ...cStatus.sink, env, launchctlRunner: noLaunchd }),
+      0,
+    );
     assert.match(cStatus.out.join("\n"), /daemon：运行中/);
 
     const cEnable = capture();
@@ -584,6 +691,121 @@ test("AC7 锁陈旧检测：活持有者心跳新鲜不误伤；死 pid 锁可�
   let ran = false;
   await withAuthLock(home, async () => { ran = true; }, { timeoutMs: 2000, staleMs: 50 });
   assert.equal(ran, true, "死 pid 陈旧锁应被回收");
+});
+
+test("AC7 锁 rename-steal：双回收者并发不双持、无残留隔离文件", async () => {
+  const home = await tempDir("d7s");
+  await writeFile(
+    authLockPath(home),
+    JSON.stringify({ pid: await deadProcessPid(), startedAt: Date.now(), owner: "dead" }),
+  );
+  let active = 0;
+  let maxActive = 0;
+  const run = (): Promise<void> =>
+    withAuthLock(
+      home,
+      async () => {
+        active += 1;
+        maxActive = Math.max(maxActive, active);
+        await sleep(80);
+        active -= 1;
+      },
+      {
+        staleMs: 50,
+        heartbeatMs: 20,
+        timeoutMs: 5000,
+        // 注入交错：两回收者同时到达抢占点，rename 只有一个能成功
+        hooks: { beforeReclaim: async () => { await sleep(60); } },
+      },
+    );
+  await Promise.all([run(), run()]);
+  assert.equal(maxActive, 1, "同一时刻仅一个持有者（rename-steal 不双持）");
+  const leftovers = (await readdir(home)).filter(
+    (f) => f.includes(".reclaim-") || f.includes(".release-"),
+  );
+  assert.deepEqual(leftovers, [], "不得残留隔离（quarantine）文件");
+  assert.equal(existsSync(authLockPath(home)), false, "结束后锁应已释放");
+});
+
+test("AC7 持有者失锁：提交前 assertOwner 失败 → 刷新丢弃、删除中止", async () => {
+  const home = await tempDir("d7o");
+  const authA = authWith(tokenJwt("A"));
+  await writeAuthStore(home, authA);
+
+  // 刷新：取锁后被并发回收（hook 删锁）→ 提交失主 → lock-lost（丢弃写回）
+  const manager = new BridgeAuthManager({
+    codexHome: home,
+    fetchImpl: okRefreshFetch(),
+    lockOptions: {
+      hooks: {
+        onLockAcquired: async () => {
+          await rm(authLockPath(home), { force: true });
+        },
+      },
+    },
+  });
+  assert.equal(await manager.refreshNow(), false, "失锁刷新应丢弃提交");
+  assert.equal(
+    (await readAuthStore(home))!.tokens!.access_token,
+    authA.tokens!.access_token,
+    "失锁刷新不得写入",
+  );
+
+  // 删除：失主 → 抛错且凭证保留
+  await assert.rejects(
+    deleteAuthStoreLocked(home, {
+      hooks: {
+        onLockAcquired: async () => {
+          await rm(authLockPath(home), { force: true });
+        },
+      },
+    }),
+    /锁已丢失/,
+  );
+  assert.ok(await readAuthStore(home), "失锁删除不得删除凭证");
+});
+
+test("B-4 auth-reset 失败仍恢复 autoRefresh 巡检", async () => {
+  const home = await tempDir("d7r");
+  const paths = cgrcbPaths(home);
+  await mkdir(paths.codexHome, { recursive: true });
+  await writeAuthStore(paths.codexHome, authWith(tokenJwt("X")));
+
+  let starts = 0;
+  let stops = 0;
+  class FailingLogoutAuth extends BridgeAuthManager {
+    override stopAutoRefresh(): void {
+      stops += 1;
+      super.stopAutoRefresh();
+    }
+    override startAutoRefresh(): void {
+      starts += 1;
+      super.startAutoRefresh();
+    }
+    override async logout(): Promise<boolean> {
+      throw new Error("logout boom");
+    }
+  }
+  const authManager = new FailingLogoutAuth({
+    codexHome: paths.codexHome,
+    autoRefreshIntervalMs: 60_000,
+  });
+  const daemon = new CgrcbDaemon({
+    home,
+    log: () => {},
+    authManager,
+    registerAgents: () => Promise.resolve(),
+  });
+  await daemon.start(); // start → startAutoRefresh（starts=1）
+  try {
+    const res = await requestIpc(paths.socketPath, "auth-reset");
+    assert.equal(res.ok, false, JSON.stringify(res));
+    assert.match((res as { message?: string }).message ?? "", /logout boom/);
+    assert.ok(stops >= 1, "应停一次巡检");
+    assert.ok(starts >= 2, "logout 抛错后 finally 仍应恢复巡检");
+  } finally {
+    await daemon.shutdown();
+  }
 });
 
 function okRefreshFetch(): FetchLike {

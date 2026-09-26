@@ -10,6 +10,7 @@
 import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { instancePaths } from "./paths.ts";
 
 export const CONFIG_VERSION = 1;
 
@@ -156,4 +157,21 @@ export async function writeLifecycle(
   const tmp = tempPath(lifecyclePath);
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, lifecyclePath);
+}
+
+/**
+ * 实例目录首次创建时写 lifecycle.json（`{everEnrolled:false}`）；已存在目录不补写。
+ * daemon 启动路径与 CLI 离线 init/reset 共用同一语义（NIT ②，勿复制逻辑）。
+ * 返回是否本次创建了目录。
+ */
+export async function ensureInstanceDir(instanceDir: string): Promise<boolean> {
+  await mkdir(dirname(instanceDir), { recursive: true }); // 离线 CLI 无父目录（daemon 已建）
+  try {
+    await mkdir(instanceDir);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw err;
+  }
+  await writeLifecycle(instancePaths(instanceDir).lifecycle, { everEnrolled: false });
+  return true;
 }

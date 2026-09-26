@@ -18,7 +18,7 @@ import { readFile, stat } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { simInit, simReset } from "../agents/sim/store.ts";
 import { BridgeAuthManager, type AuthStatus } from "../auth/manager.ts";
-import { readLifecycle, readConfig } from "../daemon/config.ts";
+import { ensureInstanceDir, readLifecycle, readConfig } from "../daemon/config.ts";
 import { CgrcbDaemon } from "../daemon/daemon.ts";
 import {
   DaemonAlreadyRunningError,
@@ -301,10 +301,18 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
     deps.authManager ?? new BridgeAuthManager({ codexHome: paths.codexHome });
   const auth = await authManager.getStatus();
 
+  if (ipc.kind === "error") {
+    // B-3：IPC 明确报错（如 INTERNAL）不降级，报错退出并保留信息
+    deps.err?.(`daemon 状态查询失败（${ipc.code}）：${ipc.message}`);
+    return EXIT_ERROR;
+  }
+
   if (ipc.kind === "ok") {
+    // 在线/离线 --json 形态统一：均含 launchd/daemon/auth
     const payload = {
       launchd,
       daemon: { running: true, source: "ipc" as const, data: ipc.data },
+      auth,
     };
     if (json) {
       out(JSON.stringify(payload, null, 2));
@@ -317,7 +325,7 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
     return EXIT_OK;
   }
 
-  // 降级：daemon 未运行 → 显示配置/登录静态信息并标注
+  // 降级（仅连接不存在时）：daemon 未运行 → 显示配置/登录静态信息并标注
   const agents: Record<string, OfflineAgentInfo> = {};
   for (const agent of SERVING_AGENTS) {
     agents[agent] = await offlineAgentInfo(agent, paths);
@@ -326,10 +334,8 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
     launchd,
     daemon: {
       running: false,
-      note:
-        ipc.kind === "not-running"
-          ? "daemon 未运行（socket 不存在/无监听）：以下为配置与登录静态信息"
-          : `daemon 状态查询失败：${ipc.message}`,
+      source: "offline" as const,
+      note: "daemon 未运行（socket 不存在/无监听）：以下为配置与登录静态信息",
     },
     auth,
     agents,
@@ -338,7 +344,7 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
     out(JSON.stringify(degraded, null, 2));
   } else {
     out(`launchd：${launchd.loaded ? `已加载（state=${launchd.state ?? "?"}, pid=${launchd.pid ?? "-"})` : "未加载"}`);
-    out(`daemon：未运行（${ipc.kind === "not-running" ? "socket 不存在" : ipc.message}）—— 静态信息如下`);
+    out(`daemon：未运行（socket 不存在）—— 静态信息如下`);
     out(`登录：${auth.loggedIn ? `${auth.email ?? auth.accountId ?? "已登录"}（plan=${auth.planType ?? "?"}）` : "未登录"}`);
     for (const [id, info] of Object.entries(agents)) {
       out(`serving-agent ${id}：enabled=${info.enabled} 实例目录=${info.instanceDirExists ? "存在" : "不存在"}`);
@@ -511,6 +517,8 @@ async function cmdServingAgent(
   if (action === "init" || action === "reset") {
     const dir = instanceDirFor(paths.root, agent);
     if (agent === "sim") {
+      // NIT ②：离线首建实例目录同 daemon 语义写 lifecycle.json（共享 helper）
+      await ensureInstanceDir(dir);
       if (action === "init") await simInit(dir);
       else await simReset(dir);
       out(`${agent} ${action} 完成（离线，daemon 未运行）`);

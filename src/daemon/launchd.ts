@@ -133,17 +133,19 @@ export function printStep(ctx: LaunchdContext): LaunchctlStep {
   return { args: ["print", serviceTarget(ctx)] };
 }
 
-/** install：bootout 旧（忽略失败）→ bootstrap（幂等刷新）。 */
-export function commandsForInstall(ctx: LaunchdContext): LaunchctlStep[] {
-  return [
-    { args: ["bootout", serviceTarget(ctx)], ignoreFailure: true },
-    { args: ["bootstrap", `gui/${ctx.uid}`, plistPath(ctx.home, ctx.env)], retries: 5 },
-  ];
+/** install：旧服务已加载则 bootout（真实失败报错），随后 bootstrap（幂等刷新，带重试）。 */
+export function commandsForInstall(ctx: LaunchdContext, loadedOld: boolean): LaunchctlStep[] {
+  const steps: LaunchctlStep[] = [];
+  if (loadedOld) {
+    steps.push({ args: ["bootout", serviceTarget(ctx)] });
+  }
+  steps.push({ args: ["bootstrap", `gui/${ctx.uid}`, plistPath(ctx.home, ctx.env)], retries: 5 });
+  return steps;
 }
 
-/** uninstall：bootout（忽略失败）；plist 删除由调用方执行。 */
-export function commandsForUninstall(ctx: LaunchdContext): LaunchctlStep[] {
-  return [{ args: ["bootout", serviceTarget(ctx)], ignoreFailure: true }];
+/** uninstall：已加载则 bootout（真实失败报错）；plist 删除由调用方在成功后执行。 */
+export function commandsForUninstall(ctx: LaunchdContext, loaded: boolean): LaunchctlStep[] {
+  return loaded ? [{ args: ["bootout", serviceTarget(ctx)] }] : [];
 }
 
 /**
@@ -159,13 +161,14 @@ export function commandsForStart(ctx: LaunchdContext, loaded: boolean): Launchct
   return steps;
 }
 
-export function commandsForStop(ctx: LaunchdContext): LaunchctlStep[] {
-  return [{ args: ["bootout", serviceTarget(ctx)], ignoreFailure: true }];
+/** stop：已加载则 bootout；未加载 = 幂等成功（空序列）。 */
+export function commandsForStop(ctx: LaunchdContext, loaded: boolean): LaunchctlStep[] {
+  return loaded ? [{ args: ["bootout", serviceTarget(ctx)] }] : [];
 }
 
 /** restart：stop → start（stop 后必未加载，故 start 走 bootstrap+kickstart）。 */
-export function commandsForRestart(ctx: LaunchdContext): LaunchctlStep[] {
-  return [...commandsForStop(ctx), ...commandsForStart(ctx, false)];
+export function commandsForRestart(ctx: LaunchdContext, loaded: boolean): LaunchctlStep[] {
+  return [...commandsForStop(ctx, loaded), ...commandsForStart(ctx, false)];
 }
 
 // ------------------------------------------------------------- launchctl print
@@ -181,7 +184,8 @@ export interface LaunchctlStatus {
 export function parseLaunchctlPrint(text: string): Omit<LaunchctlStatus, "loaded"> {
   const pidMatch = text.match(/^\s*pid = (\d+)\s*$/m);
   const stateMatch = text.match(/^\s*state = (\S+)\s*$/m);
-  const exitMatch = text.match(/^\s*last exit code = (-?\d+)\s*$/m);
+  // 兼容 `last exit code = 0` / `= -15 (signal)`；`= (never exited)` 无数字 → null
+  const exitMatch = text.match(/^\s*last exit code = (-?\d+)(?:\s*\([^)]*\))?\s*$/m);
   return {
     pid: pidMatch ? Number(pidMatch[1]) : null,
     state: stateMatch ? stateMatch[1] : null,
@@ -213,11 +217,16 @@ export const defaultLaunchctlRunner: LaunchctlRunner = (args) =>
 
 /** launchd 管理器：纯函数命令序列 + 注入执行器；测试用假执行器，不碰系统 launchctl。 */
 export class LaunchdManager {
+  private readonly unloadTimeoutMs: number;
+
   constructor(
     private readonly ctx: LaunchdContext,
     private readonly run: LaunchctlRunner = defaultLaunchctlRunner,
     private readonly log: (line: string) => void = () => {},
-  ) {}
+    opts: { unloadTimeoutMs?: number } = {},
+  ) {
+    this.unloadTimeoutMs = opts.unloadTimeoutMs ?? 3000;
+  }
 
   get plistPath(): string {
     return plistPath(this.ctx.home, this.ctx.env);
@@ -242,21 +251,38 @@ export class LaunchdManager {
       if (result.code !== 0) {
         this.log(`launchctl ${step.args.join(" ")} 忽略失败（exit ${result.code}）`);
       }
-      // bootout 异步移除服务定义：等待其真正卸载，避免紧随的 bootstrap 撞 launchd 竞态
-      if (step.args[0] === "bootout") {
-        await this.waitUnloaded();
-      }
     }
   }
 
-  /** 轮询直到服务未加载（bootout 后收敛；超时也继续，由后续 bootstrap 重试兜底）。 */
-  private async waitUnloaded(timeoutMs = 3000): Promise<void> {
+  /** 轮询直到服务未加载；超时返回 false。 */
+  private async waitUnloaded(timeoutMs = this.unloadTimeoutMs): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
+    for (;;) {
       const result = await this.run(printStep(this.ctx).args);
-      if (result.code !== 0) return;
+      if (result.code !== 0) return true;
+      if (Date.now() >= deadline) return false;
       await delay(50);
     }
+  }
+
+  /**
+   * 若服务已加载则 bootout（B-2：仅"本就未加载"幂等成功，真实失败/卸载超时报错）。
+   * bootout 失败时再查一次加载态：期间已被卸载（竞态）也算幂等成功。
+   * 返回是否实际执行了 bootout。
+   */
+  private async stopServiceIfLoaded(): Promise<boolean> {
+    if (!(await this.isLoaded())) return false;
+    const result = await this.run(["bootout", serviceTarget(this.ctx)]);
+    if (result.code !== 0) {
+      if (!(await this.isLoaded())) return true; // 竞态：期间已卸载
+      throw new Error(
+        `launchctl bootout 失败（exit ${result.code}）：${result.stderr.trim() || "(no stderr)"}`,
+      );
+    }
+    if (!(await this.waitUnloaded())) {
+      throw new Error(`launchctl bootout 后服务仍未卸载（等待 ${this.unloadTimeoutMs}ms 超时）`);
+    }
+    return true;
   }
 
   async isLoaded(): Promise<boolean> {
@@ -272,16 +298,19 @@ export class LaunchdManager {
     return { loaded: true, ...parseLaunchctlPrint(result.stdout) };
   }
 
-  /** install：写 plist（幂等刷新）+ 命令序列。 */
+  /** install：写 plist（幂等刷新）→ 旧服务已加载则 bootout（真实失败报错）→ bootstrap。 */
   async install(): Promise<void> {
     await mkdir(dirname(this.plistPath), { recursive: true });
     await mkdir(join(this.ctx.home, "logs"), { recursive: true });
     await writeFile(this.plistPath, buildPlist(this.ctx), { mode: 0o644 });
-    await this.execSteps(commandsForInstall(this.ctx));
+    // 旧服务已加载则 bootout 并等待卸载（真实失败报错）；bootstrap 另带重试兜底瞬时竞态
+    await this.stopServiceIfLoaded();
+    await this.execSteps(commandsForInstall(this.ctx, false));
   }
 
+  /** uninstall：先 stop（失败则**不删 plist**），成功后才删除 plist。 */
   async uninstall(): Promise<void> {
-    await this.execSteps(commandsForUninstall(this.ctx));
+    await this.stop();
     await rm(this.plistPath, { force: true });
   }
 
@@ -291,11 +320,12 @@ export class LaunchdManager {
   }
 
   async stop(): Promise<void> {
-    await this.execSteps(commandsForStop(this.ctx));
+    await this.stopServiceIfLoaded();
   }
 
   async restart(): Promise<void> {
-    await this.execSteps(commandsForRestart(this.ctx));
+    await this.stop();
+    await this.start();
   }
 }
 

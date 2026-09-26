@@ -18,10 +18,13 @@
 ```bash
 git clone <repo> && cd chatgpt-remote-control-bridge
 npm install
-npm run build            # 产出 dist/（仅交付面），并给 dist/cli/main.js 加可执行位
+npm run build            # 必须先构建：npm 不从源码自动产出 dist
 npm install -g .         # 安装 cgrcb 命令（private:true 不阻止本地路径安装）
 cgrcb --help
 ```
+
+> 全局安装前**必须先 `npm run build`**：包只分发 `dist/`（见 `files`），
+> `npm install -g .` 不会替你编译 TypeScript。
 
 也可以不全局安装，直接用 `node dist/cli/main.js <命令>`。
 

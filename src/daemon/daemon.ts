@@ -34,7 +34,7 @@ import { BridgeAuthManager } from "../auth/manager.ts";
 import { WhamClient } from "../wham/client.ts";
 import type { RemoteControlClient } from "../wham/protocol.ts";
 import { WhamTunnel } from "../wham/tunnel.ts";
-import { readLifecycle, readConfig, writeConfig, writeLifecycle, withAgentEnabled, type AgentConfig, type CgrcbConfig } from "./config.ts";
+import { ensureInstanceDir, readLifecycle, readConfig, writeConfig, writeLifecycle, withAgentEnabled, type AgentConfig, type CgrcbConfig } from "./config.ts";
 import {
   PairingManager,
   readEnrollmentFile,
@@ -244,7 +244,7 @@ export class CgrcbDaemon {
     const module = getAgent(id);
     if (module?.onEnable) {
       const ctx = this.instanceContext(id);
-      await this.ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
+      await ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
       await module.onEnable(ctx);
     }
     await this.startInstance(id);
@@ -493,7 +493,7 @@ export class CgrcbDaemon {
       throw new Error(`agent 模块未注册: ${inst.id}`);
     }
     const dir = instanceDirFor(this.paths.root, inst.id);
-    await this.ensureInstanceDir(dir); // 首次创建 → 写 lifecycle.json
+    await ensureInstanceDir(dir); // 首次创建 → 写 lifecycle.json
 
     const ctx = this.instanceContext(inst.id);
     const app = module.createInstance(ctx); // 可能同步抛错
@@ -661,16 +661,7 @@ export class CgrcbDaemon {
     this.logLine(`[${inst.id}] lifecycle.everEnrolled=true`);
   }
 
-  /** 实例目录首次创建时写 lifecycle.json；已存在目录不补写。 */
-  private async ensureInstanceDir(dir: string): Promise<void> {
-    try {
-      await mkdir(dir); // 父目录 instances/ 已在 start 建立；已存在 → EEXIST
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") return;
-      throw err;
-    }
-    await writeLifecycle(instancePaths(dir).lifecycle, { everEnrolled: false });
-  }
+  /** 实例目录首次创建时写 lifecycle.json；已存在目录不补写（helper 见 config.ts）。 */
 
   // ---------------------------------------------------- S04 disable 吊销/恢复
 
@@ -877,7 +868,7 @@ export class CgrcbDaemon {
     // 未声明钩子的模块跳过（通用，不硬编码 sim）。
     const module = getAgent(id)!;
     const ctx = this.instanceContext(id);
-    await this.ensureInstanceDir(ctx.instanceDir);
+    await ensureInstanceDir(ctx.instanceDir);
     await module.onEnable?.(ctx);
     // 二波2：用户显式 enable 允许清除"无身份中止"标记并重新 enroll（合规、可能铸新身份），
     // 记 identityWarnings WARN 供 status 可见。
@@ -1068,7 +1059,7 @@ export class CgrcbDaemon {
       return { ok: false, error: "INTERNAL", message: "not implemented" };
     }
     const ctx = this.instanceContext(id);
-    await this.ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
+    await ensureInstanceDir(ctx.instanceDir); // 首建写 lifecycle.json（与 enable 一致）
     const app = this.instances.get(id)?.app ?? null;
     if (mode === "init") {
       await module.onInit!(ctx, app);
@@ -1090,13 +1081,17 @@ export class CgrcbDaemon {
       return { ok: false, error: "INTERNAL", message: "daemon 未就绪" };
     }
     auth.stopAutoRefresh();
-    await auth.waitForInflightRefresh();
-    const removed = await auth.logout();
-    if (this.running && !this.stopping) {
-      auth.startAutoRefresh();
+    // B-4：无论 flush/logout 是否抛错，只要 daemon 仍在运行就恢复巡检（finally）
+    try {
+      await auth.waitForInflightRefresh();
+      const removed = await auth.logout();
+      this.logLine(`auth-reset：凭证${removed ? "已删除" : "本就未登录"}（下游实例不受影响）`);
+      return { ok: true, data: { removed, auth: await auth.getStatus() } };
+    } finally {
+      if (this.running && !this.stopping) {
+        auth.startAutoRefresh();
+      }
     }
-    this.logLine(`auth-reset：凭证${removed ? "已删除" : "本就未登录"}（下游实例不受影响）`);
-    return { ok: true, data: { removed, auth: await auth.getStatus() } };
   }
 
   /** 同 agent 的 enable/disable 经 per-agent 队列串行化，避免半状态。 */
