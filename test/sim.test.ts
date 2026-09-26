@@ -1499,6 +1499,82 @@ test("S03-A resume 快照：响应先于 goal 通知上线（updated / cleared�
   }
 });
 
+test("F3 回归：goal set/clear 通知晚于响应上线", async () => {
+  const loop = await startLoop({ stepDelayMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/goal-order" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    loop.mock.receivedEnvelopeLog.length = 0;
+    const set = (await loop.mock.rpc("thread/goal/set", { threadId, objective: "次序" })) as { id: number };
+    await waitFor(
+      () =>
+        loop.mock.receivedEnvelopeLog.some(
+          (e) => e.kind === "notification" && e.method === "thread/goal/updated",
+        ),
+      2000,
+      "thread/goal/updated 未到",
+    );
+    const setLog = loop.mock.receivedEnvelopeLog;
+    const setResp = setLog.findIndex((e) => e.kind === "response" && String(e.id) === String(set.id));
+    const updatedIdx = setLog.findIndex((e) => e.kind === "notification" && e.method === "thread/goal/updated");
+    assert.ok(setResp >= 0, "set 响应应在时序日志中");
+    assert.ok(updatedIdx > setResp, "goal/updated 必须晚于 set 响应上线");
+
+    loop.mock.receivedEnvelopeLog.length = 0;
+    const clear = (await loop.mock.rpc("thread/goal/clear", { threadId })) as { id: number };
+    await waitFor(
+      () =>
+        loop.mock.receivedEnvelopeLog.some(
+          (e) => e.kind === "notification" && e.method === "thread/goal/cleared",
+        ),
+      2000,
+      "thread/goal/cleared 未到",
+    );
+    const clearLog = loop.mock.receivedEnvelopeLog;
+    const clearResp = clearLog.findIndex((e) => e.kind === "response" && String(e.id) === String(clear.id));
+    const clearedIdx = clearLog.findIndex((e) => e.kind === "notification" && e.method === "thread/goal/cleared");
+    assert.ok(clearResp >= 0, "clear 响应应在时序日志中");
+    assert.ok(clearedIdx > clearResp, "goal/cleared 必须晚于 clear 响应上线");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("F3 回归：goalSet 入参校验（非法 status / 非数字 tokenBudget）", async () => {
+  const loop = await startLoop({ stepDelayMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/goal-validate" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    const badStatus = (await loop.mock.rpc("thread/goal/set", { threadId, status: "bogus" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(badStatus.error?.code, -32600);
+    assert.equal(badStatus.error?.message, "invalid goal status: bogus");
+
+    const badBudget = (await loop.mock.rpc("thread/goal/set", { threadId, tokenBudget: "abc" })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(badBudget.error?.code, -32600);
+    assert.equal(badBudget.error?.message, "invalid tokenBudget");
+
+    // 失败请求不得写入 goal
+    const get = (await loop.mock.rpc("thread/goal/get", { threadId })) as { result: { goal: unknown } };
+    assert.equal(get.result.goal, null, "非法入参不得留下 goal");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("S03-B compact：contextCompaction 条目 + 下一条回复标记（用后即清）", async () => {
   const loop = await startLoop({ compactWaitMs: 30, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
   try {
@@ -1996,6 +2072,225 @@ test("S03-E side：shellCommand 命令条目 + backgroundTerminals list/terminat
       result: { data: unknown[] };
     };
     assert.equal(list2.result.data.length, 0, "clean 后列表应为空");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("F1 回归：独立 shell turn 期间 turn/start 不吞消息（steer 语义排水）", async () => {
+  const loop = await startLoop({ shellWaitMs: 250, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/shell-f1-start" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    // 无活动 turn → thread/shellCommand 创建独立轻量 shell turn
+    await loop.mock.rpc("thread/shellCommand", { threadId, command: "echo hi" });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/started")),
+      2000,
+      "shell turn/started 未到",
+    );
+    const shellTurnId = findNotif(loop, "turn/started")!.params.turn.id as string;
+
+    // shell 进行中发消息：活动期 turn/start 转 steer，必须返回同一 turn id，不得丢失
+    const ts = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "重要消息" }],
+    })) as { result: { turn: { id: string } } };
+    assert.equal(ts.result.turn.id, shellTurnId, "活动 shell turn 期间 turn/start 应返回同一 turn");
+    const q0 = (await loop.mock.rpc("thread/queue/list", { threadId })) as { result: { data: unknown[] } };
+    assert.equal(q0.result.data.length, 0, "steer 路径不得入队");
+
+    // shell 条目 completed 后，消息以 userMessage 注入（steer 语义）并得到 agentMessage 回复
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "commandExecution" &&
+            n.params.item.status === "completed",
+        ),
+      5000,
+      "shell 条目未完成",
+    );
+    const steerFinder = (n: { method: string; params: unknown }) =>
+      isNotif(n, "item/started") &&
+      n.params.item.type === "userMessage" &&
+      String(n.params.item.content?.[0]?.text ?? "").includes("重要消息");
+    await waitFor(() => loop.mock.receivedNotifications.some(steerFinder), 5000, "steer 消息未注入为 userMessage");
+    const steerMsg = loop.mock.receivedNotifications.find(steerFinder)! as Notif;
+    assert.equal(steerMsg.params.turnId, shellTurnId, "steer 注入应归属 shell turn");
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "agentMessage" &&
+            String(n.params.item.text).includes("steer 注入"),
+        ),
+      5000,
+      "steer 回复未到",
+    );
+
+    const turns = (await loop.mock.rpc("thread/turns/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(turns.result.data.length, 1, "steer 不得新建 turn");
+    const q = (await loop.mock.rpc("thread/queue/list", { threadId })) as { result: { data: unknown[] } };
+    assert.equal(q.result.data.length, 0, "queue 全程为空");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("F1 回归：独立 shell turn 期间 turn/steer 不吞消息", async () => {
+  const loop = await startLoop({ shellWaitMs: 250, stepDelayMs: 5, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/shell-f1-steer" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    await loop.mock.rpc("thread/shellCommand", { threadId, command: "echo hi" });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/started")),
+      2000,
+      "shell turn/started 未到",
+    );
+    const shellTurnId = findNotif(loop, "turn/started")!.params.turn.id as string;
+
+    // 不传 expectedTurnId：断言服务器确实把 steer 注入 shell turn
+    const st = (await loop.mock.rpc("turn/steer", {
+      threadId,
+      input: [{ type: "text", text: "重要消息" }],
+    })) as { result: { turnId: string } };
+    assert.equal(st.result.turnId, shellTurnId, "turn/steer 应定位到活动 shell turn");
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "commandExecution" &&
+            n.params.item.status === "completed",
+        ),
+      5000,
+      "shell 条目未完成",
+    );
+    const steerFinder = (n: { method: string; params: unknown }) =>
+      isNotif(n, "item/started") &&
+      n.params.item.type === "userMessage" &&
+      String(n.params.item.content?.[0]?.text ?? "").includes("重要消息");
+    await waitFor(() => loop.mock.receivedNotifications.some(steerFinder), 5000, "steer 消息未注入为 userMessage");
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "agentMessage" &&
+            String(n.params.item.text).includes("steer 注入"),
+        ),
+      5000,
+      "steer 回复未到",
+    );
+
+    const turns = (await loop.mock.rpc("thread/turns/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(turns.result.data.length, 1, "steer 不得新建 turn");
+    const q = (await loop.mock.rpc("thread/queue/list", { threadId })) as { result: { data: unknown[] } };
+    assert.equal(q.result.data.length, 0, "queue 全程为空");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("F2 回归：attached shell 随父 turn 自然结束补发 interrupted 条目并登记后台终端", async () => {
+  const loop = await startLoop({ shellWaitMs: 500, stepDelayMs: 150, deltaIntervalMs: 1, deltaChars: 64 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/shell-f2" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    // 普通 turn 进行中（stepDelayMs=150 制造窗口）挂一条 shellCommand
+    const ts = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "父 turn" }],
+    })) as { result: { turn: { id: string } } };
+    const parentTurnId = ts.result.turn.id;
+    await loop.mock.rpc("thread/shellCommand", { threadId, command: "long-running" });
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "item/started") && n.params.item.type === "commandExecution",
+        ),
+      2000,
+      "attached shell item/started 未到",
+    );
+    const shellStarted = findNotif(loop, "item/started", (p) => p.item.type === "commandExecution")!;
+    assert.equal(shellStarted.params.turnId, parentTurnId, "attached 条目应挂父 turn");
+
+    // 父 turn 先自然完成（非打断）
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.id === parentTurnId,
+        ),
+      5000,
+      "父 turn 未自然完成",
+    );
+
+    // shell 条目随后以 interrupted 终态补发（此前会悬挂）
+    const itemId = shellStarted.params.item.id as string;
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            isNotif(n, "item/completed") &&
+            n.params.item.type === "commandExecution" &&
+            n.params.item.id === itemId,
+        ),
+      5000,
+      "attached shell 条目未终结（悬挂）",
+    );
+    const shellCompleted = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "commandExecution" && p.item.id === itemId,
+    )!;
+    assert.equal(shellCompleted.params.item.status, "interrupted");
+    assert.equal(shellCompleted.params.item.exitCode, null);
+    assert.equal(shellCompleted.params.item.aggregatedOutput, null);
+    assert.ok(
+      typeof shellCompleted.params.item.durationMs === "number" && shellCompleted.params.item.durationMs >= 1,
+      "durationMs 应为实测数字",
+    );
+    assert.equal(shellCompleted.params.turnId, parentTurnId, "条目仍归属父 turn");
+
+    // 条目登记进后台终端（turn 结束后仍存活），list 返回且进程指标为 null
+    const list = (await loop.mock.rpc("thread/backgroundTerminals/list", { threadId })) as {
+      result: { data: Array<Record<string, unknown>> };
+    };
+    assert.equal(list.result.data.length, 1, "attached shell 应登记后台终端");
+    const entry = list.result.data[0]!;
+    assert.equal(entry.itemId, itemId);
+    assert.equal(entry.command, "long-running");
+    assert.equal(entry.osPid, null);
+    assert.equal(entry.cpuPercent, null);
+    assert.equal(entry.rssKb, null);
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();

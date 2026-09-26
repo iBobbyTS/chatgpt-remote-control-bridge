@@ -148,6 +148,16 @@ type AnyParams = Record<string, any>;
 const ERR_NOT_INITIALIZED = { code: -32600, message: "Not initialized" };
 const ERR_METHOD_NOT_FOUND = { code: -32601, message: "Method not found" };
 
+/** thread/goal/set 允许的 status 取值（v2/thread.rs ThreadGoalStatus 枚举）。 */
+const GOAL_STATUSES: readonly SimGoalStatus[] = [
+  "active",
+  "paused",
+  "blocked",
+  "usageLimited",
+  "budgetLimited",
+  "complete",
+];
+
 /** 特殊指令帮助文本（手机端发送对应指令即得本条回复）。 */
 const HELP_TEXT = [
   "特殊指令：",
@@ -1246,11 +1256,24 @@ export class SimApp extends EventEmitter implements AgentApp {
     const existing = state.goal;
     const objective =
       p.objective === undefined || p.objective === null ? (existing?.objective ?? "") : String(p.objective);
+    // status 形状校验：codex 在 serde 反序列化层拒绝非法枚举值，sim 在此近似
+    // （v2/thread.rs ThreadGoalStatus）。
+    if (p.status !== undefined && p.status !== null && !(GOAL_STATUSES as readonly unknown[]).includes(p.status)) {
+      throw new SimMethodError(-32600, `invalid goal status: ${String(p.status)}`);
+    }
     const status: SimGoalStatus =
       p.status === undefined || p.status === null ? (existing?.status ?? "active") : (p.status as SimGoalStatus);
     let tokenBudget = existing?.tokenBudget ?? null;
     if ("tokenBudget" in p) {
-      tokenBudget = p.tokenBudget === null || p.tokenBudget === undefined ? null : Number(p.tokenBudget);
+      if (p.tokenBudget === null || p.tokenBudget === undefined) {
+        tokenBudget = null;
+      } else {
+        // codex 在 serde 反序列化层要求数字，sim 近似：非有限数字一律 -32600。
+        if (typeof p.tokenBudget !== "number" || !Number.isFinite(p.tokenBudget)) {
+          throw new SimMethodError(-32600, "invalid tokenBudget");
+        }
+        tokenBudget = p.tokenBudget;
+      }
     }
     const goal: SimGoal = {
       threadId: state.thread.id,
@@ -1264,7 +1287,13 @@ export class SimApp extends EventEmitter implements AgentApp {
     };
     state.goal = goal;
     this.persistState();
-    this.emitSoon("thread/goal/updated", { threadId: state.thread.id, turnId: null, goal }, state.thread.id);
+    // 响应先行：goal 通知用**宏任务**补发（与 resume goal 快照同模式，见 threadResume
+    // 注释）。禁用 emitSoon 微任务：微任务可能仍先于 dispatchMessage 写响应，违反
+    // codex thread_goal_processor.rs:235-242（set）/ :294-299（clear）的响应先行。
+    this.schedule(null, () => {
+      if (this.closed) return;
+      this.emit("event", this.notification("thread/goal/updated", { threadId: state.thread.id, turnId: null, goal }, state.thread.id));
+    }, 0);
     return { goal };
   }
 
@@ -1278,7 +1307,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (!state.goal) return { cleared: false };
     state.goal = null;
     this.persistState();
-    this.emitSoon("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id);
+    // 响应先行（同 goalSet）：goal/cleared 用宏任务补发，避免微任务抢在响应之前。
+    this.schedule(null, () => {
+      if (this.closed) return;
+      this.emit("event", this.notification("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id));
+    }, 0);
     return { cleared: true };
   }
 
@@ -1368,6 +1401,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     const turnId = sim.turn.id;
     const startedAtMs = Date.now();
     this.schedule(sim, () => {
+      // NIT 守卫：同一 tick 内 interrupt/compact 已结束本 turn 时不得让已完成 turn
+      // 复活（正常情况下 finishSimTurn 会清掉本定时器，此处为双保险）。
+      if (sim.ended) return;
       if (!attached) {
         this.emit("event", this.notification("thread/status/changed", {
           threadId: state.thread.id,
@@ -1384,8 +1420,41 @@ export class SimApp extends EventEmitter implements AgentApp {
         turnId,
         startedAtMs,
       }, state.thread.id));
-      this.schedule(sim, () => {
-        if (sim.ended) return;
+      // attached 时完成定时器**不挂父 turn**：finishSimTurn 会清理 sim.timers，父 turn 在
+      // shellWaitMs 内自然结束（非打断）会把本定时器一并清掉 → item/started 永不终结、
+      // backgroundTerminals 漏登记（评审 F2）。改挂无 turn 定时器后回调仍会触发，由
+      // sim.ended 分支补发终态。独立 shell turn 仍挂自身 sim（turn 结束即取消补发）。
+      this.schedule(attached ? null : sim, () => {
+        if (sim.ended) {
+          if (!attached) return; // 独立 shell turn 已收尾：条目随 turn 结束，不补发
+          // F2：attached 且父 turn 先于 shellWaitMs 结束（自然完成/打断）。命令未跑完 →
+          // 条目以 interrupted 终态补发（exitCode/aggregatedOutput null、durationMs 实测），
+          // 并登记为后台终端——条目在 turn 结束后仍存活，正是「后台终端」语义
+          // （v2/thread.rs:1215-1224），list/terminate/clean 因此可用。条目仍计入 items
+          // 索引，turnId 用父 turn id。
+          const interruptedAtMs = Date.now();
+          const interrupted: CommandExecutionItem = {
+            ...item,
+            status: "interrupted",
+            aggregatedOutput: null,
+            exitCode: null,
+            durationMs: Math.max(1, interruptedAtMs - startedAtMs),
+          };
+          this.emit("event", this.notification("item/completed", {
+            item: interrupted,
+            threadId: state.thread.id,
+            turnId,
+            completedAtMs: interruptedAtMs,
+          }, state.thread.id));
+          state.items.push({ turnId, item: interrupted, startedAtMs, completedAtMs: interruptedAtMs });
+          state.backgroundTerminals.push({
+            itemId: item.id,
+            processId: item.processId,
+            command,
+            cwd: state.thread.cwd,
+          });
+          return;
+        }
         const output = `（模拟 shell）$ ${command}\n（未调用真实 shell）`;
         const completedAtMs = Date.now();
         this.emit("event", this.notification("item/commandExecution/outputDelta", {
@@ -1416,8 +1485,14 @@ export class SimApp extends EventEmitter implements AgentApp {
           cwd: state.thread.cwd,
         });
         if (!attached) {
-          this.finishSimTurn(state, "completed");
-          this.consumeQueue(state);
+          // 独立 shell turn 收尾走普通 turn 收尾链（评审 F1）：先排水 steer
+          // （对齐 codex core/src/tasks/user_shell.rs TaskKind::Regular 可 steer——steer
+          // 输入在 shell 命令完成后作为 userMessage 注入同一 turn），再 finish + queue。
+          // 此前直接 finish 会吞掉 turnStart/turnSteer 注入的 sim.steerInputs。
+          this.processSteers(state, sim, () => {
+            this.finishSimTurn(state, "completed");
+            this.consumeQueue(state);
+          });
         }
       }, this.opts.shellWaitMs);
     }, 0);
