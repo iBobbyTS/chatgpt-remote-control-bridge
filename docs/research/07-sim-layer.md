@@ -459,3 +459,18 @@ command/exec 打通后，手机新会话卡在下一步：**任务目录创建�
 `-lc` 内层，任意 codex-* arg0）；任务目录脚本支持 env 根目录（env 经
 processSpawn/commandExec 下传 emulateShellScript）；测试新增 workspace-write
 任务目录原样脚本用例，全量 180/180。
+
+## 2026-09-25 test steer 停止规则：steer「stop」步骤边界终止脚本
+
+需求：`test steer` 脚本（3 条消息 + 2 次 15 秒模拟等待）进行中，若 steer 输入文本为
+`stop`（trim + 大小写不敏感），当前工具或消息步骤一结束就终止剩余脚本——后续消息与
+第二次等待不再执行；全部待处理 steer 输入仍落为 userMessage item（保持手机端对账），
+但只回一条固定消息 `（steer注入）已按照steer规则停止原本的任务。`，随后 turn 以
+completed 收尾并照常消费 thread 队列（排队消息不受影响）。
+
+实现：`SimTurnRuntime.steerStopRequested` 标记（`turn/steer` 与活动期 `turn/start` 两处
+入队统一走 `pushSteerInput`，文本为 stop 时置位）；`processSteers` 顶部优先分流到
+`handleSteerStop`（不逐条回复，done 链到此终止）；`runScriptedTurn.step` 在每条消息流
+结束处增加检查点——消息期间收到 stop 则不进入下一次 15 秒等待。普通 turn / 独立
+shell turn 的 steer 排水链共用该入口，`stop` 文本同样按停止语义收尾。测试新增 sim
+用例（等待窗口内 steer " Stop " → 仅 1 次 wait + 单条停止消息），全量 181/181。

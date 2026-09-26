@@ -567,6 +567,75 @@ test("回环：特殊指令 help / test steer / test queue（3 消息 + 2 次模
   }
 });
 
+test("回环：test steer 期间 steer「stop」→ 步骤边界终止脚本，只回一条停止消息", async () => {
+  const loop = await startLoop({ commandWaitMs: 300 });
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "t" },
+      capabilities: { optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const completedItems = () =>
+      loop.mock.receivedNotifications
+        .filter((n) => n.method === "item/completed")
+        .map((n) => (n.params as { item: { type: string } & Record<string, unknown> }).item);
+
+    const steerTurn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "test steer" }],
+    })) as { result: { turn: { id: string } } };
+    // 等第一次 wait 命令开始后再 steer，确保 stop 落在等待窗口内（顺序确定）
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "item/started" &&
+            (n.params as { item?: { type?: string } }).item?.type === "commandExecution",
+        ),
+      5000,
+      "第一次模拟 wait 未开始",
+    );
+    await loop.mock.rpc("turn/steer", {
+      threadId,
+      expectedTurnId: steerTurn.result.turn.id,
+      // trim + 大小写不敏感匹配「stop」；userMessage 保留原文
+      input: [{ type: "text", text: " Stop " }],
+      clientUserMessageId: "steer-stop-1",
+    });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "turn/completed" &&
+            (n.params as { turn: { status: string } }).turn.status === "completed",
+        ),
+      15_000,
+      "stop steer 后 turn 未收尾",
+    );
+    const items = completedItems();
+    // 顺序：用户消息 → 消息1 → wait1 → stop 注入 → 停止回复；消息2/3 与 wait2 被跳过
+    assert.deepEqual(
+      items.map((i) => i.type),
+      ["userMessage", "agentMessage", "commandExecution", "userMessage", "agentMessage"],
+    );
+    const agents = items.filter((i) => i.type === "agentMessage") as unknown as Array<{ text: string }>;
+    assert.ok(agents[0]!.text.includes("test steer 1/3"));
+    assert.equal(agents[1]!.text, "（steer注入）已按照steer规则停止原本的任务。");
+    assert.equal(
+      (items[3] as { content?: Array<{ text: string }> }).content?.[0]?.text,
+      " Stop ",
+      "stop 消息应作为 userMessage 注入第一次等待之后",
+    );
+    assert.equal(items.filter((i) => i.type === "commandExecution").length, 1, "第二次 15 秒等待应被跳过");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("回环：turn 结束后的 steer → -32600 no active turn to steer（对齐 codex turn_steer_inner）", async () => {
   const loop = await startLoop();
   try {

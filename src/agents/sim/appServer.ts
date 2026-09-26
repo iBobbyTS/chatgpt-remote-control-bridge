@@ -110,6 +110,11 @@ interface SimTurnRuntime {
   turn: TurnRecord;
   timers: Set<NodeJS.Timeout>;
   steerInputs: Array<{ text: string; clientUserMessageId: string | null }>;
+  /**
+   * steer 输入文本为「stop」时置位：当前工具或消息步骤一结束就终止 turn 剩余
+   * 脚本（test steer 的后续消息与 15 秒等待不再执行），只回一条停止消息。
+   */
+  steerStopRequested: boolean;
   ended: boolean;
   /**
    * turn 种类（S03）：normal=普通/shell 轻量 turn；compact=thread/compact/start
@@ -164,7 +169,7 @@ const GOAL_STATUSES: readonly SimGoalStatus[] = [
 const HELP_TEXT = [
   "特殊指令：",
   "help: 输出本条帮助信息",
-  'test steer：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试steer强制插入消息的效果。',
+  'test steer：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试steer强制插入消息的效果；期间steer发送stop会在当前步骤结束后停止脚本。',
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
   "",
   "模拟功能（对齐 codex）：",
@@ -821,7 +826,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       // 活动期 turn/start 转 steer：对齐 codex start_or_steer_turn
       // （turn_processor.rs:651-684，TurnInputSubmission::Steered）——输入注入当前
       // turn，返回同一 turn。不新建 turn、不排队，避免旧 sim 定时器孤儿化。
-      state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
+      this.pushSteerInput(state.sim, input.map((c) => c.text).join(""), clientUserMessageId);
       return { turn: { ...this.serializeTurn(state.sim.turn), items: [], itemsView: "notLoaded" as const } };
     }
     const sim = this.beginSimTurn(state, input, clientUserMessageId, titleSchemaOf(p));
@@ -839,7 +844,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       if (state.sim.kind === "compact") {
         throw new SimMethodError(-32600, "cannot steer a compact turn");
       }
-      state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
+      this.pushSteerInput(state.sim, input.map((c) => c.text).join(""), clientUserMessageId);
       return { turnId: p.expectedTurnId ?? state.sim.turn.id };
     }
     // 对齐真实 codex（app-server/src/request_processors/turn_processor.rs
@@ -897,7 +902,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const userText = input.map((c) => c.text).join("");
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "normal" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal" };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -971,7 +976,20 @@ export class SimApp extends EventEmitter implements AgentApp {
     return sim;
   }
 
+  /** steer 输入入队；文本为「stop」（trim + 大小写不敏感）时置停止请求。 */
+  private pushSteerInput(sim: SimTurnRuntime, text: string, clientUserMessageId: string | null): void {
+    sim.steerInputs.push({ text, clientUserMessageId });
+    if (text.trim().toLowerCase() === "stop") {
+      sim.steerStopRequested = true;
+    }
+  }
+
   private processSteers(state: ThreadState, sim: SimTurnRuntime, done: () => void): void {
+    // stop steer 优先于逐条回复：终止剩余脚本并直接收尾，done 链到此为止
+    if (!sim.ended && sim.steerStopRequested) {
+      this.handleSteerStop(state, sim);
+      return;
+    }
     const next = sim.steerInputs.shift();
     if (!next || sim.ended) {
       done();
@@ -1000,11 +1018,49 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /**
+   * steer 停止规则（test steer）：steer 输入「stop」在当前工具或消息步骤结束后
+   * 生效——turn 剩余脚本（后续消息与 2 次 15 秒等待）不再执行。全部待处理 steer
+   * 输入仍落为 userMessage item（保持手机端对账），但只回一条停止确认消息，随后
+   * turn 以 completed 收尾并照常消费 thread 队列（排队消息不受影响）。
+   */
+  private handleSteerStop(state: ThreadState, sim: SimTurnRuntime): void {
+    const pending = sim.steerInputs.splice(0);
+    sim.steerStopRequested = false;
+    for (const entry of pending) {
+      const steerItem = makeUserMessage(entry.text, entry.clientUserMessageId);
+      const at = Date.now();
+      this.emit("event", this.notification("item/started", {
+        item: steerItem,
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        startedAtMs: at,
+      }, state.thread.id));
+      this.emit("event", this.notification("item/completed", {
+        item: steerItem,
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        completedAtMs: at,
+      }, state.thread.id));
+      state.items.push({ turnId: sim.turn.id, item: steerItem, startedAtMs: at, completedAtMs: at });
+      sim.turn.items.push(steerItem);
+    }
+    this.schedule(sim, () => {
+      if (sim.ended) return;
+      const reply = "（steer注入）已按照steer规则停止原本的任务。";
+      this.streamAgentMessage(state, sim, reply, () => {
+        this.finishSimTurn(state, "completed");
+        this.consumeQueue(state);
+      });
+    }, this.opts.stepDelayMs);
+  }
+
+  /**
    * test steer / test queue 特殊指令脚本：3 条 agentMessage，相邻两条之间各执行
    * 一次模拟命令 "wait 15 seconds"（真实等待 commandWaitMs，不经 shell）。每次
    * 等待结束后先处理等待期间到达的 steer（对齐真实 codex：steered userMessage
    * 在当前命令完成后出现在同一 turn 内），再发下一条脚本消息——保证测试窗口
-   * 内发送的消息能观察到即时效果。
+   * 内发送的消息能观察到即时效果。steer「stop」例外：当前工具或消息步骤一结束
+   * 就终止脚本（见 handleSteerStop），剩余等待与消息不再执行。
    */
   private runScriptedTurn(
     state: ThreadState,
@@ -1015,7 +1071,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const label = kind === "test-steer" ? "test steer" : "test queue";
     const hint =
       kind === "test-steer"
-        ? "现在发送的消息会以 turn/steer 强制插入当前 turn，并在本次等待结束后立刻得到回复。"
+        ? "现在发送的消息会以 turn/steer 强制插入当前 turn，并在本次等待结束后立刻得到回复；发送 stop 会在当前步骤结束后停止本脚本。"
         : "现在发送的消息会经 thread/queue/add 排队，不打断当前 turn，turn 结束后自动开跑。";
     const messages = [
       `【${label} 1/3】turn 进行中，即将执行模拟命令 wait 15 seconds。${hint}`,
@@ -1031,6 +1087,11 @@ export class SimApp extends EventEmitter implements AgentApp {
       this.streamAgentMessage(state, sim, messages[index]!, () => {
         if (index === messages.length - 1) {
           done();
+          return;
+        }
+        if (sim.steerStopRequested) {
+          // 消息流期间已收到 stop：本条消息结束即停止脚本，不进入下一次 15 秒等待
+          this.processSteers(state, sim, () => step(index + 1));
           return;
         }
         this.simulateCommandWait(state, sim, () => {
@@ -1391,7 +1452,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "compact" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "compact" };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -1559,7 +1620,7 @@ export class SimApp extends EventEmitter implements AgentApp {
   private beginShellTurn(state: ThreadState): SimTurnRuntime {
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], ended: false, kind: "normal" };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal" };
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
