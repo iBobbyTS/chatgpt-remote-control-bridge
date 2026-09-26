@@ -46,7 +46,7 @@ export interface CommandExecutionItem {
   cwd: string;
   processId: string;
   source: string;
-  status: "inProgress" | "completed" | "failed" | "interrupted";
+  status: "inProgress" | "completed" | "failed";
   commandActions: CommandExecutionAction[];
   aggregatedOutput: string | null;
   exitCode: number | null;

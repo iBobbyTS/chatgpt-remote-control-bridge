@@ -1428,25 +1428,28 @@ export class SimApp extends EventEmitter implements AgentApp {
         if (sim.ended) {
           if (!attached) return; // 独立 shell turn 已收尾：条目随 turn 结束，不补发
           // F2：attached 且父 turn 先于 shellWaitMs 结束（自然完成/打断）。命令未跑完 →
-          // 条目以 interrupted 终态补发（exitCode/aggregatedOutput null、durationMs 实测），
-          // 并登记为后台终端——条目在 turn 结束后仍存活，正是「后台终端」语义
+          // 条目以 failed 终态补发，对齐 codex 取消路径 core/src/tasks/user_shell.rs:247-274：
+          // status CommandExecutionStatus::Failed + exit_code -1 + aggregated_output
+          // "command aborted by user"（wire 枚举 app-server-protocol/.../v2/item.rs:1074-1082
+          // 只有 InProgress|Completed|Failed|Declined，无 Interrupted，故不得下发 interrupted），
+          // durationMs 实测；并登记为后台终端——条目在 turn 结束后仍存活，正是「后台终端」语义
           // （v2/thread.rs:1215-1224），list/terminate/clean 因此可用。条目仍计入 items
           // 索引，turnId 用父 turn id。
-          const interruptedAtMs = Date.now();
-          const interrupted: CommandExecutionItem = {
+          const abortedAtMs = Date.now();
+          const aborted: CommandExecutionItem = {
             ...item,
-            status: "interrupted",
-            aggregatedOutput: null,
-            exitCode: null,
-            durationMs: Math.max(1, interruptedAtMs - startedAtMs),
+            status: "failed",
+            aggregatedOutput: "command aborted by user（模拟：父 turn 已结束）",
+            exitCode: -1,
+            durationMs: Math.max(1, abortedAtMs - startedAtMs),
           };
           this.emit("event", this.notification("item/completed", {
-            item: interrupted,
+            item: aborted,
             threadId: state.thread.id,
             turnId,
-            completedAtMs: interruptedAtMs,
+            completedAtMs: abortedAtMs,
           }, state.thread.id));
-          state.items.push({ turnId, item: interrupted, startedAtMs, completedAtMs: interruptedAtMs });
+          state.items.push({ turnId, item: aborted, startedAtMs, completedAtMs: abortedAtMs });
           state.backgroundTerminals.push({
             itemId: item.id,
             processId: item.processId,

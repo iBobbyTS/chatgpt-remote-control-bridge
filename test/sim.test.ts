@@ -2214,7 +2214,7 @@ test("F1 回归：独立 shell turn 期间 turn/steer 不吞消息", async () =>
   }
 });
 
-test("F2 回归：attached shell 随父 turn 自然结束补发 interrupted 条目并登记后台终端", async () => {
+test("F2 回归：attached shell 随父 turn 自然结束补发 failed 条目并登记后台终端", async () => {
   const loop = await startLoop({ shellWaitMs: 500, stepDelayMs: 150, deltaIntervalMs: 1, deltaChars: 64 });
   try {
     await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
@@ -2253,7 +2253,7 @@ test("F2 回归：attached shell 随父 turn 自然结束补发 interrupted 条�
       "父 turn 未自然完成",
     );
 
-    // shell 条目随后以 interrupted 终态补发（此前会悬挂）
+    // shell 条目随后以 failed 终态补发（此前会悬挂；对齐 codex 取消路径 user_shell.rs:247-274）
     const itemId = shellStarted.params.item.id as string;
     await waitFor(
       () =>
@@ -2271,9 +2271,16 @@ test("F2 回归：attached shell 随父 turn 自然结束补发 interrupted 条�
       "item/completed",
       (p) => p.item.type === "commandExecution" && p.item.id === itemId,
     )!;
-    assert.equal(shellCompleted.params.item.status, "interrupted");
-    assert.equal(shellCompleted.params.item.exitCode, null);
-    assert.equal(shellCompleted.params.item.aggregatedOutput, null);
+    assert.equal(shellCompleted.params.item.status, "failed");
+    assert.equal(shellCompleted.params.item.exitCode, -1);
+    assert.equal(
+      shellCompleted.params.item.aggregatedOutput,
+      "command aborted by user（模拟：父 turn 已结束）",
+    );
+    assert.ok(
+      String(shellCompleted.params.item.aggregatedOutput).includes("command aborted"),
+      "aggregatedOutput 应含 codex 取消文案 command aborted",
+    );
     assert.ok(
       typeof shellCompleted.params.item.durationMs === "number" && shellCompleted.params.item.durationMs >= 1,
       "durationMs 应为实测数字",
