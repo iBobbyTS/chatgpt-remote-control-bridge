@@ -7,11 +7,18 @@
  * 本模块只承载协议类型、服务端监听与客户端封装；业务 handler 由 CgrcbDaemon 注入，
  * 因此 ipc.ts 不依赖 daemon.ts（无环）。
  *
- * 单实例互斥（BLOCKER 4）：socket 探测（probe→unlink→listen）本身无跨进程原子性，
- * 故用 O_EXCL 锁文件 `<socketPath>.lock`（pid）做最小互斥；仅在探测确认死连接后才
- * unlink stale socket，listen 撞 EADDRINUSE 时重新探测，确认对方活着则报错退出、不删其 socket。
+ * 单实例互斥（BLOCKER 4 + 二波 B-2/B-3/B-4）：
+ * - **原子发布**锁文件 `<socketPath>.lock`：先写唯一临时文件，再 `link(2)` 到锁路径
+ *   （失败 EEXIST = 已被占）。空/不可解析锁一律视为"在途/未知"，短重试后 fail-safe 拒绝，
+ *   绝不当陈旧删除（避免 link 前空文件窗口竞态造成双持有）。
+ * - 锁内容 `{pid, startedAt}`：startedAt 为进程启动身份（macOS `ps -o lstart= -p`）。
+ *   pid 存活但启动身份不符 = pid 复用 → 孤儿锁，回收；身份相符/不可得且无 socket →
+ *   宽限重试后按孤儿锁回收（"daemon 存活必有 socket"不变量）。
+ * - **socket 探测保守化**：仅 ECONNREFUSED/ENOENT 判死可清理；EACCES/其他错误/超时
+ *   一律抛错拒绝接管，绝不删除他人的活 socket。
  */
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { chmod, link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { AuthStatus } from "../auth/manager.ts";
@@ -91,32 +98,59 @@ export interface DaemonStatusPayload {
 
 export class DaemonAlreadyRunningError extends Error {
   readonly code = "EADDRINUSE";
-  constructor(socketPath: string) {
-    super(`daemon 已在运行（socket 被占用）：${socketPath}`);
+  constructor(socketPath: string, detail?: string) {
+    super(`daemon 已在运行（socket 被占用）：${socketPath}${detail ? `（${detail}）` : ""}`);
     this.name = "DaemonAlreadyRunningError";
   }
 }
 
-/** 检测 socket 是否有活进程监听（能连上 = 活；ENOENT/ECONNREFUSED = stale）。 */
-export function socketIsLive(socketPath: string, timeoutMs = 500): Promise<boolean> {
-  return new Promise((resolve) => {
+export type SocketProbe = "live" | "dead";
+
+/**
+ * 探测 socket 是否有活监听者（B-3 保守化）：
+ * - connect 成功 → `"live"`；
+ * - ECONNREFUSED/ENOENT → `"dead"`（死连接残留，可安全清理）；
+ * - EACCES 及其他错误、或超时 → **抛错**（拒绝接管，绝不删除他人的活 socket）。
+ */
+export function probeSocket(socketPath: string, timeoutMs = 500): Promise<SocketProbe> {
+  return new Promise((resolve, reject) => {
     const socket = createConnection(socketPath);
     let settled = false;
-    const done = (live: boolean) => {
+    const done = (fn: () => void) => {
       if (settled) return;
       settled = true;
       socket.destroy();
-      resolve(live);
+      fn();
     };
-    socket.once("connect", () => done(true));
-    socket.once("error", () => done(false));
-    const timer = setTimeout(() => done(false), timeoutMs);
+    socket.once("connect", () => done(() => resolve("live")));
+    socket.once("error", (err) => {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "ECONNREFUSED" || code === "ENOENT") {
+        done(() => resolve("dead"));
+      } else {
+        done(() =>
+          reject(
+            new Error(`socket 探测失败（${code ?? "unknown"}），拒绝接管：${socketPath}`),
+          ),
+        );
+      }
+    });
+    const timer = setTimeout(
+      () => done(() => reject(new Error(`socket 探测超时，拒绝接管：${socketPath}`))),
+      timeoutMs,
+    );
     timer.unref?.();
   });
 }
 
 /** 单行 IPC 请求大小上限（NIT ②），超限断连防内存膨胀。 */
 export const MAX_IPC_LINE_BYTES = 1_000_000;
+
+interface LockInfo {
+  pid: number;
+  /** 进程启动身份（`ps -o lstart=`）；null = 未知/旧格式。 */
+  startedAt: string | null;
+}
 
 export interface IpcServerOptions {
   socketPath: string;
@@ -125,8 +159,8 @@ export interface IpcServerOptions {
 }
 
 /**
- * daemon 侧 IPC 服务端：行协议分发；stale socket 在被新 daemon 接管前清理；
- * 跨进程互斥由 `<socketPath>.lock` 保证（BLOCKER 4）。
+ * daemon 侧 IPC 服务端：行协议分发；stale socket 探测确认后清理；
+ * 跨进程互斥由原子发布的 `<socketPath>.lock` 保证。
  * 每个请求独立处理（同 agent 的互斥由 daemon 的业务锁保证）。
  */
 export class IpcServer {
@@ -157,10 +191,11 @@ export class IpcServer {
     await mkdir(dirname(this.socketPath), { recursive: true });
     await this.acquireLock();
     try {
-      if (await socketIsLive(this.socketPath)) {
+      // 仅探测确认死连接（或不存在）才清理陈旧 socket
+      const state = await probeSocket(this.socketPath);
+      if (state === "live") {
         throw new DaemonAlreadyRunningError(this.socketPath);
       }
-      // 仅当探测确认无监听者（死连接残留）才 unlink stale socket
       await rm(this.socketPath, { force: true });
       const server = await this.listenWithRetry();
       await chmod(this.socketPath, 0o600).catch(() => {});
@@ -172,22 +207,74 @@ export class IpcServer {
     }
   }
 
-  /** O_EXCL 锁文件：跨进程最小互斥；陈旧锁（持有者已死）清理后重试。 */
+  /**
+   * 原子发布锁：写唯一临时文件 → link(2) 到锁路径（EEXIST = 已被占）。
+   * 空/不可解析锁 = 在途/未知，短重试后 fail-safe 拒绝，绝不删除。
+   */
   private async acquireLock(): Promise<void> {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    const startedAt = await processStartIdentity(process.pid);
+    const payload = JSON.stringify({ pid: process.pid, startedAt });
+    let parseRetries = 0;
+    let orphanGrace = 0;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const tmp = `${this.lockPath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+        .toString(16)
+        .slice(2, 10)}`;
+      await writeFile(tmp, payload, { mode: 0o600 });
+      let linked = false;
       try {
-        await writeFile(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+        await link(tmp, this.lockPath); // 原子：失败 EEXIST = 已被占
+        linked = true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+          await rm(tmp, { force: true });
+          throw err;
+        }
+      }
+      await rm(tmp, { force: true });
+      if (linked) {
         this.lockAcquired = true;
         return;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-        const holder = await readLockPid(this.lockPath);
-        // 持有者存活（含同进程测试内双 daemon）→ 拒绝；不触碰其 socket/lock
-        if (holder !== null && isProcessAlive(holder)) {
-          throw new DaemonAlreadyRunningError(this.socketPath);
-        }
-        await rm(this.lockPath, { force: true });
       }
+
+      const holder = await readLockInfo(this.lockPath);
+      if (holder === null) {
+        // 空/不可解析：在途/未知（不得当陈旧删）
+        parseRetries += 1;
+        if (parseRetries >= 3) throw new DaemonAlreadyRunningError(this.socketPath, "锁不可解析");
+        await delay(60);
+        continue;
+      }
+      if (holder.pid === process.pid) {
+        // 同进程已有 daemon 持有（测试内双 daemon）：视为占用
+        throw new DaemonAlreadyRunningError(this.socketPath);
+      }
+      if (!isProcessAlive(holder.pid)) {
+        await rm(this.lockPath, { force: true }); // 持有者已死 → 陈旧锁
+        continue;
+      }
+      const identity = await processStartIdentity(holder.pid);
+      if (holder.startedAt && identity && holder.startedAt !== identity) {
+        // pid 被复用（启动身份不符）→ 孤儿锁回收
+        this.log(`锁 pid ${holder.pid} 启动身份不符（pid 复用），回收孤儿锁`);
+        await rm(this.lockPath, { force: true });
+        continue;
+      }
+      // 持有者活且身份相符/未知：daemon 存活必有 socket
+      let socketLive: boolean;
+      try {
+        socketLive = (await probeSocket(this.socketPath)) === "live";
+      } catch {
+        socketLive = true; // 探测被拒（EACCES 等）→ 保守视为占用
+      }
+      if (socketLive) throw new DaemonAlreadyRunningError(this.socketPath);
+      orphanGrace += 1;
+      if (orphanGrace >= 3) {
+        this.log(`锁 pid ${holder.pid} 存活但无 socket，按孤儿锁回收`);
+        await rm(this.lockPath, { force: true });
+        continue;
+      }
+      await delay(150); // 给"正在启动、尚未 listen"的 daemon 宽限
     }
     throw new DaemonAlreadyRunningError(this.socketPath);
   }
@@ -200,7 +287,8 @@ export class IpcServer {
 
   /**
    * listen；撞 EADDRINUSE（探测→unlink→listen 竞态窗）时重新探测：
-   * 对方活着 → DaemonAlreadyRunningError（不删其 socket）；死连接残留 → 清理重试。
+   * 对方活着 → DaemonAlreadyRunningError（不删其 socket）；探测被拒 → 抛错；
+   * 死连接残留 → 清理重试。
    */
   private async listenWithRetry(): Promise<Server> {
     for (let attempt = 0; attempt < 3; attempt += 1) {
@@ -222,7 +310,7 @@ export class IpcServer {
           // 未进入监听态
         }
         if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
-        if (await socketIsLive(this.socketPath)) {
+        if ((await probeSocket(this.socketPath)) === "live") {
           throw new DaemonAlreadyRunningError(this.socketPath);
         }
         await rm(this.socketPath, { force: true });
@@ -366,14 +454,53 @@ export function requestIpc(
   });
 }
 
-async function readLockPid(lockPath: string): Promise<number | null> {
+// ------------------------------------------------------------------- helpers
+
+async function readLockInfo(lockPath: string): Promise<LockInfo | null> {
+  let raw: string;
   try {
-    const text = (await readFile(lockPath, "utf8")).trim();
-    const pid = Number.parseInt(text, 10);
-    return Number.isInteger(pid) && pid > 0 ? pid : null;
+    raw = (await readFile(lockPath, "utf8")).trim();
   } catch {
     return null;
   }
+  if (!raw) return null; // 空文件 = 在途/未知
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const pid = Number((parsed as { pid?: unknown }).pid);
+      if (!Number.isInteger(pid) || pid <= 0) return null;
+      const startedAt = (parsed as { startedAt?: unknown }).startedAt;
+      return { pid, startedAt: typeof startedAt === "string" ? startedAt : null };
+    }
+  } catch {
+    // 兼容旧格式：纯 pid 文本
+  }
+  const legacy = Number(raw);
+  return Number.isInteger(legacy) && legacy > 0 ? { pid: legacy, startedAt: null } : null;
+}
+
+/** 进程启动身份（macOS `ps -o lstart=`）；不可得返回 null。 */
+function processStartIdentity(pid: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = spawn("ps", ["-o", "lstart=", "-p", String(pid)], {
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    let out = "";
+    let settled = false;
+    const done = (value: string | null) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    child.stdout?.on("data", (chunk) => (out += String(chunk)));
+    child.on("error", () => done(null));
+    child.on("close", () => done(out.trim() || null));
+    const timer = setTimeout(() => {
+      child.kill();
+      done(null);
+    }, 2000);
+    timer.unref?.();
+  });
 }
 
 /** 进程是否存活（EPERM = 存在但无权限，视为存活）。 */
@@ -384,4 +511,8 @@ function isProcessAlive(pid: number): boolean {
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "EPERM";
   }
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

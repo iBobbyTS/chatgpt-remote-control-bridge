@@ -116,9 +116,14 @@ export class CgrcbDaemon {
   /** config.json 提交串行化（BLOCKER 2）。 */
   private configChain: Promise<unknown> = Promise.resolve();
   private stopping = false;
+  /** shutdown() 同步置位（在 start 队列执行前即可见），用于 start 中途放弃（B-1）。 */
+  private stopRequested = false;
   private running = false;
   private startedAt = 0;
+  private startPromise: Promise<void> | null = null;
   private stopPromise: Promise<void> | null = null;
+  /** start/shutdown 生命周期串行化队列（B-1）。 */
+  private lifecycleChain: Promise<unknown> = Promise.resolve();
   private signalsInstalled = false;
   private readonly signalHandler = (): void => {
     this.logLine("收到停止信号，优雅退出…");
@@ -142,15 +147,33 @@ export class CgrcbDaemon {
     return this.running;
   }
 
-  /** 加载配置 → 起 IPC → 逐 enabled agent 建实例（经 per-agent 队列）。 */
-  async start(): Promise<void> {
-    if (this.running) return;
+  /**
+   * 加载配置 → 起 IPC → 逐 enabled agent 建实例（经 per-agent 队列）。
+   * 与 shutdown() 同一 lifecycle 队列串行（B-1）；start 每个 await 后复查 stopRequested。
+   */
+  start(): Promise<void> {
+    if (!this.startPromise) {
+      this.startPromise = this.lifecycleChain.then(() => this.doStart());
+      this.lifecycleChain = this.startPromise.then(
+        () => undefined,
+        () => undefined,
+      );
+    }
+    return this.startPromise;
+  }
+
+  private async doStart(): Promise<void> {
+    if (this.stopRequested) {
+      throw new Error("daemon 已请求停止，start 被取消");
+    }
     this.stopping = false;
-    this.stopPromise = null;
     await mkdir(this.paths.root, { recursive: true });
+    if (this.stopRequested) return this.abandonStart("stop requested");
     await mkdir(this.paths.instancesDir, { recursive: true });
     await mkdir(this.paths.logsDir, { recursive: true });
+    if (this.stopRequested) return this.abandonStart("stop requested");
     this.config = await readConfig(this.paths.configPath);
+    if (this.stopRequested) return this.abandonStart("stop requested");
     this.authManager =
       this.opts.authManager ??
       new BridgeAuthManager({ codexHome: this.paths.codexHome });
@@ -161,12 +184,14 @@ export class CgrcbDaemon {
       log: (line) => this.logLine(line),
     });
     await this.ipcServer.start(); // stale socket 在此清理；占用则抛 DaemonAlreadyRunningError
+    if (this.stopRequested) return this.abandonStart("stop requested");
 
     this.authManager.startAutoRefresh();
     this.installSignals();
     this.running = true;
     this.startedAt = Date.now();
     this.logLine(`daemon 已启动 home=${this.paths.root} pid=${process.pid}`);
+    if (this.stopRequested) return this.abandonStart("stop requested");
 
     // BLOCKER 1：初始自动启动也进入 per-agent 队列，disable/shutdown 可与之串行并等待
     for (const [id, cfg] of Object.entries(this.config.agents)) {
@@ -178,10 +203,30 @@ export class CgrcbDaemon {
     }
   }
 
+  /** start 中途收到 stop 请求：放弃并清理已建资源（IPC/socket/信号/自动刷新）。 */
+  private async abandonStart(reason: string): Promise<void> {
+    this.running = false;
+    this.stopping = true;
+    this.removeSignals();
+    this.authManager?.stopAutoRefresh();
+    if (this.ipcServer) {
+      await this.ipcServer.close();
+      this.ipcServer = null;
+    }
+    this.logLine(`启动已中止：${reason}`);
+  }
+
   /** 幂等优雅停：等待在途实例操作 → 停全部隧道（内部关 app）→ 关 IPC + 清 socket。 */
   shutdown(reason = "manual"): Promise<void> {
+    // 同步置位：让 IPC handler/doStart 立即看到停止请求（B-1 与 DAEMON_BUSY 语义）
+    this.stopRequested = true;
+    this.stopping = true;
     if (!this.stopPromise) {
-      this.stopPromise = this.doShutdown(reason);
+      this.stopPromise = this.lifecycleChain.then(() => this.doShutdown(reason));
+      this.lifecycleChain = this.stopPromise.then(
+        () => undefined,
+        () => undefined,
+      );
     }
     return this.stopPromise;
   }
@@ -191,10 +236,7 @@ export class CgrcbDaemon {
     this.running = false;
     this.removeSignals();
     for (const inst of this.instances.values()) {
-      if (inst.restartTimer) {
-        clearTimeout(inst.restartTimer);
-        inst.restartTimer = null;
-      }
+      this.clearRestartTimer(inst);
       if (inst.status !== "stopping") inst.status = "stopping";
     }
     // BLOCKER 1：等待启动/重启/disable 等在途操作收敛，避免其继续建隧道留下孤儿
@@ -281,6 +323,8 @@ export class CgrcbDaemon {
         await this.disposeInstance(inst);
         return;
       }
+      // A-NIT2：启动期 fault 排下的 pending restart 在成功后清除，避免多余健康重建
+      this.clearRestartTimer(inst);
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
@@ -399,6 +443,13 @@ export class CgrcbDaemon {
     }, delay);
   }
 
+  private clearRestartTimer(inst: InstanceRuntime): void {
+    if (inst.restartTimer) {
+      clearTimeout(inst.restartTimer);
+      inst.restartTimer = null;
+    }
+  }
+
   private async restartInstance(id: string): Promise<void> {
     if (this.stopping) return;
     const inst = this.instances.get(id);
@@ -412,6 +463,8 @@ export class CgrcbDaemon {
         await this.disposeInstance(inst);
         return;
       }
+      // A-NIT2：恢复期 fault 的 pending restart 清除
+      this.clearRestartTimer(inst);
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
@@ -484,7 +537,7 @@ export class CgrcbDaemon {
   private async handleIpc(request: IpcRequest): Promise<IpcResponse> {
     try {
       if (this.stopping && (request.op === "enable" || request.op === "disable")) {
-        return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
+        return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
       }
       switch (request.op) {
         case "status":
@@ -515,7 +568,7 @@ export class CgrcbDaemon {
 
   private async doEnable(id: string | undefined): Promise<IpcResponse> {
     if (!id || !getAgent(id)) return unknownAgent(id);
-    if (this.stopping) return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
+    if (this.stopping) return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
     const auth = await this.authManager!.getStatus();
     if (!auth.loggedIn) {
       return { ok: false, error: "NOT_LOGGED_IN", message: "未登录：请先执行 chatgpt login" };
@@ -528,10 +581,7 @@ export class CgrcbDaemon {
     if (!inst || inst.status === "disabled") {
       await this.startInstance(id);
     } else if (inst.status === "failed") {
-      if (inst.restartTimer) {
-        clearTimeout(inst.restartTimer);
-        inst.restartTimer = null;
-      }
+      this.clearRestartTimer(inst);
       await this.restartInstance(id);
     }
     return { ok: true, data: await this.agentStatus(id) };
@@ -539,16 +589,13 @@ export class CgrcbDaemon {
 
   private async doDisable(id: string | undefined): Promise<IpcResponse> {
     if (!id || !this.isKnownAgent(id)) return unknownAgent(id);
-    if (this.stopping) return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
+    if (this.stopping) return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
     if (this.config.agents[id]?.enabled === true) {
       await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
     }
     const inst = this.instances.get(id);
     if (inst) {
-      if (inst.restartTimer) {
-        clearTimeout(inst.restartTimer);
-        inst.restartTimer = null;
-      }
+      this.clearRestartTimer(inst);
       inst.status = "stopping";
       await this.disposeInstance(inst);
       this.instances.delete(id);

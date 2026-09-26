@@ -1,15 +1,16 @@
 /**
  * S02 下游框架 + 守护进程测试（AC1–AC6）。
  *
- * - 全部临时目录落在 .agent-work/tmp/daemon-tests/（CGRCB_HOME / options.home），
+ * - 全部临时目录落在 .agent-work/tmp/（CGRCB_HOME / options.home 指向临时目录），
  *   绝不触碰真实 ~/.cgrcb；wham 用 MockWhamServer，不碰真实端口/网络。
  * - stub agent 经**正式注册表** registerAgent 注册（延迟工厂），不 import src/sim/*。
  */
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
-import { createConnection } from "node:net";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createConnection, createServer } from "node:net";
 import { join } from "node:path";
 import { test, after } from "node:test";
 import { BridgeAuthManager } from "../src/auth/manager.ts";
@@ -415,8 +416,9 @@ test("daemon start：stale socket 被清理接管；活跃 daemon 的 socket 抛
   const home = await tempDir("stale");
   const paths = cgrcbPaths(home);
   await mkdir(home, { recursive: true });
-  // stale：socket 路径上有残留文件但无监听者（daemon 死）
-  await writeFile(paths.socketPath, "");
+  // stale：真实的残留 unix socket（子进程 bind 后退出，文件残留、无监听者）
+  await createStaleSocket(paths.socketPath);
+  assert.equal(existsSync(paths.socketPath), true, "stale socket 文件应残留");
   // 经 CGRCB_HOME 环境变量解析数据根（不传 home 选项），覆盖 env 接线
   const daemon = new CgrcbDaemon({ env: { CGRCB_HOME: home }, log: () => {} });
   const second = new CgrcbDaemon({ env: { CGRCB_HOME: home }, log: () => {} });
@@ -1010,5 +1012,184 @@ test("AC6 首建生活周期：实例目录首次创建即写 everEnrolled=false
     assert.equal(existsSync(ip.enrollment), false, "enroll 未成功则无 enrollment.json");
   } finally {
     await daemon.shutdown();
+  }
+});
+
+// ------------------------------------------- S02 二波修复回归（B-1..B-4 / A-NIT2 / NIT3）
+
+/** 造一个真实"陈旧 unix socket"：子进程 bind 后直接退出，socket 文件残留、无监听者。 */
+function createStaleSocket(sockPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [
+        "-e",
+        "require('node:net').createServer().listen(process.env.STALE_SOCK, () => process.exit(0));",
+      ],
+      { env: { ...process.env, STALE_SOCK: sockPath }, stdio: "ignore" },
+    );
+    child.once("error", reject);
+    child.once("exit", (code) =>
+      code === 0 ? resolve() : reject(new Error(`stale socket 子进程退出码 ${code}`)),
+    );
+  });
+}
+
+test("B-1 start 与 shutdown 并发：start 被中止，daemon 不复活", async () => {
+  const home = await tempDir("b1s");
+  const paths = cgrcbPaths(home);
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  const startP = daemon.start();
+  const stopP = daemon.shutdown(); // 同步置 stopRequested/stopping
+  const results = await Promise.allSettled([startP, stopP]);
+  assert.equal(results[1]!.status, "fulfilled");
+  assert.equal(daemon.isRunning, false, "start 不得在 shutdown 后复活 running=true");
+  assert.equal(existsSync(paths.socketPath), false, "socket 必须被清理");
+  assert.equal(existsSync(`${paths.socketPath}.lock`), false, "锁文件必须被清理");
+  await assert.rejects(
+    () => requestIpc(paths.socketPath, "status"),
+    (err: unknown) => (err as NodeJS.ErrnoException).code === "ENOENT",
+  );
+  // 后续 shutdown 仍幂等有效（旧 stopPromise 未被 start 覆盖）
+  await daemon.shutdown();
+  assert.equal(daemon.isRunning, false);
+});
+
+test("B-2 锁原子发布：空/不可解析锁一律 fail-safe 拒绝，不得判陈旧删除", async () => {
+  const home = await tempDir("b2lock");
+  const paths = cgrcbPaths(home);
+  await mkdir(home, { recursive: true });
+  const lock = `${paths.socketPath}.lock`;
+  await writeFile(lock, ""); // 空文件：在途/未知，绝不可当陈旧删
+  const d1 = new CgrcbDaemon({ home, log: () => {} });
+  await assert.rejects(
+    () => d1.start(),
+    (err: unknown) => err instanceof DaemonAlreadyRunningError,
+  );
+  assert.equal(existsSync(lock), true, "不可解析锁不得被删除");
+  assert.equal(await readFile(lock, "utf8"), "", "锁内容不得被改写");
+  await d1.shutdown();
+
+  // 清理后可正常启动；运行期锁内容为完整 JSON（原子发布，无空窗口）
+  await rm(lock, { force: true });
+  const d2 = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await d2.start();
+    const info = JSON.parse(await readFile(lock, "utf8")) as {
+      pid: number;
+      startedAt: string | null;
+    };
+    assert.equal(info.pid, process.pid);
+    assert.ok("startedAt" in info);
+  } finally {
+    await d2.shutdown();
+  }
+});
+
+test("B-3 socket 探测保守化：EACCES 的活 socket 不被删除（fail-safe）", async () => {
+  const home = await tempDir("b3sock");
+  const paths = cgrcbPaths(home);
+  await mkdir(home, { recursive: true });
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(paths.socketPath, () => resolve());
+  });
+  await chmod(paths.socketPath, 0o000); // 活 socket 但无权限 → connect EACCES
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await assert.rejects(() => daemon.start(), /拒绝接管/);
+    assert.equal(existsSync(paths.socketPath), true, "探测被拒时不得删除活 socket");
+  } finally {
+    await daemon.shutdown();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await rm(paths.socketPath, { force: true });
+    await rm(`${paths.socketPath}.lock`, { force: true });
+  }
+});
+
+test("B-4 孤儿锁回收：pid 被无关活进程复用 + 无 socket → 可接管", async () => {
+  const home = await tempDir("b4lock");
+  const paths = cgrcbPaths(home);
+  await mkdir(home, { recursive: true });
+  const lock = `${paths.socketPath}.lock`;
+  // pid 1（launchd）必然存活；startedAt 与真实身份不符 = pid 复用造成的孤儿锁
+  await writeFile(lock, JSON.stringify({ pid: 1, startedAt: "Thu Jan  1 00:00:00 1970" }));
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await daemon.start();
+    assert.equal(daemon.isRunning, true, "孤儿锁应被回收并接管");
+    assert.equal((await requestIpc(paths.socketPath, "status")).ok, true);
+    const info = JSON.parse(await readFile(lock, "utf8")) as { pid: number };
+    assert.equal(info.pid, process.pid, "锁已换为本进程");
+  } finally {
+    await daemon.shutdown();
+  }
+});
+
+test("A-NIT2 启动期 fault 的 pending restart 在启动成功后清除（无多余重建）", async () => {
+  const mock = await startMock();
+  const home = await tempDir("anit2");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("anit2");
+  const stub = registerStub(id);
+  await wantLoggedIn(home);
+  const daemon = makeDaemon(home, mock, {
+    authManager: new SlowAuthManager(120, paths.codexHome),
+    restartBaseDelayMs: 800,
+    restartMaxDelayMs: 800,
+  });
+  try {
+    await daemon.start();
+    const enableP = requestIpc(paths.socketPath, "enable", { agent: id });
+    await waitFor(
+      () => (daemon as unknown as { instances: Map<string, unknown> }).instances.has(id),
+      2000,
+      "instance starting",
+    );
+    // 模拟启动期结构性 fault → 排下 800ms 退避重启
+    (daemon as unknown as {
+      onInstanceFault: (id: string, err: unknown, context: string) => void;
+    }).onInstanceFault(id, new Error("boom"), "connectWs");
+    const res = await enableP; // 启动成功（~120ms，远早于 800ms 定时器）
+    assert.equal(res.ok, true, JSON.stringify(res));
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 5000, "online");
+    await new Promise((r) => setTimeout(r, 1000)); // 超过退避窗口
+    assert.equal(stub.instances, 1, "启动成功必须清除 pending restart，避免多余重建");
+    assert.equal((await ipcAgentStatus(paths.socketPath, id)).status, "online");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("NIT3 停止中的 enable/disable 返回 DAEMON_BUSY", async () => {
+  const mock = await startMock();
+  const home = await tempDir("nit3");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("nit3");
+  registerStub(id);
+  await wantLoggedIn(home);
+  // 用慢启动把 shutdown 的收敛窗口拉长，使 IPC 仍在监听
+  const daemon = makeDaemon(home, mock, {
+    authManager: new SlowAuthManager(300, paths.codexHome),
+  });
+  try {
+    await daemon.start();
+    const enableP = requestIpc(paths.socketPath, "enable", { agent: id });
+    await waitFor(
+      () => (daemon as unknown as { instances: Map<string, unknown> }).instances.has(id),
+      2000,
+      "instance starting",
+    );
+    const stopP = daemon.shutdown(); // stopping 同步置位；doShutdown 等待在途启动收敛
+    const en = await requestIpc(paths.socketPath, "enable", { agent: id });
+    assert.equal(en.ok, false);
+    assert.equal((en as { error: string }).error, "DAEMON_BUSY");
+    await enableP.catch(() => undefined);
+    await stopP;
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
   }
 });
