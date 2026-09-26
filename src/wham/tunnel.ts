@@ -14,6 +14,11 @@
  * - 通知 fan-out：跳过 initialize 时 capabilities.optOutNotificationMethods 声明的方法
  *   与 thread/unsubscribe 过的线程（由 AgentApp.clientState 提供状态）。
  * - 重连：WS 断开后延迟重连；token 临近过期则续期。
+ * - 出站可靠层（对齐 websocket.rs BoundedOutboundBuffer/背压）：server_message 先入每流
+ *   pending，WS open 且全局未 ack 缓冲 < 128 时分配 seq、入缓冲并发送；ack 清除 seq ≤ 游标
+ *   的缓冲帧并排空 pending；重连先按原 seq 重放缓冲再补发 pending（seq 单调连续）。pending
+ *   每流上限 256，溢出先合并相邻同 itemId delta，仍溢出才丢最旧（未分配 seq，无空洞）。
+ *   订阅游标：任意入站信封 cursor last-writer-wins，重连握手带 x-codex-subscribe-cursor。
  *
  * 与具体下游解耦：只依赖 AgentApp 接口（src/agents/types.ts）。
  *
@@ -84,9 +89,34 @@ export interface TunnelIdentity {
 
 type Enrollment = EnrollRemoteServerResponse;
 
+/**
+ * 已发未 ack 缓冲上限（对齐 codex remote_control CHANNEL_CAPACITY=128，全局计数）。
+ * 达到上限即背压：新事件不再分配 seq，转入该流 pending 等 ack 释放空位。
+ */
+const OUTBOUND_BUFFER_CAPACITY = 128;
+/** 每流 pending（未分配 seq）上限；溢出先合并相邻同 itemId delta，仍溢出才丢最旧。 */
+const OUTBOUND_PENDING_CAPACITY = 256;
+
 interface StreamState {
+  clientId: string;
+  streamId: string;
   lastAckedSeq: number;
   sentSeq: number;
+  /** 已发送未 ack 的 server_message 帧（seq 升序、整帧含 seq_id）：重连时原样重放。 */
+  buffer: Array<{ seq: number; frame: Record<string, unknown> }>;
+  /** WS 未就绪/缓冲满时暂存的 server_message 载荷（未分配 seq，可合并/丢弃）。 */
+  pending: unknown[];
+}
+
+/** item/agentMessage/delta 通知的合并判据（同 itemId 的相邻 delta 文本可拼接）。 */
+function deltaNotification(message: unknown): { itemId: string; delta: string } | null {
+  if (typeof message !== "object" || message === null) return null;
+  const m = message as { method?: unknown; params?: unknown };
+  if (m.method !== "item/agentMessage/delta") return null;
+  if (typeof m.params !== "object" || m.params === null) return null;
+  const p = m.params as { itemId?: unknown; delta?: unknown };
+  if (typeof p.itemId !== "string" || typeof p.delta !== "string") return null;
+  return { itemId: p.itemId, delta: p.delta };
 }
 
 export class WhamTunnel extends EventEmitter {
@@ -109,6 +139,14 @@ export class WhamTunnel extends EventEmitter {
   private readonly jsonlPath?: string;
   private readonly streams = new Map<string, StreamState>();
   private readonly chunkReassembler = new Map<string, Map<number, ClientEnvelope>>();
+  /** 全局已发未 ack 缓冲计数（= 各流 buffer 长度之和，背压判据）。 */
+  private bufferedUsed = 0;
+  /** 入站 client 信封携带的订阅游标（last-writer-wins），重连握手以 HTTP 头携带。 */
+  private subscribeCursor: string | null = null;
+  /** pending 相邻 delta 合并次数（累计，诊断/测试）。 */
+  private mergedPendingCount = 0;
+  /** pending 溢出丢弃最旧事件次数（累计，诊断/测试）。 */
+  private droppedPendingCount = 0;
   private enrollment: Enrollment | null = null;
   private ws: WebSocket | null = null;
   private cachedInstallationId: string | null = null;
@@ -165,6 +203,21 @@ export class WhamTunnel extends EventEmitter {
       serverName: this.name,
       installationId: this.cachedInstallationId,
       environmentId: this.enrollment.environment_id,
+    };
+  }
+
+  /**
+   * 出站可靠层状态快照（诊断/测试）：全局未 ack 缓冲数、各流 pending 合计、累计
+   * 合并/丢弃数。stop() 后 streams 清空 → buffered/pending 归零。
+   */
+  outboundBacklog(): { buffered: number; pending: number; merged: number; dropped: number } {
+    let pending = 0;
+    for (const state of this.streams.values()) pending += state.pending.length;
+    return {
+      buffered: this.bufferedUsed,
+      pending,
+      merged: this.mergedPendingCount,
+      dropped: this.droppedPendingCount,
     };
   }
 
@@ -315,6 +368,10 @@ export class WhamTunnel extends EventEmitter {
         [WS_HEADERS.installationId]: installationId,
         "User-Agent": `codex_cli_rs/${this.appServerVersion} (Mac OS ${release()}; ${process.arch}) ${this.agentLabel}`,
       };
+      // 订阅游标：任意入站信封记录过 cursor 后，重连握手必须携带最近值
+      if (this.subscribeCursor !== null) {
+        headers[WS_HEADERS.subscribeCursor] = this.subscribeCursor;
+      }
       this.openWebSocket(url, headers);
     })().catch((err) => {
       this.fault(err, "connectWs");
@@ -329,6 +386,8 @@ export class WhamTunnel extends EventEmitter {
       this.lastPongAt = Date.now();
       this.log(`wss 已连接 ${url}`);
       this.startPing();
+      // 重连（含首连）先重放未 ack 缓冲，再按序排空 pending，保证 seq 单调连续
+      this.replayBuffered();
     });
     ws.on("message", (data) => {
       // fire-and-forget：自带接收边界，agent 异常不得成为 unhandledRejection
@@ -413,6 +472,10 @@ export class WhamTunnel extends EventEmitter {
     this.stopped = true;
     this.stopPing();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    // 出站可靠层随 stop 一并清空：缓冲与 pending 全清，迟到出站帧被 stopped 拦截
+    this.streams.clear();
+    this.chunkReassembler.clear();
+    this.bufferedUsed = 0;
     const inFlight = this.renewalInFlight;
     // 二波3（有界授权加固）：app.close 抛错不得跳过 ws.close()/stopPromise 建立，
     // 否则旧 WS 泄漏且 stop() 永不收敛。吞错仅记日志，不改变其余语义。
@@ -443,6 +506,10 @@ export class WhamTunnel extends EventEmitter {
       return;
     }
     this.logFrame("wham→agent", envelope);
+    // 订阅游标：任意入站 client 信封的 cursor 都记为隧道单一最近值（last-writer-wins）
+    if (envelope.cursor !== undefined) {
+      this.subscribeCursor = envelope.cursor;
+    }
     switch (envelope.type) {
       case "client_message": {
         const message = envelope.message;
@@ -457,6 +524,9 @@ export class WhamTunnel extends EventEmitter {
       case "ack": {
         const state = this.streamState(envelope);
         state.lastAckedSeq = Math.max(state.lastAckedSeq, envelope.seq_id ?? 0);
+        // 清除已确认的缓冲帧，再按序排空 pending（缓冲有空位即分配 seq 发送）
+        this.removeAcked(state, state.lastAckedSeq);
+        this.drainPending(state);
         return;
       }
       case "ping": {
@@ -468,6 +538,9 @@ export class WhamTunnel extends EventEmitter {
       }
       case "client_closed": {
         const key = `${envelope.client_id}/${envelope.stream_id ?? ""}`;
+        // 保留既有语义：清流状态（含未 ack 缓冲与 pending；有意识偏差已在计划记录）
+        const removed = this.streams.get(key);
+        if (removed) this.bufferedUsed -= removed.buffer.length;
         this.streams.delete(key);
         this.chunkReassembler.delete(key);
         this.app.forgetClient({ clientId: envelope.client_id, streamId: envelope.stream_id ?? "" });
@@ -564,15 +637,30 @@ export class WhamTunnel extends EventEmitter {
   }
 
   private streamState(envelope: { client_id: string; stream_id?: string }): StreamState {
-    const key = `${envelope.client_id}/${envelope.stream_id ?? ""}`;
+    const clientId = envelope.client_id;
+    const streamId = envelope.stream_id ?? "";
+    const key = `${clientId}/${streamId}`;
     let state = this.streams.get(key);
     if (!state) {
-      state = { lastAckedSeq: 0, sentSeq: 0 };
+      state = {
+        clientId,
+        streamId,
+        lastAckedSeq: 0,
+        sentSeq: 0,
+        buffer: [],
+        pending: [],
+      };
       this.streams.set(key, state);
     }
     return state;
   }
 
+  /**
+   * 出站可靠层入口：server_message 一律先入 pending，再按序排空。
+   * - WS open 且缓冲有空位 → 立即分配 seq、入未 ack 缓冲、发送；
+   * - WS 未开或缓冲满（背压）→ 留在 pending（不分配 seq、不发送、不丢弃）；
+   * pong 永不缓冲/pending（连接未就绪即丢弃，维持现状）。
+   */
   private sendEnvelope(
     clientId: string,
     streamId: string,
@@ -580,22 +668,130 @@ export class WhamTunnel extends EventEmitter {
       | { type: "server_message"; message: unknown }
       | { type: "pong"; status: "active" | "unknown" },
   ): void {
-    const ws = this.ws;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      this.log(`! 发送失败（连接未就绪）: ${event.type}`);
+    if (this.stopped) {
+      // 迟到响应/事件：stop 后一律丢弃，不入队、不发送、不抛错
+      this.log(`! stop 后丢弃出站帧: ${event.type}`);
+      return;
+    }
+    if (event.type === "pong") {
+      const ws = this.ws;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        this.log(`! 发送失败（连接未就绪）: ${event.type}`);
+        return;
+      }
+      const state = this.streamState({ client_id: clientId, stream_id: streamId });
+      state.sentSeq += 1;
+      const frame = {
+        type: "pong",
+        client_id: clientId,
+        stream_id: streamId,
+        seq_id: state.sentSeq,
+        status: event.status,
+      };
+      ws.send(JSON.stringify(frame));
+      this.logFrame("agent→wham", frame);
       return;
     }
     const state = this.streamState({ client_id: clientId, stream_id: streamId });
-    state.sentSeq += 1;
-    const frame = {
-      type: event.type,
-      client_id: clientId,
-      stream_id: streamId,
-      seq_id: state.sentSeq,
-      ...(event.type === "server_message" ? { message: event.message } : { status: event.status }),
-    };
-    ws.send(JSON.stringify(frame));
-    this.logFrame("agent→wham", frame);
+    state.pending.push(event.message);
+    this.enforcePendingCap(state);
+    this.drainPending(state);
+  }
+
+  /** 重连/首连：按 seq 顺序原样重放各流未 ack 缓冲帧（不重置 sentSeq），再排空 pending。 */
+  private replayBuffered(): void {
+    const ws = this.ws;
+    if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+    for (const state of this.streams.values()) {
+      for (const entry of state.buffer) {
+        ws.send(JSON.stringify(entry.frame));
+        this.logFrame("agent→wham", entry.frame);
+      }
+      this.drainPending(state);
+    }
+  }
+
+  /** 移除 seq ≤ ackedSeq 的缓冲帧（ack 游标清除；未 ack 帧永不丢弃）。 */
+  private removeAcked(state: StreamState, ackedSeq: number): void {
+    if (state.buffer.length === 0) return;
+    const remaining = state.buffer.filter((entry) => entry.seq > ackedSeq);
+    this.bufferedUsed -= state.buffer.length - remaining.length;
+    state.buffer = remaining;
+  }
+
+  /** 按序排空 pending：缓冲有空位即分配 seq、入缓冲、发送（保持单调连续）。 */
+  private drainPending(state: StreamState): void {
+    const ws = this.ws;
+    if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
+    while (state.pending.length > 0 && this.bufferedUsed < OUTBOUND_BUFFER_CAPACITY) {
+      const message = state.pending.shift();
+      state.sentSeq += 1;
+      const frame = {
+        type: "server_message",
+        client_id: state.clientId,
+        stream_id: state.streamId,
+        seq_id: state.sentSeq,
+        message,
+      };
+      state.buffer.push({ seq: state.sentSeq, frame });
+      this.bufferedUsed += 1;
+      ws.send(JSON.stringify(frame));
+      this.logFrame("agent→wham", frame);
+    }
+  }
+
+  /**
+   * pending 溢出闭环（内存有界）：先合并相邻且同 itemId 的 item/agentMessage/delta
+   * （delta 文本拼接，不丢内容），仍超上限才丢最旧未发送事件（未分配 seq → 无 seq 空洞），
+   * 记 WARN。已发送未 ack 缓冲永不经过此路径。
+   */
+  private enforcePendingCap(state: StreamState): void {
+    if (state.pending.length <= OUTBOUND_PENDING_CAPACITY) return;
+    const merged = this.mergeAdjacentDeltas(state);
+    if (merged > 0) {
+      this.mergedPendingCount += merged;
+      this.log(
+        `pending 合并 ${merged} 条相邻 item/agentMessage/delta（${state.clientId}/${state.streamId}）`,
+      );
+    }
+    while (state.pending.length > OUTBOUND_PENDING_CAPACITY) {
+      state.pending.shift();
+      this.droppedPendingCount += 1;
+      this.warn(
+        `pending 溢出（${state.clientId}/${state.streamId}）丢弃最旧未发送事件（未分配 seq，无空洞）；` +
+          `累计丢弃 ${this.droppedPendingCount}`,
+      );
+    }
+  }
+
+  /** 把 pending 中相邻（队列位置相邻）且同 itemId 的 delta 合并为一条，返回合并次数。 */
+  private mergeAdjacentDeltas(state: StreamState): number {
+    const merged: unknown[] = [];
+    let count = 0;
+    for (const message of state.pending) {
+      const previous = merged.at(-1);
+      if (previous !== undefined && this.mergeDeltaInto(previous, message)) {
+        count += 1;
+        continue;
+      }
+      merged.push(message);
+    }
+    state.pending = merged;
+    return count;
+  }
+
+  /** 把 next 的 delta 文本并入 previous（同 itemId）；成功返回 true。 */
+  private mergeDeltaInto(previous: unknown, next: unknown): boolean {
+    const a = deltaNotification(previous);
+    const b = deltaNotification(next);
+    if (!a || !b || a.itemId !== b.itemId) return false;
+    const target = previous as { params?: unknown; emittedAtMs?: unknown };
+    const source = next as { params: Record<string, unknown>; emittedAtMs?: unknown };
+    target.params = { ...source.params, delta: a.delta + b.delta };
+    if (source.emittedAtMs !== undefined) {
+      target.emittedAtMs = source.emittedAtMs;
+    }
+    return true;
   }
 
   // ----------------------------------------------------------------- 故障

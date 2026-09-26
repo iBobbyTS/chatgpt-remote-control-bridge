@@ -78,6 +78,11 @@ export interface MockWhamOptions {
   pairFailuresRemaining?: number;
   /** 前 N 次 enroll 返回 500（测试注入"enroll 失败但实例目录已有历史"，enrollCount 仍计次）。 */
   enrollFailuresRemaining?: number;
+  /**
+   * 是否对 codex 的 server_message 自动回 ack（默认 true，兼容既有用例）。
+   * 关闭后需用 ack(seqId, streamId?) 手动确认（重放/未 ack 缓冲测试）。
+   */
+  autoAck?: boolean;
   log?: (line: string) => void;
 }
 
@@ -129,6 +134,13 @@ export class MockWhamServer {
   readonly scriptResults: Array<{ method: string; response: unknown }> = [];
   /** 收到的 codex 通知（method+params，测试断言用）。 */
   readonly receivedNotifications: Array<{ method: string; params: unknown }> = [];
+  /**
+   * 按 (client_id, stream_id, seq_id) 去重后的通知序列（重连重放不会重复计数），
+   * 保留 seqId 以断言「每条恰好一次、seq 全序无空洞」。原 receivedNotifications
+   * 保持原样（含重放造成的重复），供既有断言与重放计数。
+   */
+  readonly dedupedNotifications: Array<{ seqId: number; method: string; params: unknown }> = [];
+  private readonly dedupedNotificationKeys = new Set<string>();
   /**
    * server_message 到达时序（响应/服务器请求/通知同序记录，测试断言
    * 「响应先于某通知上线」的线上顺序用——分片消息在重组后记录一次）。
@@ -189,10 +201,13 @@ export class MockWhamServer {
   pairFailuresRemaining = 0;
   /** 剩余强制失败的 enroll 次数（测试注入 enroll 失败；计数仍递增）。 */
   enrollFailuresRemaining = 0;
+  /** 是否自动回 ack（默认 true）。测试可运行期置 false，再用 ack(seqId) 手动确认。 */
+  autoAck: boolean;
   private listRequestCount = 0;
 
   constructor(opts: MockWhamOptions) {
     this.opts = opts;
+    this.autoAck = opts.autoAck ?? true;
   }
 
   get port(): number {
@@ -663,6 +678,16 @@ export class MockWhamServer {
   }
 
   /**
+   * 只断开 codex↔mock 的 WS（模拟隧道掉线），HTTP/WSS 监听保持，供重连/重放测试。
+   * 不置 closed，不影响 REST 与后续重连（新连接由 tunnel 侧 scheduleReconnect 发起）。
+   */
+  dropCodexSocket(): void {
+    const ws = this.codexSocket;
+    this.codexSocket = null;
+    ws?.terminate();
+  }
+
+  /**
    * 处理 codex → mock 的 ServerEnvelope。
    * 收到 server_message（或重组完成的分片）后回 Ack（ClientEvent），
    * 并把 JSON-RPC 响应匹配给 pending 请求。
@@ -670,7 +695,7 @@ export class MockWhamServer {
   private async handleServerEnvelope(envelope: ServerEnvelope): Promise<void> {
     switch (envelope.type) {
       case "server_message": {
-        this.ack(envelope.seq_id, envelope.stream_id);
+        if (this.autoAck) this.ack(envelope.seq_id, envelope.stream_id);
         this.receivedSeqIds.push(envelope.seq_id);
         const message = envelope.message;
         if (!message) {
@@ -703,6 +728,15 @@ export class MockWhamServer {
               method: message.method,
             });
             this.receivedNotifications.push({ method: message.method, params: message.params });
+            const dedupKey = `${envelope.client_id}/${envelope.stream_id}/${envelope.seq_id}`;
+            if (!this.dedupedNotificationKeys.has(dedupKey)) {
+              this.dedupedNotificationKeys.add(dedupKey);
+              this.dedupedNotifications.push({
+                seqId: envelope.seq_id,
+                method: message.method,
+                params: message.params,
+              });
+            }
           }
           this.log(
             `← codex ${"id" in message ? `request(${message.method})` : `notify(${message.method})`} ` +
@@ -712,7 +746,7 @@ export class MockWhamServer {
         return;
       }
       case "server_message_chunk": {
-        this.ack(envelope.seq_id, envelope.stream_id, envelope.segment_id);
+        if (this.autoAck) this.ack(envelope.seq_id, envelope.stream_id, envelope.segment_id);
         const key = `${envelope.client_id}/${envelope.stream_id}`;
         let segments = this.reassembler.get(key);
         if (!segments) {
@@ -758,8 +792,11 @@ export class MockWhamServer {
     }
   }
 
-  /** 确认 codex 发出的 envelope（ClientEvent::Ack）。 */
-  private ack(seqId: number, streamId: string, segmentId?: number): void {
+  /**
+   * 确认 codex 发出的 envelope（ClientEvent::Ack）。autoAck 关闭时由测试手动调用
+   * （streamId 省略 = 模拟手机默认 stream，与 rpc 下发的 stream 一致）。
+   */
+  ack(seqId: number, streamId: string = this.mobileStreamId, segmentId?: number): void {
     this.sendClientEnvelope({
       type: "ack",
       client_id: this.mobileClientId,
@@ -868,14 +905,18 @@ export class MockWhamServer {
 
   // ---------------------------------------------------------------- helpers
 
-  /** 向 codex 发送 ClientEnvelope（手机/服务器方向）。 */
-  private sendClientEnvelope(envelope: ClientEnvelope): void {
+  /**
+   * 向 codex 发送 ClientEnvelope（手机/服务器方向）。`cursor` 非空时附加订阅游标字段
+   * （T6：验证 tunnel 以 x-codex-subscribe-cursor 重连）。
+   */
+  sendClientEnvelope(envelope: ClientEnvelope, cursor?: string): void {
     if (!this.codexSocket || this.codexSocket.readyState !== 1 /* OPEN */) {
       this.log(`! 发送失败（连接未就绪）: ${envelope.type}`);
       return;
     }
-    this.codexSocket.send(JSON.stringify(envelope));
-    void this.logFrame("mock→codex", envelope);
+    const frame = cursor === undefined ? envelope : { ...envelope, cursor };
+    this.codexSocket.send(JSON.stringify(frame));
+    void this.logFrame("mock→codex", frame);
   }
 
   private log(line: string): void {

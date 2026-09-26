@@ -11,6 +11,7 @@ import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import { MockWhamServer, type MockWhamOptions } from "../src/wham/mockServer.ts";
 import { WhamClient, WhamError } from "../src/wham/client.ts";
 import { WhamTunnel, ENROLLMENT_FILENAME } from "../src/wham/tunnel.ts";
+import { SimApp } from "../src/agents/sim/appServer.ts";
 import {
   REST_PATHS,
   WS_HEADERS,
@@ -179,6 +180,7 @@ async function startStubTunnel(opts: {
   mock: MockWhamServer;
   logs?: string[];
   pingIntervalMs?: number;
+  reconnectDelayMs?: number;
   onFault?: (err: unknown, context: string) => unknown;
 }): Promise<{ tunnel: WhamTunnel; app: StubAgentApp; home: string; authManager: BridgeAuthManager }> {
   const { authManager, home } = await makeAuthManager();
@@ -188,7 +190,7 @@ async function startStubTunnel(opts: {
     app: app as unknown as AgentApp,
     baseUrl: `http://127.0.0.1:${opts.mock.port}`,
     installationDir: home,
-    reconnectDelayMs: 0,
+    reconnectDelayMs: opts.reconnectDelayMs ?? 0,
     pingIntervalMs: opts.pingIntervalMs ?? 10_000,
     refreshThresholdMs: 60_000,
     log: (line) => opts.logs?.push(line),
@@ -927,7 +929,351 @@ test("二波3 tunnel.stop：app.close 抛错仍关闭 WS 且 stop() resolve（�
   }
 });
 
-function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+// ------------------------------------------------ S02 出站可靠层（seq/ack/重连重放）
+
+/** 去重升序 seq 列表。 */
+function uniqueSortedSeqs(seqs: number[]): number[] {
+  return [...new Set(seqs)].sort((a, b) => a - b);
+}
+
+/** 断言 seq 去重后为连续区间（全序无空洞）。 */
+function assertContiguousSeqs(seqs: number[], label: string): void {
+  const uniq = uniqueSortedSeqs(seqs);
+  assert.ok(uniq.length > 0, `${label}: 无 seq`);
+  assert.deepEqual(
+    uniq,
+    uniq.map((_, index) => uniq[0]! + index),
+    `${label}: seq 应全序无空洞，实际 ${JSON.stringify(uniq)}`,
+  );
+}
+
+/** 重连完成：mock 侧出现新 codex socket 且 tunnel 自认已连接。 */
+async function waitReconnect(server: MockWhamServer, tunnel: WhamTunnel): Promise<void> {
+  await waitFor(() => server["codexSocket"] !== null && tunnel.connected, 5000);
+}
+
+test("T1 未 ack 重放：drop 重连后原 seq 原样重发（receivedSeqIds 出现两次）", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server, reconnectDelayMs: 25 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } });
+
+    app.emit("event", { method: "replay/me", params: { n: 1 } } satisfies AgentNotification);
+    await waitFor(() => server.receivedSeqIds.length >= 2, 5000);
+    const seq = server.receivedSeqIds.at(-1)!;
+    assert.equal(tunnel.outboundBacklog().buffered, 2, "响应 + 通知均应留在未 ack 缓冲");
+
+    server.dropCodexSocket();
+    await waitReconnect(server, tunnel);
+
+    await waitFor(() => server.receivedSeqIds.filter((s) => s === seq).length >= 2, 5000);
+    assert.equal(
+      server.receivedSeqIds.filter((s) => s === seq).length,
+      2,
+      "未 ack 的 seq 应原样重发一次（不重置 seq）",
+    );
+    assert.equal(
+      server.receivedSeqIds.filter((s) => s === seq - 1).length,
+      2,
+      "重放应按 seq 顺序覆盖整段未 ack 缓冲",
+    );
+    assert.equal(tunnel.outboundBacklog().buffered, 2, "重放不得清空未 ack 缓冲");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T2 ack 后不重发：手动 ack 到 N，重连后 N 不再出现、后续事件 seq 连续 N+1", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server, reconnectDelayMs: 25 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } });
+
+    app.emit("event", { method: "n/1", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.dedupedNotifications.some((x) => x.method === "n/1"), 5000);
+    const n = server.dedupedNotifications.find((x) => x.method === "n/1")!.seqId;
+
+    server.ack(n); // 手动 ack 到 N（默认 mobile stream）
+    await waitFor(() => tunnel.outboundBacklog().buffered === 0, 5000);
+
+    server.dropCodexSocket();
+    await waitReconnect(server, tunnel);
+
+    app.emit("event", { method: "n/2", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.dedupedNotifications.some((x) => x.method === "n/2"), 5000);
+
+    assert.equal(server.receivedSeqIds.filter((s) => s === n).length, 1, "已 ack 的 seq 不得重发");
+    assert.deepEqual(
+      server.dedupedNotifications.map((x) => x.seqId),
+      [n, n + 1],
+      "后续事件 seq 应从 N+1 连续推进（无空洞）",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T3 断线 pending：等待段掉线，断线期间事件重连后按序补发且 seq 连续", async () => {
+  const authHome = await tempDir("simhome");
+  await writeAuthStore(authHome, fakeAuth());
+  const authManager = new BridgeAuthManager({ codexHome: authHome });
+  const mock = new MockWhamServer({ port: 0, autoScript: false, log: () => {} });
+  await mock.start();
+  const app = new SimApp({
+    codexHome: authHome,
+    stepDelayMs: 5,
+    deltaIntervalMs: 5,
+    deltaChars: 64,
+    commandWaitMs: 300,
+  });
+  const tunnel = new WhamTunnel({
+    authManager,
+    app,
+    baseUrl: `http://127.0.0.1:${mock.port}`,
+    installationDir: authHome,
+    reconnectDelayMs: 600,
+    pingIntervalMs: 60_000,
+    refreshThresholdMs: 60_000,
+    log: () => {},
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await mock.rpc("thread/start", { cwd: "/tmp-sim" })) as {
+      result: { thread: { id: string } };
+    };
+    await mock.rpc("turn/start", {
+      threadId: started.result.thread.id,
+      input: [{ type: "text", text: "TEST QUEUE" }],
+    });
+
+    // 断在第一次 wait 命令期间（turn 仍在进行）
+    await waitFor(
+      () =>
+        mock.dedupedNotifications.some(
+          (x) =>
+            x.method === "item/started" &&
+            (x.params as { item?: { type?: string } }).item?.type === "commandExecution",
+        ),
+      5000,
+      "未进入等待段",
+    );
+    mock.dropCodexSocket();
+    await waitFor(() => tunnel.connected === false, 5000);
+    // 断线期间 sim 继续产出 → 进入 pending（不丢、暂不分配 seq）
+    await waitFor(() => tunnel.outboundBacklog().pending > 0, 3000, "断线期间未积压 pending");
+
+    await waitReconnect(mock, tunnel);
+    await waitFor(
+      () =>
+        mock.dedupedNotifications.some(
+          (x) =>
+            x.method === "turn/completed" &&
+            (x.params as { turn?: { status?: string } }).turn?.status === "completed",
+        ),
+      15_000,
+      "重连后 turn 未完成",
+    );
+
+    const seqs = mock.dedupedNotifications.map((x) => x.seqId);
+    assert.equal(new Set(seqs).size, seqs.length, "去重后每条通知恰好一次");
+    assertContiguousSeqs(mock.receivedSeqIds, "T3 receivedSeqIds");
+    assert.equal(tunnel.outboundBacklog().pending, 0, "重连后 pending 应排空");
+  } finally {
+    await tunnel.stop();
+    await mock.stop();
+  }
+});
+
+test("T4 去重判据：重放 + pending + 新事件交错，dedupedNotifications 每条一次、seq 全序无空洞", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server, reconnectDelayMs: 200 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } });
+
+    app.emit("event", { method: "t4/a", params: {} } satisfies AgentNotification);
+    app.emit("event", { method: "t4/b", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.dedupedNotifications.length >= 2, 5000);
+
+    server.dropCodexSocket();
+    await waitFor(() => tunnel.connected === false, 5000);
+    app.emit("event", { method: "t4/c", params: {} } satisfies AgentNotification);
+    app.emit("event", { method: "t4/d", params: {} } satisfies AgentNotification);
+    await waitFor(() => tunnel.outboundBacklog().pending === 2, 3000);
+
+    await waitReconnect(server, tunnel);
+    // 重连后再发新事件：与重放缓冲、pending 补发交错
+    app.emit("event", { method: "t4/e", params: {} } satisfies AgentNotification);
+
+    await waitFor(() => server.dedupedNotifications.length >= 5, 5000, "t4/a..e 未全部到达");
+    assert.deepEqual(
+      server.dedupedNotifications.map((x) => x.method),
+      ["t4/a", "t4/b", "t4/c", "t4/d", "t4/e"],
+      "通知应按序补发（重放不改变顺序、不重复）",
+    );
+    const seqs = server.dedupedNotifications.map((x) => x.seqId);
+    assert.equal(new Set(seqs).size, seqs.length, "每条通知 seq 唯一（每条恰好一次）");
+    assertContiguousSeqs(server.receivedSeqIds, "T4 receivedSeqIds");
+    assert.ok(
+      new Set(server.receivedSeqIds).size < server.receivedSeqIds.length,
+      "重放应产生重复帧（原始序）但去重后无重复",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T5 client_closed：清流状态（缓冲清零、后续通知不再分发）", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } });
+    app.emit("event", { method: "t5/before", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.dedupedNotifications.some((x) => x.method === "t5/before"), 5000);
+    assert.ok(tunnel.outboundBacklog().buffered >= 2, "关流前缓冲应有未 ack 帧");
+
+    server.sendClientEnvelope({
+      type: "client_closed",
+      client_id: server.mobileClientId,
+      stream_id: server.mobileStreamId,
+    });
+    await waitFor(() => tunnel.outboundBacklog().buffered === 0, 5000);
+
+    const before = server.receivedSeqIds.length;
+    app.emit("event", { method: "t5/after", params: {} } satisfies AgentNotification);
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(server.receivedSeqIds.length, before, "关流后不得再分发通知");
+    assert.ok(!server.dedupedNotifications.some((x) => x.method === "t5/after"));
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T6 cursor 头：手机 envelope 带 cursor 后重连握手携带 x-codex-subscribe-cursor", async () => {
+  const { server } = await startMock();
+  const { tunnel } = await startStubTunnel({ mock: server, reconnectDelayMs: 25 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await waitFor(() => server["codexSocket"] !== null, 5000);
+    assert.equal(
+      server["codexHeaders"][WS_HEADERS.subscribeCursor],
+      undefined,
+      "无 cursor 时不得发送订阅游标头",
+    );
+
+    const cursor = "cursor-abc-1";
+    server.sendClientEnvelope(
+      { type: "ping", client_id: server.mobileClientId, stream_id: server.mobileStreamId },
+      cursor,
+    );
+    // pong 回来 = 该入站信封已被处理（cursor 已记录，last-writer-wins）
+    await waitFor(() => server.receivedPongs.length > 0, 5000);
+
+    server.dropCodexSocket();
+    await waitReconnect(server, tunnel);
+    await waitFor(
+      () => server["codexHeaders"][WS_HEADERS.subscribeCursor] === cursor,
+      5000,
+      "重连握手应带最近 cursor",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T7 容量闭环：128 缓冲满 + pending 合并/丢最旧 + 已发缓冲不丢、seq 无空洞", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }); // seq 1 入缓冲
+
+    // 灌满全局未 ack 缓冲（128）：1 个响应 + 127 条通知，其余进 pending
+    for (let i = 0; i < 200; i += 1) {
+      app.emit("event", { method: `fill/${i}`, params: {} } satisfies AgentNotification);
+    }
+    await waitFor(() => server.receivedSeqIds.length >= 128, 5000);
+    assert.equal(tunnel.outboundBacklog().buffered, 128, "缓冲应恰好灌满 128");
+    assert.equal(server.receivedSeqIds.length, 128, "缓冲满后不得再发送新帧（背压）");
+    assert.equal(tunnel.outboundBacklog().pending, 73, "溢出部分应留在 pending");
+
+    // 相邻同 itemId delta 合并：pending 不超上限、内容不丢
+    for (let i = 0; i < 400; i += 1) {
+      app.emit("event", {
+        method: "item/agentMessage/delta",
+        params: { threadId: "th-1", turnId: "tu-1", itemId: "it-1", delta: `d${i}` },
+        threadId: "th-1",
+      } satisfies AgentNotification);
+    }
+    assert.ok(tunnel.outboundBacklog().merged > 0, "相邻同 itemId delta 应被合并");
+    assert.ok(tunnel.outboundBacklog().pending <= 256, "pending 不得超过上限");
+
+    // 不可合并事件持续涌入 → 丢最旧 pending + WARN
+    for (let i = 0; i < 400; i += 1) {
+      app.emit("event", { method: `uniq/${i}`, params: {} } satisfies AgentNotification);
+    }
+    const backlog = tunnel.outboundBacklog();
+    assert.ok(backlog.dropped > 0, "无法合并时应丢最旧 pending");
+    assert.ok(backlog.pending <= 256, "pending 始终有界");
+    assert.equal(backlog.buffered, 128, "已发送未 ack 缓冲任何路径都不得丢弃");
+    assert.ok(
+      tunnel.warnings.some((w) => w.includes("pending 溢出")),
+      `应记录 WARN: ${JSON.stringify(tunnel.warnings.slice(-2))}`,
+    );
+    assert.equal(server.receivedSeqIds.length, 128, "丢弃/合并不得产生新的已发送帧");
+    assertContiguousSeqs(server.receivedSeqIds, "T7 receivedSeqIds");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("T8 stop：迟到出站帧丢弃不抛错、无帧发送、缓冲已清", async () => {
+  const { server } = await startMock();
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } });
+    app.emit("event", { method: "t8/before", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.dedupedNotifications.some((x) => x.method === "t8/before"), 5000);
+
+    await tunnel.stop();
+    assert.deepEqual(tunnel.outboundBacklog(), { buffered: 0, pending: 0, merged: 0, dropped: 0 });
+
+    const sentBefore = server.receivedSeqIds.length;
+    assert.doesNotThrow(() =>
+      tunnel["sendEnvelope"]("late-client", "late-stream", {
+        type: "server_message",
+        message: { method: "late/event", params: {} },
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(server.receivedSeqIds.length, sentBefore, "stop 后不得再发送任何帧");
+    assert.deepEqual(tunnel.outboundBacklog(), { buffered: 0, pending: 0, merged: 0, dropped: 0 });
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+function waitFor(predicate: () => boolean, timeoutMs = 5000, label?: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();
     const timer = setInterval(() => {
@@ -936,7 +1282,7 @@ function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
         resolve();
       } else if (Date.now() - start > timeoutMs) {
         clearInterval(timer);
-        reject(new Error("waitFor 超时"));
+        reject(new Error(label ? `waitFor 超时: ${label}` : "waitFor 超时"));
       }
     }, 20);
   });
