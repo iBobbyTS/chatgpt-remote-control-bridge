@@ -491,8 +491,14 @@ export class PairingManager {
 async function writeJsonAtomic(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true });
   const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
-  await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  await rename(tmp, path);
+  try {
+    await writeFile(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, path);
+  } finally {
+    // 三波微修：写/rename 失败（路径被占、盘满等）也必须清理 tmp，否则 tick 重试会持续遗留
+    // pairing.json.tmp-*。成功路径 tmp 已被 rename 消费，此处 rm 为无害 no-op。
+    await rm(tmp, { force: true }).catch(() => undefined);
+  }
 }
 
 function errorMessage(err: unknown): string {

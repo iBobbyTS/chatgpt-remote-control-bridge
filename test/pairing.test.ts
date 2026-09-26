@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, after } from "node:test";
 import { BridgeAuthManager } from "../src/auth/manager.ts";
@@ -999,6 +999,35 @@ test("二波4 发码写盘瞬时失败 → 不残留内存 pending，tick 补齐
     assert.ok(mock.pairRequests.length >= 2, "应有重试");
     const ok = await ipcPairStatus(paths.socketPath, id);
     assert.ok(ok.pending?.code, "补齐后 pair-status 可见 pending");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("三波1 原子写失败清理 tmp：持续写失败后实例目录无 tmp 残留", async () => {
+  const mock = await startMock();
+  const home = await tempDir("p-w5");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("pw5");
+  registerStub(id);
+  await wantLoggedIn(home);
+  const ip = instancePaths(join(paths.instancesDir, id));
+  // 占用 pairing.json 为目录 → rename(tmp, pairing.json) 持续失败
+  await mkdir(ip.pairing, { recursive: true });
+
+  const daemon = makeDaemon(home, mock);
+  try {
+    await daemon.start();
+    const en = await requestIpc(paths.socketPath, "enable", { agent: id });
+    assert.equal(en.ok, true, JSON.stringify(en));
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).online, 5000, "online");
+    // 持续写失败若干次（tick 每次重试都写 tmp、rename 失败）
+    await waitFor(() => mock.pairRequests.length >= 3, 5000, "持续重试发码");
+
+    const entries = await readdir(ip.dir);
+    const tmps = entries.filter((e) => e.startsWith("pairing.json.tmp-"));
+    assert.deepEqual(tmps, [], `写失败不得遗留 tmp: ${JSON.stringify(entries)}`);
   } finally {
     await daemon.shutdown();
     await mock.stop();
