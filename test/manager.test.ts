@@ -10,7 +10,10 @@ import {
   authJsonPath,
   type AuthDotJson,
 } from "../src/auth/store.ts";
-import { startLoginServer } from "../src/auth/loginServer.ts";
+import {
+  startLoginServer,
+  type CallbackOutcome,
+} from "../src/auth/loginServer.ts";
 import type { FetchLike } from "../src/auth/oauth.ts";
 
 const cleanupDirs: string[] = [];
@@ -261,32 +264,44 @@ test("authHeaders：临期先刷新，产出 Bearer + chatgpt-account-id", async
 });
 
 test("loginServer：正确回调拿到 code；错误 state 不放行", async () => {
-  const server = await startLoginServer({ state: "expected-state", timeoutMs: 3000 });
-  const callbackPromise = server.waitForCallback;
+  // port:0 由系统分配临时端口，避免与并发套件/残留实例争用 1455 导致 ECONNRESET。
+  const server = await startLoginServer({ port: 0, state: "expected-state", timeoutMs: 3000 });
+  let callbackPromise: Promise<CallbackOutcome> | undefined;
+  try {
+    callbackPromise = server.waitForCallback;
 
-  // 错误 state：不应 resolve
-  const bad = await fetch(`http://127.0.0.1:${server.port}/auth/callback?code=x&state=wrong`);
-  assert.equal(bad.status, 400);
+    // 错误 state：不应 resolve
+    const bad = await fetch(`http://127.0.0.1:${server.port}/auth/callback?code=x&state=wrong`);
+    assert.equal(bad.status, 400);
 
-  // 正确 state：resolve 出 code
-  const good = await fetch(
-    `http://127.0.0.1:${server.port}/auth/callback?code=abc&state=expected-state`,
-  );
-  assert.equal(good.status, 200);
-  const outcome = await callbackPromise;
-  assert.equal(outcome.code, "abc");
-  await server.close();
+    // 正确 state：resolve 出 code
+    const good = await fetch(
+      `http://127.0.0.1:${server.port}/auth/callback?code=abc&state=expected-state`,
+    );
+    assert.equal(good.status, 200);
+    const outcome = await callbackPromise;
+    assert.equal(outcome.code, "abc");
+  } finally {
+    // 任意断言失败也保证关闭服务器，避免 1455/临时端口 LISTEN 泄漏导致 node:test 子进程不退出。
+    await server.close();
+    await callbackPromise?.catch(() => {});
+  }
 });
 
 test("loginServer：oauth error 回调 → reject 并带错误信息", async () => {
-  const server = await startLoginServer({ state: "s", timeoutMs: 3000 });
-  const promise = assert.rejects(
-    server.waitForCallback,
-    /oauth callback error: access_denied/,
-  );
-  await fetch(
-    `http://127.0.0.1:${server.port}/auth/callback?error=access_denied&error_description=no+entitlement`,
-  );
-  await promise;
-  await server.close();
+  const server = await startLoginServer({ port: 0, state: "s", timeoutMs: 3000 });
+  let rejection: Promise<void> | undefined;
+  try {
+    rejection = assert.rejects(
+      server.waitForCallback,
+      /oauth callback error: access_denied/,
+    );
+    await fetch(
+      `http://127.0.0.1:${server.port}/auth/callback?error=access_denied&error_description=no+entitlement`,
+    );
+    await rejection;
+  } finally {
+    await server.close();
+    await rejection?.catch(() => {});
+  }
 });
