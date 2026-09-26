@@ -527,6 +527,41 @@ test("NIT2 故障回调 rejected Promise：不产生 unhandledRejection、tunnel
   }
 });
 
+test("MATERIAL safeEmit 捕获异步监听器：reject 不产生 unhandledRejection、后续监听器仍调用、tunnel 存活", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  const logs: string[] = [];
+  const { server } = await startMock();
+  const { tunnel } = await startStubTunnel({ mock: server, logs });
+  let secondCalls = 0;
+  // enrollment 在 start() 内发出：首个 async 监听器 reject，第二个仍必须被调用
+  tunnel.on("enrollment", async () => {
+    throw new Error("listener boom");
+  });
+  tunnel.on("enrollment", () => {
+    secondCalls += 1;
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await new Promise((r) => setTimeout(r, 100));
+    assert.ok(secondCalls >= 1, "首个监听器失败不得阻断后续订阅者");
+    assert.deepEqual(unhandled, [], "监听器 rejection 不得成为 unhandledRejection");
+    assert.ok(
+      logs.some((l) => l.includes("emit enrollment async")),
+      `监听器 rejection 应被记录: ${JSON.stringify(logs)}`,
+    );
+    // tunnel 存活
+    const ok = (await server.rpc("echo", {}, 5000)) as { result?: { method?: string } };
+    assert.equal(ok.result?.method, "echo");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 test("AC7 临期续期（成功）：WSS 不断线、refresh-first、enroll 增量 0、身份不变", async () => {
   const logs: string[] = [];
   const { server } = await startMock({ tokenTtlMs: 150, refreshTokenTtlMs: 60_000 });

@@ -633,12 +633,24 @@ export class WhamTunnel extends EventEmitter {
     this.warn(line);
   }
 
-  /** emit 的同步 listener 异常不得打断 tunnel 主流程。 */
+  /**
+   * 逐个调用监听器（rawListeners 保留 once 语义），使同步 throw 与返回的
+   * rejected Promise 都不成为 unhandledRejection，且单个监听器失败不阻断后续订阅者。
+   */
   private safeEmit(event: string, ...args: unknown[]): void {
-    try {
-      this.emit(event, ...args);
-    } catch (emitErr) {
-      this.log(`! [emit ${event}] ${errorMessage(emitErr)}`);
+    for (const listener of this.rawListeners(event)) {
+      let result: unknown;
+      try {
+        result = (listener as (...a: unknown[]) => unknown)(...args);
+      } catch (listenerErr) {
+        this.log(`! [emit ${event}] ${errorMessage(listenerErr)}`);
+        continue;
+      }
+      if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+        void (result as Promise<unknown>).catch((listenerErr) => {
+          this.log(`! [emit ${event} async] ${errorMessage(listenerErr)}`);
+        });
+      }
     }
   }
 
