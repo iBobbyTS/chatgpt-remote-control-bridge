@@ -8,7 +8,7 @@
  */
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, stat, symlink, utimes, writeFile } from "node:fs/promises";
 import { existsSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { test, after } from "node:test";
@@ -154,7 +154,7 @@ test("AC1 三组命令可达：install 写 plist、chatgpt status、serving-agen
   const runner: LaunchctlRunner = async (args) => {
     commands.push(args);
     // print 报告未加载：waitUnloaded 立即返回（不等待），install 随后 bootstrap
-    if (args[0] === "print") return { code: 3, stdout: "", stderr: "not found" };
+    if (args[0] === "print") return { code: 3, stdout: "", stderr: 'Could not find service "com.cgrcb.bridge"' };
     return { code: 0, stdout: "", stderr: "" };
   };
 
@@ -327,7 +327,40 @@ test("AC2 launchd 执行：bootout 成功但卸载超时 → 报错", async () =
     return { code: 0, stdout: "", stderr: "" };
   };
   const manager = new LaunchdManager(ctx, runner, () => {}, { unloadTimeoutMs: 150 });
-  await assert.rejects(() => manager.stop(), /仍未卸载/);
+  await assert.rejects(() => manager.stop(), /仍未确认卸载/);
+});
+
+test("AC2 launchd：print 失败无 not-loaded 特征（权限错误）→ 状态未知按仍加载，stop/uninstall 报错", async () => {
+  const home = await tempDir("d2p");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const ctx: LaunchdContext = { home, env, nodePath: "/usr/bin/node", daemonEntry: "/app/main.js", uid: 501 };
+  const plistFile = join(home, "Library", "LaunchAgents", "com.cgrcb.bridge.plist");
+  await mkdir(join(home, "Library", "LaunchAgents"), { recursive: true });
+  await writeFile(plistFile, "old");
+  const runner: LaunchctlRunner = async (args) => {
+    if (args[0] === "print") return { code: 1, stdout: "", stderr: "Operation not permitted" };
+    if (args[0] === "bootout") return { code: 0, stdout: "", stderr: "" };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const manager = new LaunchdManager(ctx, runner, () => {}, { unloadTimeoutMs: 150 });
+  await assert.rejects(() => manager.stop(), /仍未确认卸载/);
+  await assert.rejects(() => manager.uninstall(), /仍未确认卸载/);
+  assert.equal(existsSync(plistFile), true, "状态未知时不得删除 plist");
+});
+
+test("AC2 launchd：print 明确 not-loaded 特征 → stop 幂等成功且不 bootout", async () => {
+  const home = await tempDir("d2n");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const ctx: LaunchdContext = { home, env, nodePath: "/usr/bin/node", daemonEntry: "/app/main.js", uid: 501 };
+  const calls: string[][] = [];
+  const runner: LaunchctlRunner = async (args) => {
+    calls.push(args);
+    if (args[0] === "print") return { code: 3, stdout: "", stderr: 'Could not find service "com.cgrcb.bridge"' };
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  const manager = new LaunchdManager(ctx, runner);
+  await manager.stop();
+  assert.equal(calls.some((c) => c[0] === "bootout"), false, "确认未加载不应 bootout");
 });
 
 test("AC2 launchd 执行：restart 中 bootout 后 bootstrap 瞬时失败自动重试", async () => {
@@ -340,7 +373,7 @@ test("AC2 launchd 执行：restart 中 bootout 后 bootstrap 瞬时失败自动�
   const runner: LaunchctlRunner = async (args) => {
     calls.push(args);
     if (args[0] === "print") {
-      return loaded ? { code: 0, stdout: "state = running", stderr: "" } : { code: 3, stdout: "", stderr: "not found" };
+      return loaded ? { code: 0, stdout: "state = running", stderr: "" } : { code: 3, stdout: "", stderr: 'Could not find service "com.cgrcb.bridge"' };
     }
     if (args[0] === "bootout") {
       loaded = false;
@@ -390,7 +423,7 @@ test("AC3 IPC 三态降级：在线/未运行(ENOENT)/未登录", async () => {
   // NIT ③：status 一律注入假 launchctl 执行器，绝不真调系统 launchctl
   const noLaunchd: LaunchctlRunner = async (args) =>
     args[0] === "print"
-      ? { code: 3, stdout: "", stderr: "not found" }
+      ? { code: 3, stdout: "", stderr: 'Could not find service "com.cgrcb.bridge"' }
       : { code: 0, stdout: "", stderr: "" };
 
   // 在线（注入）：status 成功；--json 形态含 auth
@@ -469,7 +502,7 @@ test("AC3 真实 IPC：daemon 在线 status 汇总；enable 未登录返回 NOT_
   const env = { ...process.env, CGRCB_HOME: home };
   const noLaunchd: LaunchctlRunner = async (args) =>
     args[0] === "print"
-      ? { code: 3, stdout: "", stderr: "not found" }
+      ? { code: 3, stdout: "", stderr: 'Could not find service "com.cgrcb.bridge"' }
       : { code: 0, stdout: "", stderr: "" };
   const daemon = await startDaemon(home);
   try {
@@ -763,6 +796,84 @@ test("AC7 持有者失锁：提交前 assertOwner 失败 → 刷新丢弃、删�
     /锁已丢失/,
   );
   assert.ok(await readAuthStore(home), "失锁删除不得删除凭证");
+});
+
+test("AC7 误偷活锁还原不覆盖第三方新锁、隔离文件清理", async () => {
+  const home = await tempDir("d7v");
+  const old = Date.now() - 60_000;
+  // 本进程 pid 存活但 mtime 陈旧 → 初次判 stale（随后在抢占点变新鲜 = 活锁误判）
+  await writeFile(
+    authLockPath(home),
+    JSON.stringify({ pid: process.pid, startedAt: old, owner: "victim" }),
+  );
+  await utimes(authLockPath(home), new Date(old), new Date(old));
+  let thirdContent = "";
+  const attempt = withAuthLock(
+    home,
+    async () => {
+      /* 不应进入临界区：锁已被第三方接管 */
+    },
+    {
+      staleMs: 50,
+      heartbeatMs: 20,
+      timeoutMs: 400,
+      hooks: {
+        // 抢占点：模拟活持有者心跳（mtime 变新鲜）→ 重读判定活锁 → 走还原
+        beforeReclaim: async () => {
+          const now = new Date();
+          await utimes(authLockPath(home), now, now);
+        },
+        // 还原前：第三方在空缺窗口 wx 取新锁
+        beforeRestore: async () => {
+          thirdContent = JSON.stringify({ pid: process.pid, startedAt: Date.now(), owner: "third" });
+          await writeFile(authLockPath(home), thirdContent, { flag: "wx" });
+        },
+      },
+    },
+  );
+  await assert.rejects(() => attempt, /超时/);
+  assert.equal(
+    await readFile(authLockPath(home), "utf8"),
+    thirdContent,
+    "第三方新锁必须原样保留（link 不覆盖式还原）",
+  );
+  const leftovers = (await readdir(home)).filter(
+    (f) => f.includes(".reclaim-") || f.includes(".release-"),
+  );
+  assert.deepEqual(leftovers, [], "隔离文件应已清理");
+});
+
+test("AC7 失锁后心跳停止：不触碰第三方锁文件 mtime", async () => {
+  const home = await tempDir("d7w");
+  const acquired = deferred();
+  const release = deferred();
+  const holder = withAuthLock(
+    home,
+    async () => {
+      acquired.resolve();
+      await release.promise;
+    },
+    { staleMs: 5000, heartbeatMs: 40, timeoutMs: 5000 },
+  );
+  await acquired.promise;
+  // 模拟被抢占：移除原锁，写入第三方锁（同活 pid，不同 owner）
+  await rm(authLockPath(home), { force: true });
+  await writeFile(
+    authLockPath(home),
+    JSON.stringify({ pid: process.pid, startedAt: Date.now(), owner: "third" }),
+  );
+  await sleep(120); // 让心跳察觉失主并停跳
+  const before = (await stat(authLockPath(home))).mtimeMs;
+  await sleep(200); // 多个心跳周期
+  const after = (await stat(authLockPath(home))).mtimeMs;
+  assert.equal(after, before, "失锁后心跳不得更新第三方锁文件 mtime");
+  release.resolve();
+  await holder;
+  assert.equal(
+    JSON.parse(await readFile(authLockPath(home), "utf8")).owner,
+    "third",
+    "释放不覆盖第三方锁",
+  );
 });
 
 test("B-4 auth-reset 失败仍恢复 autoRefresh 巡检", async () => {

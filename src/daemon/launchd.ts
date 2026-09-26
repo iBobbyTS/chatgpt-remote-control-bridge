@@ -254,40 +254,55 @@ export class LaunchdManager {
     }
   }
 
-  /** 轮询直到服务未加载；超时返回 false。 */
+  /**
+   * `launchctl print` 三态：exit 0 → loaded；非零且输出含"找不到服务"特征 → not-loaded；
+   * 其他非零（权限/执行错误等）→ unknown（**保守视为仍加载**，不得当假成功）。
+   */
+  private async probeLoaded(): Promise<"loaded" | "not-loaded" | "unknown"> {
+    const result = await this.run(printStep(this.ctx).args);
+    if (result.code === 0) return "loaded";
+    const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    if (/could not find service|no such process|service not found|could not find domain/.test(text)) {
+      return "not-loaded";
+    }
+    return "unknown";
+  }
+
+  /** 轮询直到服务确认未加载（not-loaded）；loaded/unknown 都继续等，超时返回 false。 */
   private async waitUnloaded(timeoutMs = this.unloadTimeoutMs): Promise<boolean> {
     const deadline = Date.now() + timeoutMs;
     for (;;) {
-      const result = await this.run(printStep(this.ctx).args);
-      if (result.code !== 0) return true;
+      if ((await this.probeLoaded()) === "not-loaded") return true;
       if (Date.now() >= deadline) return false;
       await delay(50);
     }
   }
 
   /**
-   * 若服务已加载则 bootout（B-2：仅"本就未加载"幂等成功，真实失败/卸载超时报错）。
-   * bootout 失败时再查一次加载态：期间已被卸载（竞态）也算幂等成功。
+   * 若服务已加载则 bootout（B-2：仅"确认未加载"幂等成功；loaded/unknown 都必须 bootout 并
+   * 确认卸载，真实失败/卸载超时/状态未知报错）。bootout 失败时再探一次：确认未加载（竞态）也算成功。
    * 返回是否实际执行了 bootout。
    */
   private async stopServiceIfLoaded(): Promise<boolean> {
-    if (!(await this.isLoaded())) return false;
+    if ((await this.probeLoaded()) === "not-loaded") return false;
     const result = await this.run(["bootout", serviceTarget(this.ctx)]);
     if (result.code !== 0) {
-      if (!(await this.isLoaded())) return true; // 竞态：期间已卸载
+      if ((await this.probeLoaded()) === "not-loaded") return true; // 竞态：期间已卸载
       throw new Error(
         `launchctl bootout 失败（exit ${result.code}）：${result.stderr.trim() || "(no stderr)"}`,
       );
     }
     if (!(await this.waitUnloaded())) {
-      throw new Error(`launchctl bootout 后服务仍未卸载（等待 ${this.unloadTimeoutMs}ms 超时）`);
+      throw new Error(
+        `launchctl bootout 后服务仍未确认卸载（等待 ${this.unloadTimeoutMs}ms 超时；状态未知按仍加载处理）`,
+      );
     }
     return true;
   }
 
+  /** 对外：确认已加载才 true（unknown 视为未确认 = false）。 */
   async isLoaded(): Promise<boolean> {
-    const result = await this.run(printStep(this.ctx).args);
-    return result.code === 0;
+    return (await this.probeLoaded()) === "loaded";
   }
 
   async status(): Promise<LaunchctlStatus> {

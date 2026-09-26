@@ -16,7 +16,7 @@
  *   `baseAccessToken` 与磁盘当前 access_token 不一致（已被删除/替换/新登录）即丢弃写回。
  */
 import { randomBytes } from "node:crypto";
-import { chmod, mkdir, open, readFile, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parseIdTokenInfo, type IdTokenInfo } from "./jwt.ts";
 
@@ -105,6 +105,8 @@ export interface AuthCommitHooks {
   onLockAcquired?: () => Promise<void> | void;
   /** 抢占陈旧锁前（模拟"双回收者并发"：让两个回收者同时进入抢占点）。 */
   beforeReclaim?: () => Promise<void> | void;
+  /** 还原隔离文件前（模拟"误偷活锁时第三方已取新锁"：注入空缺窗口的新锁）。 */
+  beforeRestore?: () => Promise<void> | void;
   /** 临界区内、写盘/删除前。 */
   beforeCommit?: () => Promise<void> | void;
 }
@@ -200,20 +202,31 @@ async function lockView(lockPath: string, staleMs: number): Promise<LockView> {
   return isPidAlive(payload.pid) && fresh ? "live" : "stale";
 }
 
-/** 把隔离文件还原到锁路径；锁路径已被他人重建则放弃还原（删隔离副本）。 */
-async function restoreQuarantine(quarantine: string, lockPath: string): Promise<void> {
+/**
+ * 把隔离文件**不覆盖式**还原到锁路径：`link(quarantine, lockPath)` + `unlink(quarantine)`。
+ * 不用 rename——POSIX rename 会**静默覆盖**第三方在空缺窗口重建的新锁；link 撞 EEXIST 即
+ * 「已有新锁」→ 不覆盖、删隔离副本，按"已被接管"处理。返回 `"restored"` / `"taken"`。
+ */
+async function restoreQuarantine(
+  quarantine: string,
+  lockPath: string,
+  hooks?: AuthCommitHooks,
+): Promise<"restored" | "taken"> {
+  await hooks?.beforeRestore?.();
   try {
-    await rename(quarantine, lockPath);
+    await link(quarantine, lockPath); // EEXIST = 第三方已重建新锁，绝不覆盖
   } catch {
-    // 锁路径已被他人重建（EEXIST）或隔离文件已不在：删隔离副本，勿覆盖他人锁
     await rm(quarantine, { force: true }).catch(() => {});
+    return "taken";
   }
+  await rm(quarantine, { force: true }).catch(() => {}); // 去掉隔离名（同 inode 的额外链接）
+  return "restored";
 }
 
 /**
  * rename-steal 抢占陈旧锁（原子，无 read→rm 竞态）：
  * `rename(lockPath, quarantine)` 只有一个调用者能成功；随后**重读偷得文件**验证确属陈旧——
- * 真陈旧 → 删除；实为活锁/在途（竞态中误判）→ rename 还原并等待。另一调用者 rename 失败
+ * 真陈旧 → 删除；实为活锁/在途（竞态中误判）→ 不覆盖式还原并等待。另一调用者 rename 失败
  * （ENOENT，锁已被偷）→ gone，调用方重试。绝不基于旧读取结果直接 rm。
  */
 async function stealStaleLock(
@@ -235,7 +248,7 @@ async function stealStaleLock(
   const live = payload !== null && isPidAlive(payload.pid);
   const inFlightEmpty = payload === null && fresh;
   if ((live && fresh) || inFlightEmpty) {
-    await restoreQuarantine(quarantine, lockPath); // 误判活锁：还原
+    await restoreQuarantine(quarantine, lockPath, hooks); // 误判活锁：不覆盖式还原（可能已被接管）
     return "live";
   }
   await rm(quarantine, { force: true }).catch(() => {});
@@ -244,7 +257,7 @@ async function stealStaleLock(
 
 /**
  * 释放锁（rename 协议）：先把锁文件原子移到隔离路径，**偷到且 owner 匹配才删**；
- * owner 不匹配（说明已被替换）→ 还原，绝不删他人锁。
+ * owner 不匹配（说明已被替换）→ 不覆盖式还原，绝不删他人锁。
  */
 async function releaseAuthLock(lockPath: string, owner: string): Promise<void> {
   const quarantine = quarantinePath(lockPath, "release");
@@ -326,10 +339,17 @@ export async function withAuthLock<T>(
   try {
     await handle.writeFile(JSON.stringify(payload), "utf8");
     wroteLock = true;
-    // 心跳=mtime（utimes 原子，不与内容读写竞争，避免半写窗口）
+    // 心跳=mtime（utimes 原子）。心跳前重读校验属主：失锁即停跳，绝不触碰新持有者的锁文件。
     heartbeat = setInterval(() => {
-      const now = new Date();
-      void utimes(lockPath, now, now).catch(() => {});
+      void (async () => {
+        const current = await readLockPayload(lockPath);
+        if (current?.owner !== owner) {
+          if (heartbeat) clearInterval(heartbeat);
+          return;
+        }
+        const now = new Date();
+        await utimes(lockPath, now, now).catch(() => {});
+      })();
     }, heartbeatMs);
     heartbeat.unref?.();
     await opts.hooks?.onLockAcquired?.();
