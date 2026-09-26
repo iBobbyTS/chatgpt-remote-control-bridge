@@ -174,7 +174,8 @@ export function commandsForRestart(ctx: LaunchdContext, loaded: boolean): Launch
 // ------------------------------------------------------------- launchctl print
 
 export interface LaunchctlStatus {
-  loaded: boolean;
+  /** true=已加载；false=确认未加载；null=状态未知（print 非零但非"未加载"，如权限错误）。 */
+  loaded: boolean | null;
   pid: number | null;
   state: string | null;
   lastExitCode: number | null;
@@ -305,12 +306,17 @@ export class LaunchdManager {
     return (await this.probeLoaded()) === "loaded";
   }
 
+  /** 三态如实呈现：unknown 不折叠为"未加载"（loaded=null）。 */
   async status(): Promise<LaunchctlStatus> {
     const result = await this.run(printStep(this.ctx).args);
-    if (result.code !== 0) {
-      return { loaded: false, pid: null, state: null, lastExitCode: null };
+    if (result.code === 0) {
+      return { loaded: true, ...parseLaunchctlPrint(result.stdout) };
     }
-    return { loaded: true, ...parseLaunchctlPrint(result.stdout) };
+    const text = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    const notLoaded = /could not find service|no such process|service not found|could not find domain/.test(
+      text,
+    );
+    return { loaded: notLoaded ? false : null, pid: null, state: null, lastExitCode: null };
   }
 
   /** install：写 plist（幂等刷新）→ 旧服务已加载则 bootout（真实失败报错）→ bootstrap。 */
@@ -329,9 +335,29 @@ export class LaunchdManager {
     await rm(this.plistPath, { force: true });
   }
 
+  /**
+   * start 三态保守序：
+   * - not-loaded → bootstrap + kickstart；
+   * - loaded → 仅 kickstart；
+   * - unknown → **先 kickstart**（可能已加载），失败才 bootstrap + kickstart（可能未加载）。
+   */
   async start(): Promise<void> {
-    const loaded = await this.isLoaded();
-    await this.execSteps(commandsForStart(this.ctx, loaded));
+    const state = await this.probeLoaded();
+    if (state === "loaded") {
+      await this.execSteps(commandsForStart(this.ctx, true));
+      return;
+    }
+    if (state === "not-loaded") {
+      await this.execSteps(commandsForStart(this.ctx, false));
+      return;
+    }
+    // unknown：kickstart 先行，失败再走 bootstrap+kickstart
+    const kick = await this.run(["kickstart", "-k", serviceTarget(this.ctx)]);
+    if (kick.code === 0) return;
+    this.log(
+      `launchctl kickstart 失败（exit ${kick.code}）且加载状态未知，回退 bootstrap：${kick.stderr.trim()}`,
+    );
+    await this.execSteps(commandsForStart(this.ctx, false));
   }
 
   async stop(): Promise<void> {

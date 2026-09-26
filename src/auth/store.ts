@@ -16,7 +16,7 @@
  *   `baseAccessToken` 与磁盘当前 access_token 不一致（已被删除/替换/新登录）即丢弃写回。
  */
 import { randomBytes } from "node:crypto";
-import { chmod, link, mkdir, open, readFile, rename, rm, stat, utimes, writeFile, type FileHandle } from "node:fs/promises";
+import { chmod, link, mkdir, open, readFile, rename, rm, stat, writeFile, type FileHandle } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { parseIdTokenInfo, type IdTokenInfo } from "./jwt.ts";
 
@@ -107,6 +107,8 @@ export interface AuthCommitHooks {
   beforeReclaim?: () => Promise<void> | void;
   /** 还原隔离文件前（模拟"误偷活锁时第三方已取新锁"：注入空缺窗口的新锁）。 */
   beforeRestore?: () => Promise<void> | void;
+  /** 心跳 fd 校验属主后、futimes 前（模拟"读后换锁"交错）。 */
+  beforeHeartbeat?: () => Promise<void> | void;
   /** 临界区内、写盘/删除前。 */
   beforeCommit?: () => Promise<void> | void;
 }
@@ -144,13 +146,19 @@ function isPidAlive(pid: number): boolean {
 async function readLockPayload(lockPath: string): Promise<AuthLockPayload | null> {
   let raw: string;
   try {
-    raw = (await readFile(lockPath, "utf8")).trim();
+    raw = await readFile(lockPath, "utf8");
   } catch {
     return null;
   }
-  if (!raw) return null;
+  return parseLockPayload(raw);
+}
+
+/** 解析锁内容（从字符串；空/半写/非法 → null）。 */
+function parseLockPayload(raw: string): AuthLockPayload | null {
+  const text = raw.trim();
+  if (!text) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<AuthLockPayload>;
+    const parsed = JSON.parse(text) as Partial<AuthLockPayload>;
     if (
       parsed !== null &&
       typeof parsed === "object" &&
@@ -204,8 +212,11 @@ async function lockView(lockPath: string, staleMs: number): Promise<LockView> {
 
 /**
  * 把隔离文件**不覆盖式**还原到锁路径：`link(quarantine, lockPath)` + `unlink(quarantine)`。
- * 不用 rename——POSIX rename 会**静默覆盖**第三方在空缺窗口重建的新锁；link 撞 EEXIST 即
- * 「已有新锁」→ 不覆盖、删隔离副本，按"已被接管"处理。返回 `"restored"` / `"taken"`。
+ * 不用 rename——POSIX rename 会**静默覆盖**第三方在空缺窗口重建的新锁。
+ * 错误分类（避免静默留无锁窗口）：
+ * - `EEXIST` = 已有第三方新锁 → 不覆盖，删隔离副本，返回 `"taken"`；
+ * - `ENOENT` = 隔离文件已不在 → `"taken"`；
+ * - `EPERM`/`EIO` 等其他错误 → **保留隔离文件**并重试，仍失败则抛错（绝不静默通过）。
  */
 async function restoreQuarantine(
   quarantine: string,
@@ -213,14 +224,29 @@ async function restoreQuarantine(
   hooks?: AuthCommitHooks,
 ): Promise<"restored" | "taken"> {
   await hooks?.beforeRestore?.();
-  try {
-    await link(quarantine, lockPath); // EEXIST = 第三方已重建新锁，绝不覆盖
-  } catch {
-    await rm(quarantine, { force: true }).catch(() => {});
-    return "taken";
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await link(quarantine, lockPath);
+      await rm(quarantine, { force: true }).catch(() => {}); // 去掉隔离名（同 inode 的额外链接）
+      return "restored";
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === "EEXIST") {
+        await rm(quarantine, { force: true }).catch(() => {});
+        return "taken";
+      }
+      if (code === "ENOENT") {
+        return "taken"; // 隔离文件已不存在
+      }
+      if (attempt >= 2) {
+        // 隔离文件保留（供人工/后续重试），显式报错——绝不留无锁窗口静默通过
+        throw new Error(
+          `auth 锁还原失败（隔离文件保留：${quarantine}）：${code ?? String(err)}`,
+        );
+      }
+      await delay(50 * (attempt + 1));
+    }
   }
-  await rm(quarantine, { force: true }).catch(() => {}); // 去掉隔离名（同 inode 的额外链接）
-  return "restored";
 }
 
 /**
@@ -339,16 +365,27 @@ export async function withAuthLock<T>(
   try {
     await handle.writeFile(JSON.stringify(payload), "utf8");
     wroteLock = true;
-    // 心跳=mtime（utimes 原子）。心跳前重读校验属主：失锁即停跳，绝不触碰新持有者的锁文件。
+    // 心跳 fd 化（根治 TOCTOU）：open 取 fd → 从**同一 fd** 读内容校验 owner===self
+    // → 用 fs.futimes(fd) 更新该 inode 时间。路径若在两步间被替换，命中旧 inode（无害）；
+    // owner 不符/打开失败 → 关 fd 停跳，绝不触碰新持有者的锁文件。
     heartbeat = setInterval(() => {
       void (async () => {
-        const current = await readLockPayload(lockPath);
-        if (current?.owner !== owner) {
-          if (heartbeat) clearInterval(heartbeat);
-          return;
+        let fh: FileHandle | null = null;
+        try {
+          fh = await open(lockPath, "r");
+          const current = parseLockPayload(await fh.readFile("utf8"));
+          if (current?.owner !== owner) {
+            if (heartbeat) clearInterval(heartbeat);
+            return;
+          }
+          await opts.hooks?.beforeHeartbeat?.();
+          const now = new Date();
+          await fh.utimes(now, now); // futimes：作用于已打开的旧 inode
+        } catch {
+          if (heartbeat) clearInterval(heartbeat); // 锁文件被移除/替换：停跳
+        } finally {
+          await fh?.close().catch(() => {});
         }
-        const now = new Date();
-        await utimes(lockPath, now, now).catch(() => {});
       })();
     }, heartbeatMs);
     heartbeat.unref?.();

@@ -278,6 +278,13 @@ async function offlineAgentInfo(agent: string, paths: CgrcbPaths): Promise<Offli
   };
 }
 
+function formatLaunchd(launchd: { loaded: boolean | null; state: string | null; pid: number | null }): string {
+  if (launchd.loaded === true) {
+    return `已加载（state=${launchd.state ?? "?"}, pid=${launchd.pid ?? "-"})`;
+  }
+  return launchd.loaded === false ? "未加载" : "状态未知";
+}
+
 async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
   const json = hasFlag(args, "--json");
   const out = deps.out ?? ((l: string) => console.log(l));
@@ -293,7 +300,7 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
   try {
     launchd = await manager.status();
   } catch {
-    launchd = { loaded: false, pid: null, state: null, lastExitCode: null };
+    launchd = { loaded: null, pid: null, state: null, lastExitCode: null };
   }
 
   const ipc = await callIpc(deps, paths.socketPath, "status");
@@ -317,7 +324,7 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
     if (json) {
       out(JSON.stringify(payload, null, 2));
     } else {
-      out(`launchd：${launchd.loaded ? `已加载（state=${launchd.state ?? "?"}, pid=${launchd.pid ?? "-"})` : "未加载"}`);
+      out(`launchd：${formatLaunchd(launchd)}`);
       out(`daemon：运行中`);
       out(`登录：${auth.loggedIn ? auth.email ?? auth.accountId ?? "已登录" : "未登录"}`);
       out(JSON.stringify(ipc.data, null, 2));
@@ -343,7 +350,7 @@ async function cmdStatus(deps: CliDeps, args: string[]): Promise<number> {
   if (json) {
     out(JSON.stringify(degraded, null, 2));
   } else {
-    out(`launchd：${launchd.loaded ? `已加载（state=${launchd.state ?? "?"}, pid=${launchd.pid ?? "-"})` : "未加载"}`);
+    out(`launchd：${formatLaunchd(launchd)}`);
     out(`daemon：未运行（socket 不存在）—— 静态信息如下`);
     out(`登录：${auth.loggedIn ? `${auth.email ?? auth.accountId ?? "已登录"}（plan=${auth.planType ?? "?"}）` : "未登录"}`);
     for (const [id, info] of Object.entries(agents)) {

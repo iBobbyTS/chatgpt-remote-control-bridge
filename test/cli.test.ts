@@ -363,6 +363,50 @@ test("AC2 launchd：print 明确 not-loaded 特征 → stop 幂等成功且不 b
   assert.equal(calls.some((c) => c[0] === "bootout"), false, "确认未加载不应 bootout");
 });
 
+test("AC2 launchd：status unknown 如实呈现（loaded=null）；start unknown 先 kickstart 后回退 bootstrap", async () => {
+  const home = await tempDir("d2u");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const ctx: LaunchdContext = { home, env, nodePath: "/usr/bin/node", daemonEntry: "/app/main.js", uid: 501 };
+  const makeRunner = (firstKickCode: number): { calls: string[][]; runner: LaunchctlRunner } => {
+    const calls: string[][] = [];
+    let kicks = 0;
+    const runner: LaunchctlRunner = async (args) => {
+      calls.push(args);
+      if (args[0] === "print") return { code: 1, stdout: "", stderr: "Operation not permitted" };
+      if (args[0] === "kickstart") {
+        kicks += 1;
+        return kicks === 1 && firstKickCode !== 0
+          ? { code: firstKickCode, stdout: "", stderr: "boom" }
+          : { code: 0, stdout: "", stderr: "" };
+      }
+      return { code: 0, stdout: "", stderr: "" };
+    };
+    return { calls, runner };
+  };
+
+  const statusRunner = makeRunner(0);
+  const status = await new LaunchdManager(ctx, statusRunner.runner).status();
+  assert.equal(status.loaded, null, "unknown 应以 null 呈现，而非折叠为未加载");
+
+  // unknown + kickstart 成功：不得 bootstrap
+  const ok = makeRunner(0);
+  await new LaunchdManager(ctx, ok.runner).start();
+  assert.deepEqual(
+    ok.calls.filter((c) => c[0] !== "print").map((c) => c[0]),
+    ["kickstart"],
+    "unknown 且 kickstart 成功应为 kickstart 先行序",
+  );
+
+  // unknown + kickstart 失败：回退 bootstrap + kickstart
+  const retry = makeRunner(5);
+  await new LaunchdManager(ctx, retry.runner).start();
+  assert.deepEqual(
+    retry.calls.filter((c) => c[0] !== "print").map((c) => c[0]),
+    ["kickstart", "bootstrap", "kickstart"],
+    "kickstart 失败应回退 bootstrap 后再 kickstart",
+  );
+});
+
 test("AC2 launchd 执行：restart 中 bootout 后 bootstrap 瞬时失败自动重试", async () => {
   const home = await tempDir("d2r");
   const env = { ...process.env, CGRCB_HOME: home };
@@ -495,6 +539,24 @@ test("AC3 IPC 三态降级：在线/未运行(ENOENT)/未登录", async () => {
     1,
   );
   assert.match(cNotLogged.err.join("\n"), /未登录/);
+});
+
+test("AC3 status：launchctl 状态未知时如实呈现（非未加载）", async () => {
+  const home = await tempDir("d3u");
+  const env = { ...process.env, CGRCB_HOME: home };
+  const unknownRunner: LaunchctlRunner = async (args) =>
+    args[0] === "print"
+      ? { code: 1, stdout: "", stderr: "Operation not permitted" }
+      : { code: 0, stdout: "", stderr: "" };
+  const ipcDown = async () => {
+    throw Object.assign(new Error("connect ENOENT"), { code: "ENOENT" });
+  };
+  const c = capture();
+  assert.equal(
+    await runCli(["status"], { ...c.sink, env, ipc: ipcDown, launchctlRunner: unknownRunner }),
+    0,
+  );
+  assert.match(c.out.join("\n"), /launchd：状态未知/);
 });
 
 test("AC3 真实 IPC：daemon 在线 status 汇总；enable 未登录返回 NOT_LOGGED_IN", async () => {
@@ -874,6 +936,45 @@ test("AC7 失锁后心跳停止：不触碰第三方锁文件 mtime", async () =
     "third",
     "释放不覆盖第三方锁",
   );
+});
+
+test("AC7 心跳 fd 化：读后换锁不触碰新锁 mtime（futimes 旧 inode）", async () => {
+  const home = await tempDir("d7x");
+  const acquired = deferred();
+  const release = deferred();
+  let swapped = false;
+  let thirdContent = "";
+  const holder = withAuthLock(
+    home,
+    async () => {
+      acquired.resolve();
+      await release.promise;
+    },
+    {
+      staleMs: 5000,
+      heartbeatMs: 40,
+      timeoutMs: 5000,
+      hooks: {
+        // fd 读校验属主后、futimes 前：换入第三方新锁，模拟"读后换锁"交错
+        beforeHeartbeat: async () => {
+          if (swapped) return;
+          swapped = true;
+          await rm(authLockPath(home), { force: true });
+          thirdContent = JSON.stringify({ pid: process.pid, startedAt: Date.now(), owner: "third" });
+          await writeFile(authLockPath(home), thirdContent);
+        },
+      },
+    },
+  );
+  await acquired.promise;
+  await sleep(160); // 首跳换锁并 futimes 旧 inode；后续心跳因属主不符停跳
+  const before = (await stat(authLockPath(home))).mtimeMs;
+  await sleep(220); // 多个心跳周期
+  const after = (await stat(authLockPath(home))).mtimeMs;
+  assert.equal(after, before, "换锁后心跳不得触碰新锁 mtime（fd 指向旧 inode）");
+  assert.equal(await readFile(authLockPath(home), "utf8"), thirdContent, "新锁内容不被改写");
+  release.resolve();
+  await holder;
 });
 
 test("B-4 auth-reset 失败仍恢复 autoRefresh 巡检", async () => {
