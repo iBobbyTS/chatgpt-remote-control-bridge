@@ -183,6 +183,37 @@ function specialCommandOf(userText: string): "help" | "test-steer" | "test-queue
   return null;
 }
 
+/**
+ * 识别手机的任务标题生成 turn（turnTrigger=remote_ios + outputSchema{title}）：
+ * 手机用 LLM 为用户消息生成 ≤36 字符的 UI 标题，期待 agentMessage 文本为符合
+ * schema 的 JSON（{"title":"…"}）。2026-09-26 真机复现：该 turn 被当普通消息
+ * 回复长文本（非 JSON）→ 手机 outputSchema 解析失败 → UI 渲染冻结 + 30s 重连
+ * 循环（docs/research/07-sim-layer.md）。返回 title.maxLength（无则 36）；非
+ * 标题 turn 返回 null。
+ */
+function titleSchemaOf(p: AnyParams): number | null {
+  const schema = p.outputSchema;
+  if (typeof schema !== "object" || schema === null) return null;
+  const props = (schema as { properties?: unknown }).properties;
+  const title = typeof props === "object" && props !== null
+    ? (props as Record<string, unknown>).title
+    : undefined;
+  if (typeof title !== "object" || title === null) return null;
+  const max = (title as { maxLength?: unknown }).maxLength;
+  if (typeof max === "number" && Number.isFinite(max) && max > 0) return max;
+  return 36;
+}
+
+/** 从标题生成 prompt 尾部 "User prompt:\n<msg>" 提取标题：单行化、去引号、按 schema 截断。 */
+function titleForPrompt(prompt: string, maxLength: number): string {
+  const marker = "User prompt:";
+  const idx = prompt.lastIndexOf(marker);
+  const raw = idx >= 0 ? prompt.slice(idx + marker.length) : prompt;
+  let title = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "");
+  if (!title) title = "Task";
+  return title.length > maxLength ? title.slice(0, maxLength) : title;
+}
+
 export class SimApp extends EventEmitter implements AgentApp {
   private readonly clients = new Map<string, SimClientState>();
   private readonly threads = new Map<string, ThreadState>();
@@ -783,7 +814,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
       return { turn: { ...this.serializeTurn(state.sim.turn), items: [], itemsView: "notLoaded" as const } };
     }
-    const sim = this.beginSimTurn(state, input, clientUserMessageId);
+    const sim = this.beginSimTurn(state, input, clientUserMessageId, titleSchemaOf(p));
     // 真实 turn/start 响应：items 空、itemsView notLoaded
     return { turn: { ...this.serializeTurn(sim.turn), items: [], itemsView: "notLoaded" as const } };
   }
@@ -851,6 +882,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state: ThreadState,
     input: TextContent[],
     clientUserMessageId: string | null,
+    titleMaxLength: number | null = null,
   ): SimTurnRuntime {
     const userText = input.map((c) => c.text).join("");
     const turn = makeTurn("inProgress");
@@ -859,7 +891,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
-    state.thread.preview = userText.slice(0, 80) || state.thread.preview;
+    // 标题生成 turn 的 preview 用提取的标题（手机以该 turn 的 JSON 输出更新任务标题）
+    state.thread.preview =
+      titleMaxLength != null
+        ? titleForPrompt(userText, titleMaxLength)
+        : userText.slice(0, 80) || state.thread.preview;
 
     // Plan 模式在 turn 开始时快照（对齐 codex turn_context 快照语义）
     const planMode = state.thread.collaborationMode.mode === "plan";
@@ -897,7 +933,8 @@ export class SimApp extends EventEmitter implements AgentApp {
       }, state.thread.id));
 
       // agentMessage：流式模拟回复；特殊指令 test steer / test queue 走
-      // 「3 条消息 + 2 次模拟等待」脚本，help 在 buildReply 内返回帮助文本
+      // 「3 条消息 + 2 次模拟等待」脚本，help 在 buildReply 内返回帮助文本；
+      // 标题生成 turn（outputSchema{title}）按契约回 JSON
       this.schedule(sim, () => {
         const finishTurn = () => {
           this.processSteers(state, sim, () => {
@@ -906,6 +943,12 @@ export class SimApp extends EventEmitter implements AgentApp {
             this.consumeQueue(state);
           });
         };
+        if (titleMaxLength != null) {
+          // 手机按 outputSchema 解析 agentMessage 文本；非 JSON 会让其 UI 流程挂起
+          const reply = JSON.stringify({ title: titleForPrompt(userText, titleMaxLength) });
+          this.streamAgentMessage(state, sim, reply, finishTurn);
+          return;
+        }
         const special = specialCommandOf(userText);
         if (special === "test-steer" || special === "test-queue") {
           this.runScriptedTurn(state, sim, special, finishTurn);

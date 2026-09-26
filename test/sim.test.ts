@@ -2497,3 +2497,117 @@ function waitFor(predicate: () => boolean, timeoutMs: number, message: string): 
     }, 20);
   });
 }
+
+test("回环：手机标题生成 turn（turnTrigger=remote_ios + outputSchema{title}）按契约回 JSON", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "codex_chatgpt_ios_remote" },
+      capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-title", threadSource: "user" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    // 手机标题 turn 的真实形状（2026-09-26 抓包）：注入 prompt 尾部带用户消息
+    const injectionPrompt =
+      "You are a helpful assistant. You will be presented with a user prompt, and your job is to " +
+      "provide a short title for a task that will be created from that prompt.\n\nUser prompt:\nFix the login bug";
+    const turn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      turnTrigger: "remote_ios",
+      effort: "low",
+      outputSchema: {
+        properties: { title: { type: "string", maxLength: 36, minLength: 1 } },
+        additionalProperties: false,
+        required: ["title"],
+        type: "object",
+      },
+      input: [{ text: injectionPrompt, type: "text" }],
+      clientUserMessageId: "title-turn-1",
+    })) as { result: { turn: { id: string; status: string } } };
+    assert.equal(turn.result.turn.status, "inProgress");
+
+    await waitFor(() =>
+      loop.mock.receivedNotifications.some(
+        (n) => n.method === "turn/completed" &&
+          (n.params as { turn?: { id?: string } }).turn?.id === turn.result.turn.id,
+      ),
+      5000,
+      "标题 turn 未完成",
+    );
+
+    // agentMessage 文本必须是符合 outputSchema 的 JSON（手机解析失败会冻结 UI）
+    const completed = loop.mock.receivedNotifications.find(
+      (n) =>
+        n.method === "item/completed" &&
+        (n.params as { item?: { type?: string } }).item?.type === "agentMessage",
+    )!;
+    const item = (completed.params as { item: { text: string } }).item;
+    assert.deepEqual(JSON.parse(item.text), { title: "Fix the login bug" });
+
+    // thread.preview 用提取的标题（手机任务列表 UI 标题）
+    const list = (await loop.mock.rpc("thread/list", {})) as {
+      result: { data: Array<{ id: string; preview: string }> };
+    };
+    const listed = list.result.data.find((t) => t.id === threadId);
+    assert.ok(listed, "标题线程应出现在 thread/list");
+    assert.equal(listed!.preview, "Fix the login bug");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：标题 turn 超 maxLength 截断、含 test queue 字样不误触发脚本", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "codex_chatgpt_ios_remote" },
+      capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-title2", threadSource: "user" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    const longPrompt =
+      "You are a helpful assistant.\n\nUser prompt:\ntest queue with an extremely long user message that exceeds the schema limit";
+    const turn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      turnTrigger: "remote_ios",
+      outputSchema: {
+        properties: { title: { type: "string", maxLength: 36 } },
+        required: ["title"],
+        type: "object",
+      },
+      input: [{ text: longPrompt, type: "text" }],
+    })) as { result: { turn: { id: string } } };
+
+    await waitFor(() =>
+      loop.mock.receivedNotifications.some(
+        (n) => n.method === "turn/completed" &&
+          (n.params as { turn?: { id?: string } }).turn?.id === turn.result.turn.id,
+      ),
+      5000,
+      "标题 turn 未完成",
+    );
+
+    const msgs = loop.mock.receivedNotifications.filter(
+      (n) =>
+        n.method === "item/completed" &&
+        (n.params as { item?: { type?: string } }).item?.type === "agentMessage",
+    );
+    // 标题 turn 只产出 1 条 agentMessage（不得误入 test queue 的 3 条脚本）
+    assert.equal(msgs.length, 1);
+    const { title } = JSON.parse((msgs[0]!.params as { item: { text: string } }).item.text) as {
+      title: string;
+    };
+    assert.ok(title.length <= 36, `title 超 schema maxLength: ${title}`);
+    assert.ok(title.startsWith("test queue with an extremely"), `title 应取自 User prompt 之后: ${title}`);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
