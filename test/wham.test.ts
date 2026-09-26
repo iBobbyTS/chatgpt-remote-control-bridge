@@ -79,10 +79,41 @@ function fakeAuth(): AuthDotJson {
   };
 }
 
-async function makeAuthManager(): Promise<{ authManager: BridgeAuthManager; home: string }> {
+async function makeAuthManager(): Promise<{
+  authManager: BridgeAuthManager;
+  home: string;
+  auth: AuthDotJson;
+}> {
   const home = await tempDir("auth");
-  await writeAuthStore(home, fakeAuth());
-  return { authManager: new BridgeAuthManager({ codexHome: home }), home };
+  const auth = fakeAuth();
+  await writeAuthStore(home, auth);
+  return { authManager: new BridgeAuthManager({ codexHome: home }), home, auth };
+}
+
+/** 直连 mock 的 enroll（测试注入特定账号 token / installation_id）。 */
+async function rawEnroll(
+  base: string,
+  accountToken: string,
+  installationId: string,
+  accountId = "acc-1",
+): Promise<EnrollRemoteServerResponse> {
+  const res = await fetch(`${base}${REST_PATHS.enroll}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      authorization: `Bearer ${accountToken}`,
+      "chatgpt-account-id": accountId,
+    },
+    body: JSON.stringify({
+      name: "raw",
+      os: "macos",
+      arch: "arm64",
+      app_server_version: "t",
+      installation_id: installationId,
+    }),
+  });
+  assert.equal(res.status, 200);
+  return (await res.json()) as EnrollRemoteServerResponse;
 }
 
 /** 最小 AgentApp stub（AC4/AC6/AC7）：结构化实现，不依赖 sim 类型。 */
@@ -148,6 +179,7 @@ async function startStubTunnel(opts: {
   mock: MockWhamServer;
   logs?: string[];
   pingIntervalMs?: number;
+  onFault?: (err: unknown, context: string) => unknown;
 }): Promise<{ tunnel: WhamTunnel; app: StubAgentApp; home: string; authManager: BridgeAuthManager }> {
   const { authManager, home } = await makeAuthManager();
   const app = new StubAgentApp();
@@ -160,6 +192,7 @@ async function startStubTunnel(opts: {
     pingIntervalMs: opts.pingIntervalMs ?? 10_000,
     refreshThresholdMs: 60_000,
     log: (line) => opts.logs?.push(line),
+    onFault: opts.onFault,
   });
   return { tunnel, app, home, authManager };
 }
@@ -265,9 +298,15 @@ test("AC1 listClients：分页参数/响应解码/账号鉴权头（非 remote-t
     const client = new WhamClient({ authManager, baseUrl: `http://127.0.0.1:${port}` });
     const enrolled = await client.enroll({ name: "ac1", appServerVersion: "t" });
 
-    server.addClient({ client_id: "c-old", last_seen_at: new Date(Date.now() - 3000).toISOString() });
-    server.addClient({ client_id: "c-mid", last_seen_at: new Date(Date.now() - 2000).toISOString() });
-    const newest = server.addClient({
+    server.addClient(enrolled.environment_id, {
+      client_id: "c-old",
+      last_seen_at: new Date(Date.now() - 3000).toISOString(),
+    });
+    server.addClient(enrolled.environment_id, {
+      client_id: "c-mid",
+      last_seen_at: new Date(Date.now() - 2000).toISOString(),
+    });
+    const newest = server.addClient(enrolled.environment_id, {
       client_id: "c-new",
       display_name: "My iPhone",
       last_seen_at: new Date(Date.now() - 1000).toISOString(),
@@ -334,12 +373,12 @@ test("AC2 revokeClient：DELETE 路径/空响应体容忍/错误映射", async (
   try {
     const client = new WhamClient({ authManager, baseUrl: `http://127.0.0.1:${port}` });
     const enrolled = await client.enroll({ name: "ac2", appServerVersion: "t" });
-    server.addClient({ client_id: "c-revoke" });
+    server.addClient(enrolled.environment_id, { client_id: "c-revoke" });
 
     // 204 空 body：必须容忍（UTF-8 解析空串会失败，本路径不得解码 body）
     await client.revokeClient({ environmentId: enrolled.environment_id, clientId: "c-revoke" });
     assert.ok(server.revokedClients.has("c-revoke"));
-    assert.equal(server.pairedClients.length, 0);
+    assert.equal(server.clientsFor(enrolled.environment_id).length, 0);
 
     const del = server.clientsRequests.at(-1)!;
     assert.equal(del.method, "DELETE");
@@ -451,6 +490,43 @@ test("AC6 异步隔离：handleRequest reject → 无 unhandledRejection、tunne
   }
 });
 
+test("NIT2 故障回调 rejected Promise：不产生 unhandledRejection、tunnel 存活", async () => {
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  process.on("unhandledRejection", onUnhandled);
+  const handlerErrors: string[] = [];
+  const { server } = await startMock();
+  const { tunnel, app } = await startStubTunnel({
+    mock: server,
+    logs: handlerErrors,
+    // 同步抛 + 返回 rejected Promise 两种回调形态
+    onFault: (_err, context) =>
+      context === "handleRequest(boomSync)"
+        ? Promise.reject(new Error("onFault boom (async)"))
+        : Promise.reject(new Error("onFault boom")),
+  });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    app.failMethods.add("boomSync");
+    const failed = (await server.rpc("boomSync", {}, 5000)) as { error?: { message?: string } };
+    assert.match(String(failed.error?.message), /agent error/);
+    // tunnel 仍存活
+    const ok = (await server.rpc("echo", {}, 5000)) as { result?: { method?: string } };
+    assert.equal(ok.result?.method, "echo");
+    await new Promise((r) => setTimeout(r, 100));
+    assert.deepEqual(unhandled, [], "onFault rejection 不得成为 unhandledRejection");
+    assert.ok(
+      handlerErrors.some((l) => l.includes("onFault async")),
+      `回调 rejection 应被记录: ${JSON.stringify(handlerErrors)}`,
+    );
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 test("AC7 临期续期（成功）：WSS 不断线、refresh-first、enroll 增量 0、身份不变", async () => {
   const logs: string[] = [];
   const { server } = await startMock({ tokenTtlMs: 150, refreshTokenTtlMs: 60_000 });
@@ -516,6 +592,83 @@ test("AC7 临期续期（失败）：refresh 401 → enroll 兜底 + WARN", asyn
   }
 });
 
+test("BLOCKER1 stop 收敛：在途续期结果被丢弃，stop 后无 enrollment 写入/事件", async () => {
+  const { server, port } = await startMock({ refreshDelayMs: 300 });
+  const { tunnel, home, authManager } = await startStubTunnel({ mock: server });
+  // 先建立 mock 侧 enrollment，并预置本地记录（start 走 refresh-first 且刷新被延迟）
+  const seedClient = new WhamClient({ authManager, baseUrl: `http://127.0.0.1:${port}` });
+  const enrolled = await seedClient.enroll({ name: "blocker1", appServerVersion: "t" });
+  const persisted = {
+    server_id: enrolled.server_id,
+    environment_id: enrolled.environment_id,
+    remote_control_token: "rct_persisted_stale",
+    expires_at: new Date(Date.now() + 3600_000).toISOString(),
+  };
+  await writeFile(join(home, ENROLLMENT_FILENAME), JSON.stringify(persisted));
+  const events: unknown[] = [];
+  tunnel.on("enrollment", (e) => events.push(e));
+  const startP = tunnel.start();
+  await waitFor(() => server.refreshCount >= 1, 5000); // refresh 已在途（mock 延迟 300ms）
+  await tunnel.stop();
+  await startP.catch(() => undefined);
+
+  assert.equal(events.length, 0, "stop 后不得再发 enrollment 事件");
+  const onDisk = JSON.parse(await readFile(join(home, ENROLLMENT_FILENAME), "utf8"));
+  assert.deepEqual(onDisk, persisted, "stop 后不得改写 enrollment.json");
+  assert.equal(tunnel.enrollmentSnapshot, null, "在途续期结果不得落入内存身份");
+  await server.stop();
+});
+
+test("BLOCKER2 refresh 身份漂移：environment_id 变化 → WARN + identityWarnings 可见", async () => {
+  const { server, port } = await startMock({
+    refreshResponsePatch: { environment_id: "env_drifted" },
+  });
+  const { tunnel, home, authManager } = await startStubTunnel({ mock: server });
+  const seedClient = new WhamClient({ authManager, baseUrl: `http://127.0.0.1:${port}` });
+  const enrolled = await seedClient.enroll({ name: "drift", appServerVersion: "t" });
+  await writeFile(
+    join(home, ENROLLMENT_FILENAME),
+    JSON.stringify({
+      server_id: enrolled.server_id,
+      environment_id: enrolled.environment_id,
+      remote_control_token: "rct_stale",
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+    }),
+  );
+  await tunnel.start();
+  await waitFor(() => tunnel.connected, 5000);
+
+  assert.ok(
+    tunnel.warnings.some((w) => w.includes("身份漂移")),
+    `refresh 身份漂移应 WARN: ${JSON.stringify(tunnel.warnings)}`,
+  );
+  assert.ok(tunnel.identityWarnings.length >= 1, "identityWarnings 应记录（S04 status 出口）");
+  assert.equal(
+    tunnel.enrollmentSnapshot!.environment_id,
+    "env_drifted",
+    "漂移接受但可见（不得静默替换为不可见）",
+  );
+  assert.equal(tunnel.serverId, enrolled.server_id);
+  await tunnel.stop();
+  await server.stop();
+});
+
+test("NIT1 持续续期：跨多个 ping 周期 refresh 持续、enroll 恒 0", async () => {
+  const { server } = await startMock({ tokenTtlMs: 60, refreshTokenTtlMs: 60 });
+  const { tunnel } = await startStubTunnel({ mock: server, pingIntervalMs: 20 });
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await waitFor(() => server.refreshCount >= 3, 8000);
+    assert.equal(server.enrollCount, 1, "持续续期期间 enroll 恒为 1（仅首次）");
+    assert.equal(tunnel.connected, true, "持续续期期间 WSS 不断线");
+    assert.ok(server.refreshCount >= 3);
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 test("AC8 mock 幂等：同 (账号, installation_id) 两次 enroll 同 server_id/environment_id", async () => {
   const { server, port } = await startMock();
   const { authManager } = await makeAuthManager();
@@ -526,6 +679,92 @@ test("AC8 mock 幂等：同 (账号, installation_id) 两次 enroll 同 server_i
     assert.equal(second.server_id, first.server_id);
     assert.equal(second.environment_id, first.environment_id);
     assert.equal(server.enrollCount, 2);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("BLOCKER3 mock 账号幂等/token 语义：同账号换 token 同身份；历次 token 有效；未知/remote token 401", async () => {
+  // mock 语义（写清）：账号身份 = chatgpt-account-id；refresh/clients 鉴权接受该账号
+  // 历次 enroll 登记过的 access token（账号有效性集合），因此轮换后的新旧 token 都可 refresh。
+  const { server, port } = await startMock();
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    const first = await rawEnroll(base, "account-token-1", "inst-x");
+    const second = await rawEnroll(base, "account-token-2", "inst-x");
+    assert.equal(second.server_id, first.server_id, "同账号换 token 仍同 server_id");
+    assert.equal(second.environment_id, first.environment_id, "同账号换 token 仍同 environment_id");
+    assert.equal(server.enrollCount, 2);
+
+    const refresh = (auth: string) =>
+      fetch(`${base}${REST_PATHS.refresh}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          authorization: `Bearer ${auth}`,
+          "chatgpt-account-id": "acc-1",
+          "x-codex-installation-id": "inst-x",
+        },
+        body: JSON.stringify({ server_id: first.server_id, installation_id: "inst-x" }),
+      });
+
+    // 当前 token 与历次有效 token 都可 refresh
+    assert.equal((await refresh("account-token-2")).status, 200);
+    assert.equal((await refresh("account-token-1")).status, 200, "账号历次有效 token 仍可 refresh");
+    // 未知 token / remote_control_token → 401
+    assert.equal((await refresh("account-token-unknown")).status, 401);
+    assert.equal((await refresh(first.remote_control_token)).status, 401);
+  } finally {
+    await server.stop();
+  }
+});
+
+test("BLOCKER4 clients 环境隔离：按 env 归属查询/吊销，不跨 env 泄漏", async () => {
+  const { server, port } = await startMock();
+  const { authManager, auth } = await makeAuthManager();
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    // 同账号两个 installation → 两个 environment
+    const accountToken = auth.tokens!.access_token;
+    const envA = await rawEnroll(base, accountToken, "inst-a");
+    const envB = await rawEnroll(base, accountToken, "inst-b");
+    assert.notEqual(envA.environment_id, envB.environment_id);
+    server.addClient(envA.environment_id, { client_id: "a-1" });
+    server.addClient(envB.environment_id, { client_id: "b-1" });
+
+    const client = new WhamClient({ authManager, baseUrl: base });
+    const listA = await client.listClients({ environmentId: envA.environment_id });
+    assert.deepEqual(
+      listA.items.map((i) => i.client_id),
+      ["a-1"],
+      "envA 的 list 只应见 envA",
+    );
+    const listB = await client.listClients({ environmentId: envB.environment_id });
+    assert.deepEqual(
+      listB.items.map((i) => i.client_id),
+      ["b-1"],
+      "envB 的 list 只应见 envB",
+    );
+
+    // 用 envA 吊销 envB 的 client → 404（不属于该 env）
+    await assert.rejects(
+      () => client.revokeClient({ environmentId: envA.environment_id, clientId: "b-1" }),
+      (err: unknown) => err instanceof WhamError && err.status === 404,
+    );
+    assert.deepEqual(
+      server.clientsFor(envB.environment_id).map((c) => c.client_id),
+      ["b-1"],
+      "跨 env DELETE 失败不得影响 envB",
+    );
+
+    // 吊销 envA 的 client → 只影响 envA
+    await client.revokeClient({ environmentId: envA.environment_id, clientId: "a-1" });
+    assert.equal(server.clientsFor(envA.environment_id).length, 0);
+    assert.deepEqual(
+      server.clientsFor(envB.environment_id).map((c) => c.client_id),
+      ["b-1"],
+      "envB 不受 envA 吊销影响",
+    );
   } finally {
     await server.stop();
   }

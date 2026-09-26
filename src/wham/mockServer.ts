@@ -44,6 +44,13 @@ export interface MockWhamOptions {
   refreshTokenTtlMs?: number;
   /** 非空时 refresh 端点恒返回该状态码（测试注入 401 验证 enroll 兜底）。 */
   refreshStatusCode?: number;
+  /** refresh 成功前的延迟（毫秒），测试注入在途续期以验证 stop 收敛。 */
+  refreshDelayMs?: number;
+  /**
+   * refresh 成功响应上叠加的字段覆盖（测试注入身份漂移：不同 environment_id/server_id）。
+   * 不改变 mock 内部 storage。
+   */
+  refreshResponsePatch?: Partial<EnrollRemoteServerResponse>;
   log?: (line: string) => void;
 }
 
@@ -54,8 +61,8 @@ interface Enrollment {
   expiresAt: string;
   installationId: string;
   name: string;
-  /** enroll 请求携带的账号 token（clients/refresh 账号鉴权校验用）。 */
-  accountToken: string | null;
+  /** 稳定账号身份（chatgpt-account-id 头优先），幂等键/鉴权的账号维度。 */
+  accountIdentity: string;
   accountId: string | null;
 }
 
@@ -72,8 +79,14 @@ export class MockWhamServer {
   private wss!: WebSocketServer;
   private actualPort = 0;
   private enrollment: Enrollment | null = null;
-  /** enroll 幂等（测试脚手架假设）：key=`(账号, installation_id)` → 稳定 server/environment。 */
+  /**
+   * enroll 幂等（测试脚手架假设）：key=`(稳定账号身份, installation_id)` → 稳定 server/environment。
+   * 账号身份=chatgpt-account-id 头（缺失时退化为该次使用的 bearer），因此同账号轮换
+   * access token 后再 enroll 仍得同一身份。
+   */
   private readonly enrollmentsByKey = new Map<string, Enrollment>();
+  /** 账号维度登记历次有效 access token（refresh/clients 鉴权）。 */
+  private readonly accountTokens = new Map<string, Set<string>>();
   private codexSocket: WebSocket | null = null;
   private codexHeaders: Record<string, string> = {};
   private nextRpcId = 1;
@@ -102,8 +115,8 @@ export class MockWhamServer {
     query: Record<string, string>;
     headers: Record<string, string>;
   }> = [];
-  /** enroll 幂等作用域下的「已配对客户端」（addClient 播种；DELETE 移除）。 */
-  readonly pairedClients: RemoteControlClient[] = [];
+  /** 「已配对客户端」按 environment 归属存储（BLOCKER 4：跨 env 不泄漏）。 */
+  private readonly clientsByEnvironment = new Map<string, RemoteControlClient[]>();
   /** 被 DELETE 吊销过的 client_id 集合。 */
   readonly revokedClients = new Set<string>();
   /** 端点调用计数（AC7 的「enroll 增量为 0」判据）。 */
@@ -184,10 +197,17 @@ export class MockWhamServer {
     if (url.pathname === REST_PATHS.enroll) {
       this.enrollCount += 1;
       const request = JSON.parse(body) as EnrollRemoteServerRequest;
-      const accountToken = bearer || null;
       const accountId = headerValue(req, "chatgpt-account-id");
-      // 幂等（测试脚手架假设）：同 (账号, installation_id) 稳定返回同一 server/environment
-      const key = `${accountToken ?? ""}|${request.installation_id}`;
+      // 稳定账号身份：优先 account id，其次该次 bearer（无账号头的本地探测）
+      const accountIdentity = accountId ?? (bearer ? `token:${bearer}` : "anonymous");
+      if (bearer) {
+        // 登记该账号历次有效 token（refresh/clients 鉴权按账号维度接受）
+        const tokens = this.accountTokens.get(accountIdentity) ?? new Set<string>();
+        tokens.add(bearer);
+        this.accountTokens.set(accountIdentity, tokens);
+      }
+      // 幂等（测试脚手架假设）：同 (账号身份, installation_id) 稳定返回同一 server/environment
+      const key = `${accountIdentity}|${request.installation_id}`;
       const existing = this.enrollmentsByKey.get(key);
       const serverId = existing?.serverId ?? `srv_${randomUUID()}`;
       const environmentId = existing?.environmentId ?? `env_${randomUUID()}`;
@@ -198,7 +218,7 @@ export class MockWhamServer {
         expiresAt: this.expiryFromNow(this.opts.tokenTtlMs ?? 24 * 3600_000),
         installationId: request.installation_id,
         name: request.name,
-        accountToken,
+        accountIdentity,
         accountId,
       };
       this.enrollmentsByKey.set(key, this.enrollment);
@@ -216,12 +236,14 @@ export class MockWhamServer {
         await this.replyJson(res, { error: "injected_refresh_failure" }, this.opts.refreshStatusCode);
         return;
       }
-      // 鉴权=账号 token + x-codex-installation-id（对齐 WhamClient.refresh / server_api.rs）
+      if (this.opts.refreshDelayMs) {
+        await new Promise((r) => setTimeout(r, this.opts.refreshDelayMs));
+      }
+      // 鉴权=账号 token（该账号历次有效 token 集合）+ x-codex-installation-id
       const installationId = headerValue(req, "x-codex-installation-id");
       if (
         !this.enrollment ||
-        !this.enrollment.accountToken ||
-        bearer !== this.enrollment.accountToken ||
+        !this.accountTokenIsValid(this.enrollment, bearer) ||
         installationId !== this.enrollment.installationId
       ) {
         await this.replyJson(res, { error: "invalid_token" }, 401);
@@ -237,7 +259,11 @@ export class MockWhamServer {
         this.opts.refreshTokenTtlMs ?? this.opts.tokenTtlMs ?? 24 * 3600_000,
       );
       this.log(`refresh: server_id=${request.server_id} → 新 token`);
-      await this.replyJson(res, enrollResponse(this.enrollment));
+      const response = enrollResponse(this.enrollment);
+      if (this.opts.refreshResponsePatch) {
+        Object.assign(response, this.opts.refreshResponsePatch);
+      }
+      await this.replyJson(res, response);
       return;
     }
     if (url.pathname === REST_PATHS.pair) {
@@ -313,30 +339,33 @@ export class MockWhamServer {
       await this.replyJson(res, { error: "environment_not_found" }, 404);
       return;
     }
-    // 账号鉴权：必须是 enroll 携带的账号 token，且不与 remote_control_token 相同
+    // 账号鉴权：该账号历次有效 token（非 remote_control_token）
     const bearer = (req.headers.authorization ?? "").replace(/^Bearer\s+/i, "");
     const accountId = headerValue(req, "chatgpt-account-id");
     if (
-      !accountTokenIsValid(enrollment, bearer) ||
+      !this.accountTokenIsValid(enrollment, bearer) ||
       (enrollment.accountId !== null && accountId !== enrollment.accountId)
     ) {
       await this.replyJson(res, { error: "invalid_account_token" }, 401);
       return;
     }
 
+    // BLOCKER 4：客户端按 environment 归属操作，绝不跨 env
+    const envClients = this.clientsByEnvironment.get(environmentId) ?? [];
+
     if (method === "DELETE") {
       if (!clientId) {
         await this.replyJson(res, { error: "client_id_required" }, 400);
         return;
       }
-      const idx = this.pairedClients.findIndex((c) => c.client_id === clientId);
+      const idx = envClients.findIndex((c) => c.client_id === clientId);
       if (idx < 0) {
         await this.replyJson(res, { error: "client_not_found" }, 404);
         return;
       }
-      this.pairedClients.splice(idx, 1);
+      envClients.splice(idx, 1);
       this.revokedClients.add(clientId);
-      this.log(`clients revoke: ${clientId}`);
+      this.log(`clients revoke: ${clientId} (env=${environmentId})`);
       // 2xx 空 body（WhamClient.revokeClient 必须容忍）
       res.writeHead(204).end();
       return;
@@ -354,7 +383,7 @@ export class MockWhamServer {
     }
     const order = url.searchParams.get("order") === "asc" ? "asc" : "desc";
     const offset = decodeCursor(url.searchParams.get("cursor"));
-    const sorted = [...this.pairedClients].sort((a, b) => {
+    const sorted = [...envClients].sort((a, b) => {
       const at = Date.parse(a.last_seen_at ?? "") || 0;
       const bt = Date.parse(b.last_seen_at ?? "") || 0;
       return order === "asc" ? at - bt : bt - at;
@@ -363,6 +392,13 @@ export class MockWhamServer {
     const nextOffset = offset + page.length;
     const cursor = nextOffset < sorted.length ? encodeCursor(nextOffset) : null;
     await this.replyJson(res, { items: page, cursor });
+  }
+
+  /** 账号鉴权：bearer ∈ 该账号历次有效 token 集合，且不同于 remote_control_token。 */
+  private accountTokenIsValid(enrollment: Enrollment, bearer: string): boolean {
+    if (!bearer) return false;
+    if (bearer === enrollment.token) return false; // 明确拒绝 remote_control_token
+    return this.accountTokens.get(enrollment.accountIdentity)?.has(bearer) ?? false;
   }
 
   private enrollmentForEnvironment(environmentId: string): Enrollment | null {
@@ -377,8 +413,15 @@ export class MockWhamServer {
     return null;
   }
 
-  /** 测试脚手架：播种一个已配对客户端（last_seen_at 默认按播种顺序递减）。 */
-  addClient(client: Partial<RemoteControlClient> & { client_id?: string }): RemoteControlClient {
+  /**
+   * 测试脚手架：给指定 environment 播种一个已配对客户端
+   * （last_seen_at 默认按该 env 内播种顺序递减）。
+   */
+  addClient(
+    environmentId: string,
+    client: Partial<RemoteControlClient> & { client_id?: string } = {},
+  ): RemoteControlClient {
+    const list = this.clientsByEnvironment.get(environmentId) ?? [];
     const entry: RemoteControlClient = {
       client_id: client.client_id ?? `cli_${randomUUID()}`,
       display_name: client.display_name ?? "mock device",
@@ -388,10 +431,16 @@ export class MockWhamServer {
       device_model: client.device_model ?? "iPhone",
       app_version: client.app_version ?? "1.0.0",
       last_seen_at:
-        client.last_seen_at ?? new Date(Date.now() - this.pairedClients.length * 1000).toISOString(),
+        client.last_seen_at ?? new Date(Date.now() - list.length * 1000).toISOString(),
     };
-    this.pairedClients.push(entry);
+    list.push(entry);
+    this.clientsByEnvironment.set(environmentId, list);
     return entry;
+  }
+
+  /** 某 environment 当前已配对客户端快照（测试断言用）。 */
+  clientsFor(environmentId: string): RemoteControlClient[] {
+    return [...(this.clientsByEnvironment.get(environmentId) ?? [])];
   }
 
   private async replyJson(
@@ -714,13 +763,6 @@ function headerRecord(req: IncomingMessage): Record<string, string> {
     out[key] = Array.isArray(value) ? value.join(", ") : String(value);
   }
   return out;
-}
-
-/** 账号鉴权：bearer 必须等于 enroll 携带的账号 token，且不同于 remote_control_token。 */
-function accountTokenIsValid(enrollment: Enrollment, bearer: string): boolean {
-  if (!enrollment.accountToken || !bearer) return false;
-  if (bearer === enrollment.token) return false; // 明确拒绝 remote_control_token
-  return bearer === enrollment.accountToken;
 }
 
 /** 不透明分页游标（mock 内部用偏移编码，对客户端保持不透明）。 */

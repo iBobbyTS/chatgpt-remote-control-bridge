@@ -91,8 +91,10 @@ interface StreamState {
 
 export class WhamTunnel extends EventEmitter {
   readonly app: AgentApp;
-  /** 累计 WARN（含 refresh 失败回退、身份变更），供 status 展示（S04 identityWarnings 出口）。 */
+  /** 累计 WARN（含 refresh 失败回退、身份变更/漂移），供 status 展示。 */
   readonly warnings: string[] = [];
+  /** 身份相关 WARN 子集（S04 status.identityWarnings 的出口）。 */
+  readonly identityWarnings: string[] = [];
   private readonly authManager: BridgeAuthManager;
   private readonly baseUrl: string;
   private readonly name: string;
@@ -114,6 +116,7 @@ export class WhamTunnel extends EventEmitter {
   private pingTimer: NodeJS.Timeout | null = null;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private renewalInFlight: Promise<void> | null = null;
+  private stopPromise: Promise<void> | null = null;
   private lastPongAt = 0;
   private jsonlQueue: Promise<void> = Promise.resolve();
 
@@ -215,6 +218,7 @@ export class WhamTunnel extends EventEmitter {
   }
 
   private async doRenewEnrollment(reason: string): Promise<void> {
+    if (this.stopped) return;
     const client = this.whamClient();
     const previous = this.enrollment ?? (await this.loadPersistedEnrollment());
     if (previous) {
@@ -223,11 +227,13 @@ export class WhamTunnel extends EventEmitter {
         await this.applyEnrollment(refreshed, previous, "refresh", reason);
         return;
       } catch (err) {
+        if (this.stopped) return;
         this.warn(
           `refresh 失败（${reason}），回退 enroll 兜底（可能铸新身份）: ${errorMessage(err)}`,
         );
       }
     }
+    if (this.stopped) return;
     const enrolled = await client.enroll({
       name: this.name,
       appServerVersion: this.appServerVersion,
@@ -241,11 +247,27 @@ export class WhamTunnel extends EventEmitter {
     mode: "refresh" | "enroll",
     reason: string,
   ): Promise<void> {
-    if (previous && next.server_id !== previous.server_id) {
-      this.warn(
-        `身份变更：server_id ${previous.server_id} → ${next.server_id}（${mode}/${reason}）；` +
-          `兜底 enroll 可能已铸新 environment`,
-      );
+    // 停止与续期提交互斥（BLOCKER 1）：stop() 置位后到达的结果一律丢弃，不写盘、不发事件
+    if (this.stopped) {
+      this.log(`${mode} 结果在 stop 之后到达，已丢弃（${reason}）`);
+      return;
+    }
+    if (previous) {
+      const serverChanged = next.server_id !== previous.server_id;
+      const environmentChanged = next.environment_id !== previous.environment_id;
+      if (mode === "refresh" && (serverChanged || environmentChanged)) {
+        // BLOCKER 2：refresh 必须保身份；漂移接受但可见（codex server_api.rs 视为硬错误）
+        this.warnIdentity(
+          `身份漂移：refresh 返回 server_id ${previous.server_id} → ${next.server_id}、` +
+            `environment_id ${previous.environment_id} → ${next.environment_id}（${reason}）`,
+        );
+      } else if (mode === "enroll" && (serverChanged || environmentChanged)) {
+        this.warnIdentity(
+          `身份变更：server_id ${previous.server_id} → ${next.server_id}、` +
+            `environment_id ${previous.environment_id} → ${next.environment_id}（${reason}）；` +
+            `兜底 enroll 可能已铸新 environment`,
+        );
+      }
     }
     this.enrollment = next;
     try {
@@ -253,7 +275,12 @@ export class WhamTunnel extends EventEmitter {
     } catch (err) {
       this.warn(`enrollment 持久化失败: ${errorMessage(err)}`);
     }
-    this.emit("enrollment", { ...next });
+    // stop() 可能在 persist await 期间置位：再次确认后不再对外发布
+    if (this.stopped) {
+      this.log(`enrollment 在 stop 之后到达，已丢弃事件（${reason}）`);
+      return;
+    }
+    this.safeEmit("enrollment", { ...next });
     this.log(
       `${mode} ✓ (${reason}) server_id=${next.server_id} environment_id=${next.environment_id} ` +
         `expires_at=${next.expires_at}`,
@@ -375,13 +402,28 @@ export class WhamTunnel extends EventEmitter {
     }, this.reconnectDelayMs);
   }
 
-  async stop(): Promise<void> {
+  /**
+   * 停止隧道。BLOCKER 1：置 stopped 后等待在途续期收敛（其结果在 applyEnrollment
+   * 处被丢弃），因此 stop() resolve 后不再有任何 enrollment 落盘/事件。
+   */
+  stop(): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
     this.stopped = true;
     this.stopPing();
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    const inFlight = this.renewalInFlight;
     this.app.close();
     this.ws?.close();
     this.ws = null;
+    this.stopPromise = (async () => {
+      if (inFlight) {
+        // 只等待其结束，不消费其结果；续期失败也不得让 stop 抛错
+        await inFlight.catch(() => undefined);
+      }
+    })();
+    return this.stopPromise;
   }
 
   // ----------------------------------------------------------------- 帧处理
@@ -555,19 +597,49 @@ export class WhamTunnel extends EventEmitter {
   private fault(err: unknown, context: string): void {
     const message = errorMessage(err);
     this.log(`! [${context}] ${message}`);
-    this.emit("fault", err, context);
+    this.safeEmit("fault", err, context);
+    this.callFaultHandler(err, context);
+  }
+
+  /**
+   * NIT 2：故障回调的同步 throw 与异步 rejection 都不得反噬 tunnel / 变成
+   * unhandledRejection——返回值若是 thenable 必须挂 .catch。
+   */
+  private callFaultHandler(err: unknown, context: string): void {
+    if (!this.onFault) return;
+    let result: unknown;
     try {
-      this.onFault?.(err, context);
+      result = this.onFault(err, context);
     } catch (handlerErr) {
-      // 故障回调自身异常不得反噬 tunnel
       this.log(`! [onFault] ${errorMessage(handlerErr)}`);
+      return;
+    }
+    if (result && typeof (result as PromiseLike<unknown>).then === "function") {
+      void (result as Promise<unknown>).catch((handlerErr) => {
+        this.log(`! [onFault async] ${errorMessage(handlerErr)}`);
+      });
     }
   }
 
   private warn(line: string): void {
     this.warnings.push(line);
     this.log(`WARN ${line}`);
-    this.emit("warn", line);
+    this.safeEmit("warn", line);
+  }
+
+  /** 身份相关 WARN：同时进入 warnings 与 identityWarnings（S04 status 出口）。 */
+  private warnIdentity(line: string): void {
+    this.identityWarnings.push(line);
+    this.warn(line);
+  }
+
+  /** emit 的同步 listener 异常不得打断 tunnel 主流程。 */
+  private safeEmit(event: string, ...args: unknown[]): void {
+    try {
+      this.emit(event, ...args);
+    } catch (emitErr) {
+      this.log(`! [emit ${event}] ${errorMessage(emitErr)}`);
+    }
   }
 
   // ----------------------------------------------------------------- 日志
