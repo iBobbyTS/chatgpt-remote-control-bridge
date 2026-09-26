@@ -5,7 +5,7 @@
  * 的固定响应与通知事件流、seq 递增、interrupt、虚拟 FS、process/spawn。
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, after } from "node:test";
@@ -23,6 +23,15 @@ after(async () => {
 
 async function tempDir(slug: string): Promise<string> {
   const base = join(process.cwd(), ".agent-work", "tmp", "sim-tests");
+  await mkdir(base, { recursive: true });
+  const dir = await mkdtemp(join(base, `${slug}-`));
+  cleanupDirs.push(dir);
+  return dir;
+}
+
+/** 虚拟 FS 用例的固定数据源：.agent-work/tmp/wham-tests/ 下的小型目录，避免读真实 $HOME。 */
+async function whamTempDir(slug: string): Promise<string> {
+  const base = join(process.cwd(), ".agent-work", "tmp", "wham-tests");
   await mkdir(base, { recursive: true });
   const dir = await mkdtemp(join(base, `${slug}-`));
   cleanupDirs.push(dir);
@@ -285,11 +294,28 @@ test("回环：fs 虚拟目录 + process/spawn mkdir 覆盖层", async () => {
   const loop = await startLoop();
   try {
     await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
-    const home = homedir();
-    const real = (await loop.mock.rpc("fs/readDirectory", { path: home })) as {
+    // 读真实 $HOME 在目录很大/机器负载下会拖慢甚至超时 fs/readDirectory（外部评审曾在此挂起）。
+    // 改用 .agent-work/tmp/wham-tests/ 下预建的小型固定目录：仍验证 sim「真实 FS 只读合并」能力。
+    const fixedDir = await whamTempDir("readdir");
+    await mkdir(join(fixedDir, "subdir"), { recursive: true });
+    await writeFile(join(fixedDir, "alpha.txt"), "alpha");
+    await writeFile(join(fixedDir, "beta.txt"), "beta");
+    const real = (await loop.mock.rpc("fs/readDirectory", { path: fixedDir }, 10_000)) as {
       result: { entries: Array<{ fileName: string; isDirectory: boolean }> };
     };
     assert.ok(Array.isArray(real.result.entries) && real.result.entries.length > 0);
+    const names = real.result.entries.map((e) => e.fileName);
+    for (const expected of ["alpha.txt", "beta.txt", "subdir"]) {
+      assert.ok(names.includes(expected), `readDirectory 应包含 ${expected}: ${names.join(",")}`);
+    }
+    assert.ok(
+      real.result.entries.some((e) => e.fileName === "subdir" && e.isDirectory),
+      "subdir 应被识别为目录",
+    );
+    assert.ok(
+      real.result.entries.some((e) => e.fileName === "alpha.txt" && !e.isDirectory),
+      "alpha.txt 应被识别为文件",
+    );
 
     // process/spawn 模拟手机「新建任务目录」脚本（真实形状）：stdout 返回创建的目录路径
     const realMkdirScript =
@@ -321,13 +347,13 @@ test("回环：fs 虚拟目录 + process/spawn mkdir 覆盖层", async () => {
     const today = new Date();
     const dateStr = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}-${String(today.getDate()).padStart(2, "0")}`;
     assert.equal(taskDir, `${homedir()}/Documents/Codex/${dateStr}/sim-new-task`);
-    const taskMeta = (await loop.mock.rpc("fs/getMetadata", { path: taskDir })) as {
+    const taskMeta = (await loop.mock.rpc("fs/getMetadata", { path: taskDir }, 10_000)) as {
       result: { isDirectory: boolean };
     };
     assert.equal(taskMeta.result.isDirectory, true);
 
-    // process/spawn 模拟手机 mkdir 任务目录（不真正落盘）
-    const overlayDir = `${home}/Documents/Codex/2026-09-25/sim-overlay-task`;
+    // process/spawn 模拟手机 mkdir 任务目录（不真正落盘）；父目录同样落在固定数据源下
+    const overlayDir = join(fixedDir, "Documents", "Codex", "2026-09-25", "sim-overlay-task");
     loop.mock.receivedNotifications.length = 0;
     const spawnResult = (await loop.mock.rpc("process/spawn", {
       command: ["/bin/bash", "-lc", `mkdir -p ${overlayDir}`],
@@ -346,13 +372,15 @@ test("回环：fs 虚拟目录 + process/spawn mkdir 覆盖层", async () => {
     );
 
     // 覆盖层目录可见
-    const parent = (await loop.mock.rpc("fs/readDirectory", {
-      path: `${home}/Documents/Codex/2026-09-25`,
-    })) as { result: { entries: Array<{ fileName: string; isDirectory: boolean }> } };
+    const parent = (await loop.mock.rpc(
+      "fs/readDirectory",
+      { path: join(fixedDir, "Documents", "Codex", "2026-09-25") },
+      10_000,
+    )) as { result: { entries: Array<{ fileName: string; isDirectory: boolean }> } };
     assert.ok(
       parent.result.entries.some((e) => e.fileName === "sim-overlay-task" && e.isDirectory),
     );
-    const meta = (await loop.mock.rpc("fs/getMetadata", { path: overlayDir })) as {
+    const meta = (await loop.mock.rpc("fs/getMetadata", { path: overlayDir }, 10_000)) as {
       result: { isDirectory: boolean };
     };
     assert.equal(meta.result.isDirectory, true);
