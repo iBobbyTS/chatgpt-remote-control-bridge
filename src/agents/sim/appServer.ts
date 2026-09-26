@@ -1852,7 +1852,10 @@ export class SimApp extends EventEmitter implements AgentApp {
   private processSpawn(p: AnyParams): unknown {
     const command: string[] = Array.isArray(p.command) ? p.command : [];
     const handle = p.processHandle ?? `sim-${uuidv7()}`;
-    const { stdout, stderr, exitCode } = this.emulateShellScript(command.join(" "));
+    const { stdout, stderr, exitCode } = this.emulateShellScript(
+      command.join(" "),
+      p.env !== null && typeof p.env === "object" ? (p.env as Record<string, unknown>) : undefined,
+    );
     this.emit("event", this.notification("process/exited", {
       processHandle: handle,
       exitCode,
@@ -1869,12 +1872,17 @@ export class SimApp extends EventEmitter implements AgentApp {
    * 已知模式按真机语义应答：任务目录 mkdir（覆盖层 + 路径应答）、HOME 探测、
    * draft git 探测（非 git 目录形状）、其他 mkdir 登记覆盖层、周期 workspace-diff
    * 静默空应答；未识别脚本留痕后空 stdout / exit 0 兜底。
+   * env 为 command/exec 的环境覆盖（新版任务目录脚本经 CODEX_PROJECTLESS_ROOT
+   * 注入根目录，脚本文本不再含 Documents/Codex 字样）。
    */
-  private emulateShellScript(script: string): { stdout: string; stderr: string; exitCode: number } {
+  private emulateShellScript(
+    script: string,
+    env?: Record<string, unknown>,
+  ): { stdout: string; stderr: string; exitCode: number } {
     let stdout = "";
     let stderr = "";
     let exitCode = 0;
-    const taskDir = this.emulateTaskDirMkdir(script);
+    const taskDir = this.emulateTaskDirMkdir(script, env);
     if (taskDir) {
       // 手机端新建任务：解析 stdout 拿任务目录路径（真实脚本 printf candidate）
       stdout = `${taskDir}\n`;
@@ -1923,18 +1931,21 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (command.length === 0) {
       throw new SimMethodError(-32600, "command must not be empty");
     }
-    // codex-read-only 包装：["/bin/sh","-c","printf '\0'; exec \"$@\"",arg0,
-    // "/bin/sh","-lc",<内层脚本>]——外壳先输出 NUL 再 exec 内层，仿真保持同形状
+    // codex 沙箱包装（read-only / workspace-write 同形）：
+    // ["/bin/sh","-c","printf '\0'; exec \"$@\"",<wrapper>,"/bin/sh","-lc",<内层脚本>]
+    // ——外壳先输出 NUL 再 exec 内层，仿真保持同形状输出
     let script = command.join(" ");
     let nulPrefix = false;
     if (
-      command.length === 7 && command[3] === "codex-read-only" && command[5] === "-lc" &&
-      typeof command[6] === "string"
+      command.length === 7 && command[1] === "-c" && command[5] === "-lc" &&
+      typeof command[2] === "string" && typeof command[6] === "string" &&
+      command[2].includes("exec \"$@\"")
     ) {
       script = command[6];
-      nulPrefix = typeof command[2] === "string" && command[2].includes("printf '\\0'");
+      nulPrefix = command[2].includes("printf '\\0'");
     }
-    const emulated = this.emulateShellScript(script);
+    const env = p.env !== null && typeof p.env === "object" ? (p.env as Record<string, unknown>) : undefined;
+    const emulated = this.emulateShellScript(script, env);
     const stdout = nulPrefix ? `\0${emulated.stdout}` : emulated.stdout;
     const capBytes = typeof p.outputBytesCap === "number" && Number.isFinite(p.outputBytesCap) &&
       p.outputBytesCap >= 0
@@ -1993,11 +2004,23 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /**
-   * 识别手机端「新建任务目录」脚本（root="${HOME}/Documents/Codex" + base="<name>"），
-   * 在覆盖层创建 <home>/Documents/Codex/<今天>/<base>（重名加 -N 后缀）并返回完整路径。
+   * 识别手机端「新建任务目录」脚本并返回应答路径，同时在覆盖层创建目录：
+   * - 旧版（≤1.2026.251）：root="${HOME}/Documents/Codex" 硬编码在脚本文本里；
+   * - 新版（1.2026.258）：root="$CODEX_PROJECTLESS_ROOT"（env 注入根目录），
+   *   base 取消息文本（如 base="hi"），重名加 -N 后缀，应答 printf candidate。
    */
-  private emulateTaskDirMkdir(script: string): string | null {
-    if (!script.includes("Documents/Codex") || !/\bbase="([^"]+)"/.test(script)) {
+  private emulateTaskDirMkdir(script: string, env?: Record<string, unknown>): string | null {
+    if (!/\bbase="([^"]+)"/.test(script)) {
+      return null;
+    }
+    let root: string | null = null;
+    if (script.includes('root="$CODEX_PROJECTLESS_ROOT"')) {
+      const fromEnv = env?.CODEX_PROJECTLESS_ROOT;
+      root = typeof fromEnv === "string" && fromEnv !== "" ? fromEnv : `${homedir()}/Documents/Codex`;
+    } else if (script.includes("Documents/Codex")) {
+      root = `${homedir()}/Documents/Codex`;
+    }
+    if (!root) {
       return null;
     }
     const base = script.match(/\bbase="([^"]+)"/)![1]!;
@@ -2005,7 +2028,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const yyyy = date.getFullYear();
     const mm = String(date.getMonth() + 1).padStart(2, "0");
     const dd = String(date.getDate()).padStart(2, "0");
-    const dateDir = `${homedir()}/Documents/Codex/${yyyy}-${mm}-${dd}`;
+    const dateDir = `${root}/${yyyy}-${mm}-${dd}`;
     this.overlayMkdir(dateDir);
     let candidate = `${dateDir}/${base}`;
     let index = 1;

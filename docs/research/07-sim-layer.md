@@ -446,3 +446,16 @@ process/spawn（全部成功），证明是新版协议差异。
 - sim 实现 `command/exec`（+write/terminate/resize），仿真引擎与 process/spawn 共用
   （`emulateShellScript` 提取），HOME 探测回 `\0 + realpath($HOME)`；
 - 测试：sim 3 个（流式/缓冲+cap/校验与错误文案）+ wham T12（target 定向路由），全量 179/179。
+
+### 追记：第二层「Codex 执行失败」（同日 17:31）
+
+command/exec 打通后，手机新会话卡在下一步：**任务目录创建脚本**改走
+`codex-workspace-write` 包装，且根目录不再硬编码 `Documents/Codex` 而是
+`root="$CODEX_PROJECTLESS_ROOT"`（env 注入，base=消息文本，应答 printf candidate）。
+两处叠加：包装解包只认了 `codex-read-only`；`emulateTaskDirMkdir` 匹配不上新脚本
+→ 回空 stdout，手机拿不到新任务目录路径 → 弹「Codex 执行失败」。
+
+修复（commit 与 75009e6 批次相邻）：包装解包改为结构判定（`exec "$@"` 外壳 +
+`-lc` 内层，任意 codex-* arg0）；任务目录脚本支持 env 根目录（env 经
+processSpawn/commandExec 下传 emulateShellScript）；测试新增 workspace-write
+任务目录原样脚本用例，全量 180/180。

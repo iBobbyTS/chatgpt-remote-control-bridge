@@ -2742,3 +2742,77 @@ test("回环：command/exec 校验顺序与 write/terminate/resize 无会话错�
     await loop.mock.stop();
   }
 });
+
+test("回环：command/exec codex-workspace-write 任务目录脚本（1.2026.258 新会话）应答 candidate 路径", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "codex_chatgpt_ios_remote" } });
+    // 真机 2026-09-26T17:31:54Z 抓包原样：根目录经 env CODEX_PROJECTLESS_ROOT 注入，
+    // base=消息文本；应答 stdout 即新任务目录（手机拿不到路径 →「Codex 执行失败」）
+    const script = [
+      "set -eu",
+      'root="$CODEX_PROJECTLESS_ROOT"',
+      'date_directory="$root/$(date +%Y-%m-%d)"',
+      'mkdir -p "$root"',
+      'if [ ! -d "$root" ] || [ -L "$root" ]; then',
+      '  echo "Codex projectless chat root must be a real directory." >&2',
+      "  exit 1",
+      "fi",
+      'mkdir -p "$date_directory"',
+      'if [ ! -d "$date_directory" ] || [ -L "$date_directory" ]; then',
+      '  echo "Codex projectless chat date directory must be a real directory." >&2',
+      "  exit 1",
+      "fi",
+      'base="hi"',
+      'candidate="$date_directory/$base"',
+      "index=1",
+      'while ! mkdir "$candidate" 2>/dev/null; do',
+      "  index=$((index + 1))",
+      '  if [ "$index" -gt 1000 ]; then',
+      '    echo "Could not create a unique Codex projectless chat directory." >&2',
+      "    exit 1",
+      "  fi",
+      '  candidate="$date_directory/$base-$index"',
+      "done",
+      "printf '%s\\n' \"$candidate\"",
+    ].join("\n");
+    const root = `${homedir()}/Documents/Codex`;
+    const res = (await loop.mock.rpc("command/exec", {
+      timeoutMs: 20000,
+      cwd: "/",
+      env: { ENV: null, BASH_ENV: null, CODEX_PROJECTLESS_ROOT: root },
+      processId: "ios-workspace-write-TEST",
+      outputBytesCap: 4097,
+      streamStdoutStderr: true,
+      sandboxPolicy: {
+        type: "workspaceWrite",
+        networkAccess: true,
+        writableRoots: [`${homedir()}/Documents`],
+        excludeSlashTmp: false,
+        excludeTmpdirEnvVar: false,
+      },
+      command: [
+        "/bin/sh", "-c", "printf '\\0'; exec \"$@\"", "codex-workspace-write",
+        "/bin/sh", "-lc", script,
+      ],
+    })) as { result: { exitCode: number; stdout: string; stderr: string } };
+    assert.deepEqual(res.result, { exitCode: 0, stdout: "", stderr: "" });
+
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "command/exec/outputDelta"),
+      5000,
+      "任务目录 outputDelta 未到达",
+    );
+    const delta = loop.mock.receivedNotifications.find(
+      (n) => n.method === "command/exec/outputDelta",
+    )!.params as { processId: string; stream: string; deltaBase64: string };
+    assert.equal(delta.processId, "ios-workspace-write-TEST");
+    const text = Buffer.from(delta.deltaBase64, "base64").toString("utf8");
+    const d = new Date();
+    const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    assert.equal(text, `\0${root}/${ymd}/hi\n`, "应答应为 NUL 前缀 + 新任务目录路径");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
