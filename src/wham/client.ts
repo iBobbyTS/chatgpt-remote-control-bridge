@@ -8,15 +8,19 @@
  * - installation_id：与 codex 相同语义（每安装唯一，持久化在 CODEX_HOME）
  */
 import { randomUUID } from "node:crypto";
-import { readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { release } from "node:os";
 import { join } from "node:path";
 import type { BridgeAuthManager } from "../auth/manager.ts";
 import {
   REST_PATHS,
+  environmentClientPath,
+  environmentClientsPath,
   type EnrollRemoteServerResponse,
+  type RemoteControlClientsListOrder,
+  type RemoteControlClientsListResponse,
 } from "./protocol.ts";
-import { curlPostJson } from "./rest.ts";
+import { curlDeleteJson, curlGetJson, curlPostJson } from "./rest.ts";
 
 export const DEFAULT_CHATGPT_BASE_URL = "https://chatgpt.com";
 
@@ -37,6 +41,11 @@ function normalizeBaseUrl(baseUrl: string): string {
 export interface WhamClientOptions {
   authManager: BridgeAuthManager;
   baseUrl?: string;
+  /**
+   * installation_id 所在目录（每实例身份隔离）；默认 authManager.codexHome
+   * （现有调用方行为不变）。S02 实例运行器传实例目录。
+   */
+  installationDir?: string;
 }
 
 export class WhamError extends Error {
@@ -52,16 +61,21 @@ export class WhamError extends Error {
 export class WhamClient {
   readonly baseUrl: string;
   private readonly authManager: BridgeAuthManager;
+  private readonly installationDir: string;
 
   constructor(opts: WhamClientOptions) {
     // REST_PATHS 自带 /backend-api 前缀，baseUrl 归一化为 origin
     this.baseUrl = normalizeBaseUrl(opts.baseUrl ?? DEFAULT_CHATGPT_BASE_URL);
     this.authManager = opts.authManager;
+    this.installationDir = opts.installationDir ?? opts.authManager.codexHome;
   }
 
-  /** 读取或生成 installation_id（持久化在 CODEX_HOME）。 */
-  async installationId(): Promise<string> {
-    const path = join(this.authManager.codexHome, "installation_id");
+  /**
+   * 读取或生成 installation_id（持久化在指定目录，默认 CODEX_HOME）。
+   * 传 dir 可覆盖构造时的 installationDir（每实例身份）。
+   */
+  async installationId(dir?: string): Promise<string> {
+    const path = join(dir ?? this.installationDir, "installation_id");
     try {
       const existing = (await readFile(path, "utf8")).trim();
       if (existing) {
@@ -71,6 +85,7 @@ export class WhamClient {
       // 不存在则生成
     }
     const id = randomUUID();
+    await mkdir(dir ?? this.installationDir, { recursive: true });
     await writeFile(path, `${id}\n`, { mode: 0o600 });
     return id;
   }
@@ -87,7 +102,7 @@ export class WhamClient {
     }
     headers["x-codex-installation-id"] = await this.installationId();
     // Cloudflare 会拦默认 node UA；对齐 codex 的 UA 形状（default_client.rs get_codex_user_agent）
-    headers["User-Agent"] = `codex_cli_rs/0.156.1 (${osName()} ${release()}; ${process.arch}) dumb`;
+    headers["User-Agent"] = codexUserAgent();
     const { status, body: text } = await curlPostJson(
       `${this.baseUrl}${path}`,
       headers,
@@ -151,6 +166,66 @@ export class WhamClient {
       args.remoteControlToken,
     );
   }
+
+  /**
+   * 列出 environment 下已配对客户端（clients.rs list_remote_control_clients）。
+   *
+   * 鉴权=账号 token（authHeaders，含 chatgpt-account-id），**不带** remote_control_token
+   * bearer 覆盖，**不带** x-codex-installation-id（对齐 clients.rs:172/194/222 → auth.rs
+   * request_headers）。limit ∈ 1..=100（同 codex InvalidInput 校验）。
+   */
+  async listClients(args: {
+    environmentId: string;
+    limit?: number;
+    cursor?: string;
+    order?: RemoteControlClientsListOrder;
+  }): Promise<RemoteControlClientsListResponse> {
+    if (!args.environmentId) {
+      throw new Error("listClients requires environmentId");
+    }
+    if (args.limit !== undefined && (!Number.isInteger(args.limit) || args.limit < 1 || args.limit > 100)) {
+      throw new Error("listClients limit must be between 1 and 100");
+    }
+    const query = new URLSearchParams();
+    if (args.limit !== undefined) query.set("limit", String(args.limit));
+    if (args.order) query.set("order", args.order);
+    if (args.cursor) query.set("cursor", args.cursor);
+    const path = environmentClientsPath(args.environmentId);
+    const url = `${this.baseUrl}${path}${query.size > 0 ? `?${query.toString()}` : ""}`;
+    const { status, body } = await curlGetJson(url, await this.accountHeaders());
+    if (status < 200 || status >= 300) {
+      throw new WhamError(status, body);
+    }
+    return JSON.parse(body) as RemoteControlClientsListResponse;
+  }
+
+  /**
+   * 吊销一个已配对客户端（clients.rs revoke_remote_control_client）。
+   * DELETE 成功为 2xx **空 body**：不回读/解码响应体。鉴权同 listClients（账号 token）。
+   */
+  async revokeClient(args: { environmentId: string; clientId: string }): Promise<void> {
+    if (!args.environmentId) {
+      throw new Error("revokeClient requires environmentId");
+    }
+    if (!args.clientId) {
+      throw new Error("revokeClient requires clientId");
+    }
+    const url = `${this.baseUrl}${environmentClientPath(args.environmentId, args.clientId)}`;
+    const { status, body } = await curlDeleteJson(url, await this.accountHeaders());
+    if (status < 200 || status >= 300) {
+      throw new WhamError(status, body);
+    }
+  }
+
+  /**
+   * 账号 token 请求头（clients 管理用）：authHeaders() + codex UA。
+   * 不含 x-codex-installation-id（与 enroll/refresh 的 post() 不同，对齐 auth.rs）。
+   */
+  private async accountHeaders(): Promise<Record<string, string>> {
+    const headers = await this.authManager.authHeaders();
+    headers["User-Agent"] = codexUserAgent();
+    return headers;
+  }
 }
 
 function platformOs(): string {
@@ -173,4 +248,9 @@ function osName(): string {
     default:
       return "Linux";
   }
+}
+
+/** codex UA 形状（default_client.rs get_codex_user_agent）；CF 会拦默认 node UA。 */
+function codexUserAgent(): string {
+  return `codex_cli_rs/0.156.1 (${osName()} ${release()}; ${process.arch}) dumb`;
 }

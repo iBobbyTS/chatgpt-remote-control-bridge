@@ -74,7 +74,23 @@ export const REST_PATHS = {
   pair: "/backend-api/wham/remote/control/server/pair",
   pairStatus: "/backend-api/wham/remote/control/server/pair/status",
   websocket: "/backend-api/wham/remote/control/server",
+  /**
+   * 环境客户端管理基路径（clients.rs environment_clients_url）：
+   * `{environments}/{environment_id}/clients[/{client_id}]`。
+   * 账号 token 鉴权（auth.rs request_headers），非 remote_control_token。
+   */
+  environments: "/backend-api/wham/remote/control/environments",
 } as const;
+
+/** `{environments}/{environment_id}/clients`（clients.rs environment_clients_url）。 */
+export function environmentClientsPath(environmentId: string): string {
+  return `${REST_PATHS.environments}/${encodeURIComponent(environmentId)}/clients`;
+}
+
+/** `{environments}/{environment_id}/clients/{client_id}`。 */
+export function environmentClientPath(environmentId: string, clientId: string): string {
+  return `${environmentClientsPath(environmentId)}/${encodeURIComponent(clientId)}`;
+}
 
 export interface EnrollRemoteServerRequest {
   name: string;
@@ -89,4 +105,24 @@ export interface EnrollRemoteServerResponse {
   environment_id: string;
   remote_control_token: string;
   expires_at: string;
+}
+
+/** 环境客户端条目（clients.rs RemoteControlClientResponse，wire 为 snake_case）。 */
+export interface RemoteControlClient {
+  client_id: string;
+  display_name?: string | null;
+  device_type?: string | null;
+  platform?: string | null;
+  os_version?: string | null;
+  device_model?: string | null;
+  app_version?: string | null;
+  last_seen_at?: string | null;
+}
+
+export type RemoteControlClientsListOrder = "asc" | "desc";
+
+/** GET clients 响应（clients.rs ListRemoteControlClientsResponse）。 */
+export interface RemoteControlClientsListResponse {
+  items: RemoteControlClient[];
+  cursor?: string | null;
 }
