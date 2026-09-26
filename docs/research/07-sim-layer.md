@@ -137,6 +137,24 @@ npm run sim -- --name "名字"   # 手机上显示的服务器名（默认 <主�
    导致 [用户消息, 回复] 显示成 [回复, 用户消息]。
    → 修复：items/list 尊重 sortDirection（默认 desc），与 turns/list 一致。
 
+## 二轮手机实测：用户消息双渲染的第二条路径（2026-09-25 深夜，正式化后）
+
+现象：配对成功后在「模拟会话：桥接链路验证」发 "hi"，实时视图出现 2 个 hi，
+手机自动刷新（thread/items/list 全量重建）后恢复 1 个。持久层自始至终只有 1 份
+（state.json 仅 1 条 userMessage），纯实时渲染路径问题。
+
+根因（区别于上文问题 2 的 turn/completed 路径）：模拟层在 `turn/start` 派发内
+**同步**发射 `thread/status/changed`/`turn/started`/userMessage 的
+`item/started`/`item/completed`，而隧道把 JSON-RPC 响应写在 handleRequest 之后——
+通知先于响应上线。真实 codex（catalog3 winnerTurn 抓包）中响应先回，userMessage
+item 事件比 `turn/started` 晚 ~620ms；手机依赖该次序把本地回显（键 =
+clientUserMessageId）与服务器 item（item.clientId 对账）合并，顺序颠倒即双渲染。
+
+→ 修复：`beginSimTurn` 的通知序列推迟一个宏任务（setTimeout 0，微任务不可保证）
+发射，状态写入保持同步；`turn/started` 显式带空 items（真实形状，userMessage
+只经 item 事件下发）。回归测试两道：应用层「turn/start 派发期间零通知」+
+隧道线上时序「响应信封先于全部 turn 通知」（mockServer 增 receivedEnvelopeLog）。
+
 ## 对齐 codex 线程生命周期（源码实证）
 
 codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁盘 rollout；

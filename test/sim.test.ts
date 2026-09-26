@@ -227,6 +227,95 @@ test("回环：initialize / thread/list（固定列表）/ thread/start / turn �
   }
 });
 
+test("turn/start 派发期间不得发射 turn 通知（响应先行的应用层契约）", async () => {
+  const dir = await tempDir("order-app");
+  const app = new SimApp({ codexHome: dir, stepDelayMs: 10, deltaIntervalMs: 2, deltaChars: 64 });
+  const events: Array<{ method: string; params: unknown }> = [];
+  app.on("event", (n) => events.push({ method: n.method, params: n.params }));
+  const key = { clientId: "c", streamId: "s" };
+  await app.handleRequest(key, 0, "initialize", { clientInfo: { name: "t" } });
+  const started = (await app.handleRequest(key, 1, "thread/start", { cwd: "/tmp-sim/order" })) as {
+    result: { thread: { id: string } };
+  };
+  const threadId = started.result.thread.id;
+  events.length = 0;
+
+  // await 续体运行于微任务：若通知在 turn/start 派发内同步发射，此刻必已可见。
+  // 手机依赖「响应先于 userMessage item 事件」完成本地回显对账，顺序颠倒会
+  // 双渲染用户消息（2026-09-25 真机复现，docs/research/07）。
+  await app.handleRequest(key, 2, "turn/start", {
+    threadId,
+    input: [{ type: "text", text: "order", text_elements: [] }],
+    clientUserMessageId: "client-order-1",
+  });
+  assert.equal(events.length, 0, "turn/start 响应就绪时不得已有本 turn 的通知");
+
+  await waitFor(() => events.some((n) => n.method === "turn/completed"), 5000, "turn/completed");
+  const order = (m: string) => events.findIndex((n) => n.method === m);
+  assert.ok(order("turn/started") >= 0, "turn/started");
+  assert.ok(order("item/started") > order("turn/started"), "userMessage item 事件晚于 turn/started");
+  const userStarted = events.find(
+    (n) => n.method === "item/started" && (n.params as { item: { type: string } }).item.type === "userMessage",
+  )!;
+  assert.equal(
+    (userStarted.params as { item: { clientId: string | null } }).item.clientId,
+    "client-order-1",
+    "userMessage item 应携带 clientUserMessageId（手机对账键）",
+  );
+  const turnStarted = events.find((n) => n.method === "turn/started")!;
+  assert.deepEqual(
+    (turnStarted.params as { turn: { items: unknown[] } }).turn.items,
+    [],
+    "turn/started 的 turn.items 必须为空（userMessage 只经 item 事件下发）",
+  );
+  app.close();
+});
+
+test("回环：turn/start 响应先于 turn 通知上线（手机端双渲染回归）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "t" },
+      capabilities: { optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/order" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedEnvelopeLog.length = 0;
+
+    const turn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "order-probe", text_elements: [] }],
+      clientUserMessageId: "client-order-2",
+    })) as { id: number | string; result: { turn: { id: string; status: string } } };
+    assert.equal(turn.result.turn.status, "inProgress");
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+
+    // 线上顺序（到达序）：turn/start 响应信封必须先于本 turn 的全部通知信封
+    const log = loop.mock.receivedEnvelopeLog;
+    const notificationEntries = log.filter((e) => e.kind === "notification");
+    assert.ok(notificationEntries.length > 0, "应收到 turn 通知");
+    const responseIndex = log.findIndex(
+      (e) => e.kind === "response" && String(e.id) === String(turn.id),
+    );
+    assert.ok(responseIndex >= 0, "turn/start 响应应在时序日志中");
+    for (const e of notificationEntries) {
+      assert.ok(
+        log.indexOf(e) > responseIndex,
+        `通知 ${e.method} 必须晚于 turn/start 响应上线`,
+      );
+    }
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("回环：interrupt → interrupted；steer 注入；queue 自动消费", async () => {
   const loop = await startLoop();
   try {

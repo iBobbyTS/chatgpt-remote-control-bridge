@@ -129,6 +129,16 @@ export class MockWhamServer {
   readonly scriptResults: Array<{ method: string; response: unknown }> = [];
   /** 收到的 codex 通知（method+params，测试断言用）。 */
   readonly receivedNotifications: Array<{ method: string; params: unknown }> = [];
+  /**
+   * server_message 到达时序（响应/服务器请求/通知同序记录，测试断言
+   * 「响应先于某通知上线」的线上顺序用——分片消息在重组后记录一次）。
+   */
+  readonly receivedEnvelopeLog: Array<{
+    seqId: number;
+    kind: "response" | "serverRequest" | "notification";
+    id?: string | number;
+    method?: string;
+  }> = [];
   /** 收到的 codex 请求（codex 主动发起，如 attestation/generate）。 */
   readonly receivedServerRequests: Array<{ method: string; params: unknown }> = [];
   /** 收到的 server_message 帧 seq_id 序列（按到达顺序）。 */
@@ -667,6 +677,7 @@ export class MockWhamServer {
           return;
         }
         if ("id" in message && ("result" in message || "error" in message)) {
+          this.receivedEnvelopeLog.push({ seqId: envelope.seq_id, kind: "response", id: message.id });
           const pending = this.pending.get(String(message.id));
           if (pending) {
             clearTimeout(pending.timer);
@@ -678,8 +689,19 @@ export class MockWhamServer {
         } else if ("method" in message) {
           // codex 主动通知 / codex 发起的请求（如 approval 请求）
           if ("id" in message) {
+            this.receivedEnvelopeLog.push({
+              seqId: envelope.seq_id,
+              kind: "serverRequest",
+              id: message.id,
+              method: message.method,
+            });
             this.receivedServerRequests.push({ method: message.method, params: message.params });
           } else {
+            this.receivedEnvelopeLog.push({
+              seqId: envelope.seq_id,
+              kind: "notification",
+              method: message.method,
+            });
             this.receivedNotifications.push({ method: message.method, params: message.params });
           }
           this.log(

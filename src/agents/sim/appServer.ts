@@ -630,39 +630,48 @@ export class SimApp extends EventEmitter implements AgentApp {
 
     const userItem = makeUserMessage(userText, clientUserMessageId);
     const startedAtMs = Date.now();
-    this.emit("event", this.notification("thread/status/changed", {
-      threadId: state.thread.id,
-      status: { type: "active", activeFlags: [] },
-    }, state.thread.id));
-    this.emit("event", this.notification("turn/started", {
-      threadId: state.thread.id,
-      turn: this.serializeTurn(turn),
-    }, state.thread.id));
-    this.emit("event", this.notification("item/started", {
-      item: userItem,
-      threadId: state.thread.id,
-      turnId: turn.id,
-      startedAtMs,
-    }, state.thread.id));
-    this.emit("event", this.notification("item/completed", {
-      item: userItem,
-      threadId: state.thread.id,
-      turnId: turn.id,
-      completedAtMs: startedAtMs,
-    }, state.thread.id));
     state.items.push({ turnId: turn.id, item: userItem, startedAtMs, completedAtMs: startedAtMs });
     turn.items.push(userItem);
 
-    // agentMessage：流式模拟回复
+    // turn/start（含 turn/steer 冷启动）的响应必须先于本 turn 的通知到达手机：
+    // 真实 codex 的 userMessage item 事件比响应晚 ~600ms，手机依赖该次序把本地
+    // 回显与服务器 item 对账；通知先于响应上线会让对账失败 → 用户消息双渲染
+    // （2026-09-25 真机复现，docs/research/07）。通知推迟一个宏任务发射——
+    // 微任务不可用：可能仍先于 dispatchMessage 写响应。
     this.schedule(sim, () => {
-      const reply = this.buildReply(userText, state.thread);
-      this.streamAgentMessage(state, sim, reply, () => {
-        this.processSteers(state, sim, () => {
-          this.finishSimTurn(state, "completed");
-          this.consumeQueue(state);
+      this.emit("event", this.notification("thread/status/changed", {
+        threadId: state.thread.id,
+        status: { type: "active", activeFlags: [] },
+      }, state.thread.id));
+      this.emit("event", this.notification("turn/started", {
+        threadId: state.thread.id,
+        // 真实 turn/started 不带 items：userMessage 只经 item 事件下发
+        turn: { ...this.serializeTurn(turn), items: [], itemsView: "notLoaded" as const },
+      }, state.thread.id));
+      this.emit("event", this.notification("item/started", {
+        item: userItem,
+        threadId: state.thread.id,
+        turnId: turn.id,
+        startedAtMs,
+      }, state.thread.id));
+      this.emit("event", this.notification("item/completed", {
+        item: userItem,
+        threadId: state.thread.id,
+        turnId: turn.id,
+        completedAtMs: startedAtMs,
+      }, state.thread.id));
+
+      // agentMessage：流式模拟回复
+      this.schedule(sim, () => {
+        const reply = this.buildReply(userText, state.thread);
+        this.streamAgentMessage(state, sim, reply, () => {
+          this.processSteers(state, sim, () => {
+            this.finishSimTurn(state, "completed");
+            this.consumeQueue(state);
+          });
         });
-      });
-    }, this.opts.stepDelayMs);
+      }, this.opts.stepDelayMs);
+    }, 0);
     return sim;
   }
 
