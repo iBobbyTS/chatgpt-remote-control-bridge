@@ -1312,6 +1312,71 @@ test("B1 跨流 pending 公平排空：全局满时流 B 积压，ack 流 A 后�
   }
 });
 
+test("B1b 跨流轮转公平：A、B 均有 pending 且全局满，逐帧 ack A 时 B 在有限次释放内被服务", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  const streamA = server.mobileStreamId;
+  const streamB = randomUUID();
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }, 5000, streamA); // 流 A seq 1
+
+    // 仅流 A 存在时灌满全局未 ack 缓冲（1 响应 + 127 通知 = 128）
+    for (let i = 0; i < 127; i += 1) {
+      app.emit("event", { method: `b1b/fill/${i}`, params: {} } satisfies AgentNotification);
+    }
+    await waitFor(() => tunnel.outboundBacklog().buffered === 128, 5000);
+
+    // 缓冲满后再往流 A 灌 30 条 → 全进流 A pending（远多于后续要发的 ack 数：固定序下
+    // 旧实现每次都让 A 先占唯一空位，B 须等 A 清空才可能发出）
+    for (let i = 0; i < 30; i += 1) {
+      app.emit("event", { method: `b1b/a-pending/${i}`, params: {} } satisfies AgentNotification);
+    }
+    // 背压下新建流 B：其响应进入流 B pending（此时 A、B 均有 pending，全局满）
+    const bId = 4242;
+    server.sendClientEnvelope({
+      type: "client_message",
+      client_id: server.mobileClientId,
+      stream_id: streamB,
+      message: { jsonrpc: "2.0", id: bId, method: "echoB", params: {} },
+    });
+    await waitFor(
+      () => tunnel.outboundBacklog().pending === 31,
+      3000,
+      "A(30)+B(1) 应同时滞留 pending",
+    );
+    assert.equal(server.receivedSeqIds.length, 128, "背压期间不得发出新帧");
+
+    const bEmitted = () =>
+      server.receivedEnvelopeLog.some((e) => e.kind === "response" && e.id === bId);
+    assert.equal(bEmitted(), false, "流 B 响应不得在释放容量前发出");
+
+    // 反复逐帧 ack 流 A：每次只释放 1 个空位。固定序 + 单空位释放 = 饥饿（B1 反例）：
+    // 旧实现每次都让 A 先占空位，B 要等 A 全部 30 条 pending 清空（≥31 次 ack）才可能发出。
+    const baseSeqCount = server.receivedSeqIds.length;
+    let servedAtAck = 0;
+    for (let k = 1; k <= 6; k += 1) {
+      server.ack(k, streamA);
+      await waitFor(
+        () => server.receivedSeqIds.length >= baseSeqCount + k,
+        3000,
+        `ack#${k} 后应释放并补发 1 帧`,
+      );
+      if (bEmitted()) {
+        servedAtAck = k;
+        break;
+      }
+    }
+    assert.ok(servedAtAck > 0, "流 B pending 在 6 次单帧 ack 内仍未被服务（跨流饥饿）");
+    assert.ok(servedAtAck <= 3, `流 B 应在 ≤3 次单帧 ack 内被轮转服务，实际第 ${servedAtAck} 次`);
+    assert.ok(tunnel.outboundBacklog().buffered <= 128, "不得越过全局 128 上限");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
 test("B2 pong 入缓冲重放：通知+pong 交错断线重连后重放含 pong 且 seq 连续无空洞", async () => {
   const { server } = await startMock({ autoAck: false });
   const { tunnel, app } = await startStubTunnel({ mock: server, reconnectDelayMs: 25 });
@@ -1348,6 +1413,60 @@ test("B2 pong 入缓冲重放：通知+pong 交错断线重连后重放含 pong 
     assertContiguousSeqs(replayedSeqs, "B2 重放序列（含 pong）");
     assert.deepEqual(replayedSeqs, [1, 2, 3, 4], "重放应覆盖整段未 ack 缓冲（含 pong），seq 全序无空洞");
     assert.equal(tunnel.outboundBacklog().buffered, 4, "重放不得清空未 ack 缓冲");
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("B3 mock autoAck 对 pong 回 ack：pong 占 per-stream seq 且被确认，缓冲不积压", async () => {
+  const { server } = await startMock(); // autoAck 默认 true
+  const { tunnel } = await startStubTunnel({ mock: server });
+  const streamA = server.mobileStreamId;
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }, 5000, streamA); // seq 1
+    await waitFor(() => tunnel.outboundBacklog().buffered === 0, 3000, "响应应被 autoAck 清空");
+
+    server.sendPing(streamA); // pong 占 per-stream seq 2
+    await waitFor(() => server.receivedPongs.length >= 1, 5000, "pong 未发出");
+    assert.equal(server.receivedPongs[0]!.seq_id, 2, "pong 应分配 per-stream seq");
+    // autoAck 必须对 pong 回 ack（携带该帧 seq_id/stream_id），否则 pong 永久留在 128 缓冲
+    // 造成假背压（真实手机/后端会对所有信封回 ack）。修复前此处 buffered 恒为 1。
+    await waitFor(
+      () => tunnel.outboundBacklog().buffered === 0,
+      3000,
+      "pong 未被 ack：未 ack 缓冲积压（假背压）",
+    );
+  } finally {
+    await tunnel.stop();
+    await server.stop();
+  }
+});
+
+test("B4 关 autoAck 手动 ack pong：未 ack 缓冲下降且后续帧可发出", async () => {
+  const { server } = await startMock({ autoAck: false });
+  const { tunnel, app } = await startStubTunnel({ mock: server });
+  const streamA = server.mobileStreamId;
+  try {
+    await tunnel.start();
+    await waitFor(() => tunnel.connected, 5000);
+    await server.rpc("initialize", { clientInfo: { name: "t" } }, 5000, streamA); // seq 1
+    server.sendPing(streamA); // pong seq 2
+    await waitFor(() => server.receivedPongs.length >= 1, 5000, "pong 未发出");
+    assert.equal(tunnel.outboundBacklog().buffered, 2, "响应 + pong 均入未 ack 缓冲");
+
+    server.ack(2, streamA); // 手动 ack pong（seq_id/stream_id 取自该帧）：累计确认至 seq 2
+    await waitFor(
+      () => tunnel.outboundBacklog().buffered === 0,
+      3000,
+      "ack pong 后缓冲应下降（pong 已确认）",
+    );
+
+    app.emit("event", { method: "b4/after", params: {} } satisfies AgentNotification);
+    await waitFor(() => server.receivedSeqIds.includes(3), 5000, "后续帧应以 seq 3 发出");
+    assert.equal(tunnel.outboundBacklog().buffered, 1, "后续通知入未 ack 缓冲");
   } finally {
     await tunnel.stop();
     await server.stop();

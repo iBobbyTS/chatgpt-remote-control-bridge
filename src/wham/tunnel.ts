@@ -152,6 +152,13 @@ export class WhamTunnel extends EventEmitter {
   private readonly chunkReassembler = new Map<string, Map<number, ClientEnvelope>>();
   /** 全局已发未 ack 缓冲计数（= 各流 buffer 长度之和，背压判据）。 */
   private bufferedUsed = 0;
+  /**
+   * 跨流排空的持久轮转游标（streams 插入序下标，指向**下一个**待服务的流）。
+   * B1：若每次排空都从插入序头部扫描，全局每次只释放 1 个空位（逐帧 ack）时先插入且
+   * 持续有 pending 的流 A 永远先占空位，后插入的流 B 永久饥饿；持久游标使服务位置在
+   * 多次排空调用之间连续推进，任一有 pending 的流至多在一轮后被服务。
+   */
+  private drainCursor = 0;
   /** 入站 client 信封携带的订阅游标（last-writer-wins），重连握手以 HTTP 头携带。 */
   private subscribeCursor: string | null = null;
   /** pending 相邻 delta 合并次数（累计，诊断/测试）。 */
@@ -487,6 +494,7 @@ export class WhamTunnel extends EventEmitter {
     this.streams.clear();
     this.chunkReassembler.clear();
     this.bufferedUsed = 0;
+    this.drainCursor = 0;
     const inFlight = this.renewalInFlight;
     // 二波3（有界授权加固）：app.close 抛错不得跳过 ws.close()/stopPromise 建立，
     // 否则旧 WS 泄漏且 stop() 永不收敛。吞错仅记日志，不改变其余语义。
@@ -729,29 +737,44 @@ export class WhamTunnel extends EventEmitter {
   }
 
   /**
-   * 跨流公平排空（容量释放路径：ack / 重连重放后）：全局缓冲仍有余位时，按 streams
-   * 插入序轮询，逐流每次最多补一帧，直到容量耗尽或所有 pending 清空。
+   * 跨流公平排空（容量释放路径：ack / 重连重放后）：全局缓冲仍有余位时，从 drainCursor
+   * 指向的流开始按插入序环状扫描，逐流每次最多补一帧，直到容量耗尽或所有 pending 清空。
    *
-   * B1：从前只在 ack 的流上 drainPending，全局背压期间进入他流 pending 的事件（该流
-   * 无新事件/ack/重连）会永久滞留。轮询而非"逐流一次性灌满"保证公平——任一流的
-   * pending 都不会独占刚释放的空位而饿死他流；循环条件恒检 bufferedUsed < 128，
-   * 绝不越过全局上限。
+   * B1：从前只从插入序头部扫描——全局每次只释放 1 个空位（逐帧 ack）时，先插入且持续
+   * 有 pending 的流 A 每轮都抢到唯一空位，后插入的流 B 永久饥饿（固定序 + 单空位释放 =
+   * 饥饿）。持久轮转游标让服务位置跨调用连续推进：任一有 pending 的流至多在"其他流各取
+   * 一帧"一轮后被服务。单流场景游标恒为 0，行为与旧实现一致。循环条件恒检
+   * bufferedUsed < 128，绝不越过全局上限。
    */
   private drainPendingAcrossStreams(): void {
     const ws = this.ws;
     if (this.stopped || !ws || ws.readyState !== WebSocket.OPEN) return;
     // 快照插入序：drainOne 不新增/删除流，轮询序在本方法内稳定
     const states = [...this.streams.values()];
+    const total = states.length;
+    if (total === 0) {
+      this.drainCursor = 0;
+      return;
+    }
+    // 归一化游标：流可被 client_closed 删除或新增，旧下标可能越界
+    let cursor = ((this.drainCursor % total) + total) % total;
     let progressed = true;
     while (progressed && this.bufferedUsed < OUTBOUND_BUFFER_CAPACITY) {
       progressed = false;
-      for (const state of states) {
+      for (let i = 0; i < total; i += 1) {
+        if (this.bufferedUsed >= OUTBOUND_BUFFER_CAPACITY) {
+          // 容量耗尽：游标已指向下一个未服务流，下次调用从此续扫
+          this.drainCursor = cursor % total;
+          return;
+        }
+        const state = states[cursor]!;
+        cursor = (cursor + 1) % total;
         if (state.pending.length === 0) continue;
-        if (this.bufferedUsed >= OUTBOUND_BUFFER_CAPACITY) break;
         this.drainOne(state);
         progressed = true;
       }
     }
+    this.drainCursor = cursor % total;
   }
 
   /** 取 pending 首帧分配 seq、入未 ack 缓冲并发送（调用方须保证 WS open 且缓冲有余位）。 */

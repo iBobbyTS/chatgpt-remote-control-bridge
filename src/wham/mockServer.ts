@@ -784,6 +784,10 @@ export class MockWhamServer {
         return;
       }
       case "pong":
+        // pong 与 server_message 同走 codex 的有界可靠层（占 per-stream seq、入未 ack 缓冲），
+        // 故真实手机/后端会对所有信封回 ack。仅 autoAck 时同步回 ack（带该帧 seq_id/stream_id），
+        // 否则连续 pong 会占满 128 缓冲造成假背压。autoAck 关闭时由测试手动 ack(seq_id, stream_id)。
+        if (this.autoAck) this.ack(envelope.seq_id, envelope.stream_id);
         this.receivedPongs.push({
           client_id: envelope.client_id,
           stream_id: envelope.stream_id,
