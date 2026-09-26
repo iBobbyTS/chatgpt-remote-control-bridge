@@ -118,10 +118,12 @@ interface SimTurnRuntime {
   ended: boolean;
   /**
    * turn 种类（S03）：normal=普通/shell 轻量 turn；compact=thread/compact/start
-   * 创建的压缩 turn。compact turn 不可 steer、不可被 turn/start 接管
-   * （对齐 codex TaskKind::Compact，turn_input.rs:660-680）。
+   * 创建的压缩 turn；goal=goal 续跑 turn（thread/goal/set active 后自动开跑，
+   * 输入为隐藏内部上下文，无 userMessage item，可 steer）。compact turn 不可
+   * steer、不可被 turn/start 接管（对齐 codex TaskKind::Compact，
+   * turn_input.rs:660-680）。
    */
-  kind: "normal" | "compact";
+  kind: "normal" | "compact" | "goal";
 }
 
 /** thread/shellCommand 登记的后台终端条目（v2/thread.rs:1215-1224）。 */
@@ -165,6 +167,9 @@ const GOAL_STATUSES: readonly SimGoalStatus[] = [
   "complete",
 ];
 
+/** goal 计量每 turn 累加的模拟 token 数（与 tokenUsage 通知的 total 1234 一致）。 */
+const GOAL_TURN_TOKENS = 1234;
+
 /** 特殊指令帮助文本（手机端发送对应指令即得本条回复）。 */
 const HELP_TEXT = [
   "特殊指令：",
@@ -173,7 +178,7 @@ const HELP_TEXT = [
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
   "",
   "模拟功能（对齐 codex）：",
-  "goal 设置后 turn 结束自动清除",
+  "goal 启用后自动续跑一轮并标记完成",
   "compact 约 5 秒完成且下一条回复标记",
   "Plan 模式回复带前缀",
   "shell 命令生成模拟命令条目",
@@ -1204,11 +1209,23 @@ export class SimApp extends EventEmitter implements AgentApp {
       threadId: state.thread.id,
       status: { type: "idle" },
     }, state.thread.id));
-    // turn 结束清除 goal（对齐抓包：真实会话每次 turn 结束发 cleared，因 goal 存在）。
-    // 条件化：无 goal 不发（避免对未设置 goal 的会话发送误导性清除通知）。
-    if (state.goal) {
-      state.goal = null;
-      this.emit("event", this.notification("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id));
+    // goal 计量（extension.rs on_turn_stop → account_active_goal_progress）：active
+    // goal 随 turn 累加用量并广播 thread/goal/updated（带 turnId）。goal turn 由
+    // sim 层代替 LLM 调 update_goal(complete)（tool.rs handle_update）标记完成；
+    // 非 active（paused/blocked/complete…）不计量不发。cleared 只来自
+    // thread/goal/clear RPC（thread_goal_processor.rs:294-299），turn 结束不发。
+    if (state.goal && state.goal.status === "active") {
+      state.goal.tokensUsed += GOAL_TURN_TOKENS;
+      state.goal.timeUsedSeconds += Math.max(0, completedAt - (sim.turn.startedAt ?? completedAt));
+      if (sim.kind === "goal") {
+        state.goal.status = "complete";
+      }
+      state.goal.updatedAt = completedAt;
+      this.emit("event", this.notification("thread/goal/updated", {
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        goal: state.goal,
+      }, state.thread.id));
     }
     this.emit("event", this.notification("thread/tokenUsage/updated", {
       threadId: state.thread.id,
@@ -1248,7 +1265,11 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   private consumeQueue(state: ThreadState): void {
     const next = state.queue.shift();
-    if (!next) return;
+    if (!next) {
+      // 队列耗尽线程空闲：goal 仍 active 则自动续跑（extension.rs on_thread_idle）
+      this.continueGoalIfIdle(state);
+      return;
+    }
     this.emit("event", this.notification("thread/queue/changed", { threadId: state.thread.id }, state.thread.id));
     this.schedule(null, () => {
       if (this.closed) return;
@@ -1368,8 +1389,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     const state = this.threadState(p);
     const now = Math.floor(Date.now() / 1000);
     const existing = state.goal;
+    // codex 对 objective 做 trim（api.rs set_thread_goal：GoalObjectiveUpdate::Set → trim）
     const objective =
-      p.objective === undefined || p.objective === null ? (existing?.objective ?? "") : String(p.objective);
+      p.objective === undefined || p.objective === null ? (existing?.objective ?? "") : String(p.objective).trim();
     // status 形状校验：codex 在 serde 反序列化层拒绝非法枚举值，sim 在此近似
     // （v2/thread.rs ThreadGoalStatus）。
     if (p.status !== undefined && p.status !== null && !(GOAL_STATUSES as readonly unknown[]).includes(p.status)) {
@@ -1400,6 +1422,12 @@ export class SimApp extends EventEmitter implements AgentApp {
       updatedAt: now,
     };
     state.goal = goal;
+    // 请求携带 objective 且线程 preview 为空时用 objective 填充
+    // （api.rs set_thread_goal → fill_empty_thread_preview_if_possible，
+    // tool.rs:473 set_thread_preview_if_empty）。
+    if (p.objective !== undefined && p.objective !== null && state.thread.preview === "") {
+      state.thread.preview = objective;
+    }
     this.persistState();
     // 响应先行：goal 通知用**宏任务**补发（与 resume goal 快照同模式，见 threadResume
     // 注释）。禁用 emitSoon 微任务：微任务可能仍先于 dispatchMessage 写响应，违反
@@ -1408,6 +1436,12 @@ export class SimApp extends EventEmitter implements AgentApp {
       if (this.closed) return;
       this.emit("event", this.notification("thread/goal/updated", { threadId: state.thread.id, turnId: null, goal }, state.thread.id));
     }, 0);
+    // active goal 且线程空闲 → 立即自动续跑（runtime.rs apply_external_goal_set →
+    // continue_if_idle → start_turn_if_idle，turn_trigger "goal"；忙时由当前 turn
+    // 收尾链的 consumeQueue 触发，对齐 on_thread_idle）。
+    if (goal.status === "active") {
+      this.continueGoalIfIdle(state);
+    }
     return { goal };
   }
 
@@ -1427,6 +1461,62 @@ export class SimApp extends EventEmitter implements AgentApp {
       this.emit("event", this.notification("thread/goal/cleared", { threadId: state.thread.id }, state.thread.id));
     }, 0);
     return { cleared: true };
+  }
+
+  /**
+   * goal 续跑检查（runtime.rs continue_if_idle / extension.rs on_thread_idle）：
+   * 线程空闲（无活动 turn、无排队消息）且 goal 仍为 active 时自动开跑一轮
+   * goal turn。codex 中该循环由 LLM 调 update_goal(complete|paused|blocked)
+   * 终止（tool.rs handle_update）；sim 无模型，goal turn 结束即标记 complete，
+   * 一次激活至多续跑一轮，循环有界。
+   */
+  private continueGoalIfIdle(state: ThreadState): void {
+    if (this.closed || state.sim || state.queue.length > 0) return;
+    if (!state.goal || state.goal.status !== "active") return;
+    this.schedule(null, () => {
+      // 回调内重查：等待窗口内可能出现新 turn / 排队消息 / goal 被清除或暂停
+      if (this.closed || state.sim || state.queue.length > 0) return;
+      if (!state.goal || state.goal.status !== "active") return;
+      this.beginGoalTurn(state);
+    }, this.opts.stepDelayMs);
+  }
+
+  /**
+   * goal 续跑 turn（runtime.rs continue_if_idle → start_turn_if_idle，
+   * turn_trigger "goal"）：输入是隐藏内部上下文（steering.rs
+   * continuation_steering_item → ContextualUserFragment，不下发客户端），故本
+   * turn 无 userMessage item；手机端看到 turn/started → agentMessage →
+   * turn/completed。可被 steer（含 stop 规则），结束走统一收尾（finishSimTurn
+   * 内做 goal 计量并把 goal 标记 complete）。
+   */
+  private beginGoalTurn(state: ThreadState): SimTurnRuntime {
+    const turn = makeTurn("inProgress");
+    turn.items = [];
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "goal" };
+    state.sim = sim;
+    state.thread.turns.push(turn);
+    state.thread.status = { type: "active", activeFlags: [] };
+    this.schedule(sim, () => {
+      this.emit("event", this.notification("thread/status/changed", {
+        threadId: state.thread.id,
+        status: { type: "active", activeFlags: [] },
+      }, state.thread.id));
+      this.emit("event", this.notification("turn/started", {
+        threadId: state.thread.id,
+        turn: { ...this.serializeTurn(turn), items: [], itemsView: "notLoaded" as const },
+      }, state.thread.id));
+      this.schedule(sim, () => {
+        const objective = state.goal?.objective ?? "";
+        const reply = `（goal）已接收目标：「${objective}」，sim 层自动续跑本轮；结束后目标将标记为 complete。`;
+        this.streamAgentMessage(state, sim, reply, () => {
+          this.processSteers(state, sim, () => {
+            this.finishSimTurn(state, "completed");
+            this.consumeQueue(state);
+          });
+        });
+      }, this.opts.stepDelayMs);
+    }, 0);
+    return sim;
   }
 
   // -------------------------------------------------------------- compact 模拟

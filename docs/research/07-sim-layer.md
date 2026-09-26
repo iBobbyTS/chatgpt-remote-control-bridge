@@ -474,3 +474,45 @@ completed 收尾并照常消费 thread 队列（排队消息不受影响）。
 结束处增加检查点——消息期间收到 stop 则不进入下一次 15 秒等待。普通 turn / 独立
 shell turn 的 steer 排水链共用该入口，`stop` 文本同样按停止语义收尾。测试新增 sim
 用例（等待窗口内 steer " Stop " → 仅 1 次 wait + 单条停止消息），全量 181/181。
+
+## 2026-09-26 goal 续跑：thread/goal/set active 自动开跑 turn（continue_if_idle 对齐）
+
+真机复现（ChatGPT iOS 1.2026.258）：会话内「启用 goal」→ 手机发 `thread/goal/set`
+（status active + objective）后**一直等不到任何回复**；约 30 秒自动刷新后，用户发出
+的那条目标消息气泡消失。frames.jsonl 佐证：goal/set 响应与 `thread/goal/updated` 均正常，
+但手机此后**再未发出 turn/start**——目标气泡是纯手机本地 UI，锚定在「goal 激活后
+agent 侧自动开跑的续跑 turn」上；sim 只存了 goal 不开跑，刷新对账时服务器侧无任何
+对应条目，气泡即被清掉。
+
+codex 参考语义（`reference/codex/codex-rs`）：
+
+- `thread_goal_processor.rs:141-243`：set 响应先行，随后 `thread/goal/updated`
+  {turnId:null}；`apply_runtime_effects` → status active 时走 `continue_if_idle`。
+- `ext/goal/src/runtime.rs:425-523` `continue_if_idle`：线程空闲则
+  `start_turn_if_idle`（turn_trigger "goal"），输入为隐藏内部上下文
+  （steering.rs `continuation_steering_item` → ContextualUserFragment，**不下发
+  客户端**，故续跑 turn 无 userMessage item）；`extension.rs on_thread_idle` 在
+  每次线程转空闲时重复触发，循环由 LLM 调 `update_goal(complete|paused|blocked)`
+  （tool.rs handle_update）终止。
+- `extension.rs on_turn_stop` → `account_active_goal_progress`：active goal 随
+  turn 累加 tokensUsed/timeUsedSeconds 并广播 `thread/goal/updated`{turnId:本turn}；
+  `thread/goal/cleared` **只**来自 `thread/goal/clear` RPC
+  （thread_goal_processor.rs:294-299）。
+- `api.rs set_thread_goal`：objective 做 trim；携带 objective 且线程 preview 为空时
+  用 objective 填充（tool.rs:473 `fill_empty_thread_preview_if_possible`）。
+
+sim 实现（无模型，循环有界）：`goalSet` 结果为 active 且空闲 →
+`continueGoalIfIdle`（consumeQueue 队列耗尽处同触发，对齐 on_thread_idle；回调内
+重查忙/队列/goal 状态防竞态）→ `beginGoalTurn`（kind "goal"，可 steer 含 stop
+规则，无 userMessage item，回一条 `（goal）已接收目标：「…」` 消息）→
+`finishSimTurn` 计量：active goal 每 turn 累加 1234 token（与 tokenUsage 通知的
+total 一致）+ 实耗秒数，goal turn 结束标记 **complete**（代替 LLM 的
+update_goal(complete)，一次激活至多续跑一轮）；turn 结束不再发 cleared（旧
+「每 turn 清除 goal」行为废止）。goalSet 补 objective trim 与空 preview 填充。
+
+测试：S03-A goal 用例重写（空闲 set → 自动 turn/started 无 items → 无 userMessage
+item → 计量 updated{turnId} + complete + tokensUsed 1234 → 无 cleared →
+budget/objective 保持 → clear true/false）；新增忙时用例（test queue 等待窗口内
+set active → 用户 turn 结束计量仍 active → 自动续跑 goal turn → complete，共 2 轮
+计量 2468，bounded 断言无第三轮）；resume 快照用例改 `status:"paused"` 消除自动
+续跑与 envelope 时序的竞态。全量 182/182。
