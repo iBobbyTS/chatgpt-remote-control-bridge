@@ -6,11 +6,16 @@
  *
  * 本模块只承载协议类型、服务端监听与客户端封装；业务 handler 由 CgrcbDaemon 注入，
  * 因此 ipc.ts 不依赖 daemon.ts（无环）。
+ *
+ * 单实例互斥（BLOCKER 4）：socket 探测（probe→unlink→listen）本身无跨进程原子性，
+ * 故用 O_EXCL 锁文件 `<socketPath>.lock`（pid）做最小互斥；仅在探测确认死连接后才
+ * unlink stale socket，listen 撞 EADDRINUSE 时重新探测，确认对方活着则报错退出、不删其 socket。
  */
-import { chmod, mkdir, rm } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { dirname } from "node:path";
 import type { AuthStatus } from "../auth/manager.ts";
+import { assertSocketPathFits } from "./paths.ts";
 
 export type IpcOp =
   | "status"
@@ -62,7 +67,7 @@ export interface AgentRuntimeStatus {
   serverId: string | null;
   environmentId: string | null;
   installationId: string | null;
-  /** lifecycle.json 的 everEnrolled；null = 历史不明（文件缺失）。 */
+  /** lifecycle.json 的 everEnrolled；null = 历史不明（缺失/损坏/非布尔）。 */
   everEnrolled: boolean | null;
   identityWarnings: string[];
   warnings: string[];
@@ -110,6 +115,9 @@ export function socketIsLive(socketPath: string, timeoutMs = 500): Promise<boole
   });
 }
 
+/** 单行 IPC 请求大小上限（NIT ②），超限断连防内存膨胀。 */
+export const MAX_IPC_LINE_BYTES = 1_000_000;
+
 export interface IpcServerOptions {
   socketPath: string;
   handler: IpcHandler;
@@ -117,7 +125,8 @@ export interface IpcServerOptions {
 }
 
 /**
- * daemon 侧 IPC 服务端：行协议分发；stale socket 在被新 daemon 接管前清理。
+ * daemon 侧 IPC 服务端：行协议分发；stale socket 在被新 daemon 接管前清理；
+ * 跨进程互斥由 `<socketPath>.lock` 保证（BLOCKER 4）。
  * 每个请求独立处理（同 agent 的互斥由 daemon 的业务锁保证）。
  */
 export class IpcServer {
@@ -126,6 +135,7 @@ export class IpcServer {
   private readonly log: (line: string) => void;
   private readonly sockets = new Set<Socket>();
   private server: Server | null = null;
+  private lockAcquired = false;
 
   constructor(opts: IpcServerOptions) {
     this.socketPath = opts.socketPath;
@@ -137,26 +147,88 @@ export class IpcServer {
     return this.server !== null;
   }
 
+  private get lockPath(): string {
+    return `${this.socketPath}.lock`;
+  }
+
   async start(): Promise<void> {
     if (this.server) return;
+    assertSocketPathFits(this.socketPath);
     await mkdir(dirname(this.socketPath), { recursive: true });
-    if (await socketIsLive(this.socketPath)) {
-      throw new DaemonAlreadyRunningError(this.socketPath);
+    await this.acquireLock();
+    try {
+      if (await socketIsLive(this.socketPath)) {
+        throw new DaemonAlreadyRunningError(this.socketPath);
+      }
+      // 仅当探测确认无监听者（死连接残留）才 unlink stale socket
+      await rm(this.socketPath, { force: true });
+      const server = await this.listenWithRetry();
+      await chmod(this.socketPath, 0o600).catch(() => {});
+      this.server = server;
+      this.log(`ipc 监听 ${this.socketPath}`);
+    } catch (err) {
+      await this.releaseLock();
+      throw err;
     }
-    // stale socket（daemon 死）→ 清理后接管
-    await rm(this.socketPath, { force: true });
-    const server = createServer((socket) => this.onConnection(socket));
-    await new Promise<void>((resolve, reject) => {
-      const onError = (err: Error) => reject(err);
-      server.once("error", onError);
-      server.listen(this.socketPath, () => {
-        server.off("error", onError);
-        resolve();
-      });
-    });
-    await chmod(this.socketPath, 0o600).catch(() => {});
-    this.server = server;
-    this.log(`ipc 监听 ${this.socketPath}`);
+  }
+
+  /** O_EXCL 锁文件：跨进程最小互斥；陈旧锁（持有者已死）清理后重试。 */
+  private async acquireLock(): Promise<void> {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await writeFile(this.lockPath, `${process.pid}\n`, { flag: "wx", mode: 0o600 });
+        this.lockAcquired = true;
+        return;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        const holder = await readLockPid(this.lockPath);
+        // 持有者存活（含同进程测试内双 daemon）→ 拒绝；不触碰其 socket/lock
+        if (holder !== null && isProcessAlive(holder)) {
+          throw new DaemonAlreadyRunningError(this.socketPath);
+        }
+        await rm(this.lockPath, { force: true });
+      }
+    }
+    throw new DaemonAlreadyRunningError(this.socketPath);
+  }
+
+  private async releaseLock(): Promise<void> {
+    if (!this.lockAcquired) return;
+    this.lockAcquired = false;
+    await rm(this.lockPath, { force: true }).catch(() => {});
+  }
+
+  /**
+   * listen；撞 EADDRINUSE（探测→unlink→listen 竞态窗）时重新探测：
+   * 对方活着 → DaemonAlreadyRunningError（不删其 socket）；死连接残留 → 清理重试。
+   */
+  private async listenWithRetry(): Promise<Server> {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const server = createServer((socket) => this.onConnection(socket));
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const onError = (err: Error) => reject(err);
+          server.once("error", onError);
+          server.listen(this.socketPath, () => {
+            server.off("error", onError);
+            resolve();
+          });
+        });
+        return server;
+      } catch (err) {
+        try {
+          server.close();
+        } catch {
+          // 未进入监听态
+        }
+        if ((err as NodeJS.ErrnoException).code !== "EADDRINUSE") throw err;
+        if (await socketIsLive(this.socketPath)) {
+          throw new DaemonAlreadyRunningError(this.socketPath);
+        }
+        await rm(this.socketPath, { force: true });
+      }
+    }
+    throw new DaemonAlreadyRunningError(this.socketPath);
   }
 
   private onConnection(socket: Socket): void {
@@ -165,12 +237,21 @@ export class IpcServer {
     let buffer = "";
     socket.on("data", (chunk: string) => {
       buffer += chunk;
+      if (Buffer.byteLength(buffer, "utf8") > MAX_IPC_LINE_BYTES) {
+        this.log(`ipc 请求行超限（>${MAX_IPC_LINE_BYTES}B），断开连接`);
+        buffer = "";
+        socket.destroy();
+        return;
+      }
       let idx: number;
       while ((idx = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, idx);
         buffer = buffer.slice(idx + 1);
         if (line.trim()) {
-          void this.dispatch(socket, line);
+          // NIT ①：dispatch 内 write/stringify 防御，异常不得成为 unhandledRejection
+          void this.dispatch(socket, line).catch((err) =>
+            this.log(`ipc 分发失败: ${err instanceof Error ? err.message : String(err)}`),
+          );
         }
       }
     });
@@ -219,12 +300,11 @@ export class IpcServer {
       socket.destroy();
     }
     this.sockets.clear();
-    if (!server) {
-      // 未成功监听（如启动即被活跃 daemon 拒绝）：不属于本实例，勿删他人 socket
-      return;
+    if (server) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await rm(this.socketPath, { force: true });
     }
-    await new Promise<void>((resolve) => server.close(() => resolve()));
-    await rm(this.socketPath, { force: true });
+    await this.releaseLock();
   }
 }
 
@@ -284,4 +364,24 @@ export function requestIpc(
       finish(() => reject(new Error("IPC 连接在收到响应前关闭")));
     });
   });
+}
+
+async function readLockPid(lockPath: string): Promise<number | null> {
+  try {
+    const text = (await readFile(lockPath, "utf8")).trim();
+    const pid = Number.parseInt(text, 10);
+    return Number.isInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/** 进程是否存活（EPERM = 存在但无权限，视为存活）。 */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "EPERM";
+  }
 }

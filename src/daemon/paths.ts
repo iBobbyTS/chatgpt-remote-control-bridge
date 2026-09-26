@@ -39,6 +39,22 @@ export function resolveCgrcbHome(env: NodeJS.ProcessEnv = process.env): string {
   return override ? resolve(override) : join(homedir(), DEFAULT_HOME_DIRNAME);
 }
 
+/**
+ * unix socket 路径字节上限（NIT ③）：macOS/BSD `sun_path` 为 104 字节（含结尾 NUL），
+ * 实际可用 ≤100 字节，超长 `listen` 会抛 EINVAL。提前给出明确错误。
+ */
+export const MAX_SOCKET_PATH_BYTES = 100;
+
+export function assertSocketPathFits(socketPath: string): void {
+  const bytes = Buffer.byteLength(socketPath, "utf8");
+  if (bytes > MAX_SOCKET_PATH_BYTES) {
+    throw new Error(
+      `daemon.sock 路径过长（${bytes} 字节 > ${MAX_SOCKET_PATH_BYTES}）：${socketPath}；` +
+        `请将 CGRCB_HOME 设到更短的目录`,
+    );
+  }
+}
+
 export interface CgrcbPaths {
   /** 数据根目录。 */
   root: string;

@@ -7,10 +7,21 @@
  * - **宽松向前兼容**：多余字段（顶层/agent 级）原样保留，不报错；非法 agent 条目忽略。
  * - **未知 agent 首次 enable 时补条目**：`withAgentEnabled` 负责补齐。
  */
+import { randomBytes } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export const CONFIG_VERSION = 1;
+
+/**
+ * 唯一临时路径（BLOCKER 2）：pid + 单调计数 + 随机后缀，避免同毫秒同进程
+ * 两次写共用同一 tmp 名互相覆盖。
+ */
+let tempCounter = 0;
+function tempPath(target: string): string {
+  tempCounter += 1;
+  return `${target}.tmp-${process.pid}-${tempCounter}-${randomBytes(4).toString("hex")}`;
+}
 
 export interface AgentConfig {
   enabled: boolean;
@@ -80,7 +91,7 @@ export async function readConfig(configPath: string): Promise<CgrcbConfig> {
 /** 原子写配置（tmp + rename，mode 600）。 */
 export async function writeConfig(configPath: string, config: CgrcbConfig): Promise<void> {
   await mkdir(dirname(configPath), { recursive: true });
-  const tmp = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+  const tmp = tempPath(configPath);
   await writeFile(tmp, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, configPath);
 }
@@ -111,7 +122,7 @@ export interface LifecycleState {
   [key: string]: unknown;
 }
 
-/** 读 lifecycle.json；缺失/损坏返回 null（= 历史不明，绝不臆造 false）。 */
+/** 读 lifecycle.json；缺失/损坏/**everEnrolled 非显式布尔**返回 null（= 历史不明，绝不臆造 false）。 */
 export async function readLifecycle(lifecyclePath: string): Promise<LifecycleState | null> {
   let text: string;
   try {
@@ -125,7 +136,12 @@ export async function readLifecycle(lifecyclePath: string): Promise<LifecycleSta
       return null;
     }
     const obj = parsed as Record<string, unknown>;
-    return { ...obj, everEnrolled: obj.everEnrolled === true };
+    // BLOCKER 3：只接受显式布尔。`{}` / `"yes"` / `1` / null 等一律历史不明，
+    // 否则会把"从未成功 enroll"错判给 S04（据此跳过吊销）。
+    if (typeof obj.everEnrolled !== "boolean") {
+      return null;
+    }
+    return { ...obj, everEnrolled: obj.everEnrolled };
   } catch {
     return null;
   }
@@ -137,7 +153,7 @@ export async function writeLifecycle(
   state: LifecycleState,
 ): Promise<void> {
   await mkdir(dirname(lifecyclePath), { recursive: true });
-  const tmp = `${lifecyclePath}.tmp-${process.pid}-${Date.now()}`;
+  const tmp = tempPath(lifecyclePath);
   await writeFile(tmp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   await rename(tmp, lifecyclePath);
 }

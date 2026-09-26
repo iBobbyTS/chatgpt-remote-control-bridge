@@ -11,6 +11,14 @@
  *   首个 enrollment 事件置 true，此后不重置/删除；已有目录缺失该文件时 enable 不补写。
  * - 本节 enable/disable 不实现配对吊销（S04）；pair/pair-status/agent-init/agent-reset/
  *   auth-reset 仅分发骨架，返回 INTERNAL "not implemented"。
+ *
+ * 并发/竞态（评审修复）：
+ * - **per-agent 操作队列**：启动/重启/disable 全部经同一 `serialize(id, …)` 串行化，
+ *   shutdown 等待全部在途操作收敛（BLOCKER 1：启动窗口不得留孤儿隧道）。
+ * - **实例代次**：tunnel 赋值前后复查 `stopping`/`instances.get(id) !== inst`，失效即停隧道。
+ * - **配置提交串行化**：跨 agent 共写 config.json 经 `commitConfig` 队列，写盘成功后才发布内存。
+ * - **fault 分级**（MATERIAL 6）：`handleRequest*` 的 per-request fault 由 tunnel 自行恢复，
+ *   不拆整实例；仅结构性 fault（连接/协议/未知）触发退避重启。
  */
 import { mkdir, rm } from "node:fs/promises";
 import { hostname } from "node:os";
@@ -74,9 +82,16 @@ interface InstanceRuntime {
   error: string | null;
   attempts: number;
   restartTimer: NodeJS.Timeout | null;
-  everEnrolled: boolean;
   warnings: string[];
   identityWarnings: string[];
+}
+
+/** 启动/重启在 stopping 或实例代次失效时主动取消（BLOCKER 1）。 */
+class InstanceCancelledError extends Error {
+  constructor(reason: string) {
+    super(`实例操作已取消：${reason}`);
+    this.name = "InstanceCancelledError";
+  }
 }
 
 const NOT_IMPLEMENTED_OPS = new Set<IpcRequest["op"]>([
@@ -94,7 +109,12 @@ export class CgrcbDaemon {
   private config: CgrcbConfig = { version: 1, agents: {} };
   private ipcServer: IpcServer | null = null;
   private readonly instances = new Map<string, InstanceRuntime>();
+  /** per-agent 操作队列（串行化）：启动/重启/disable 同一 key 排队。 */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** 在途操作（shutdown 等待其收敛，防孤儿隧道）。 */
+  private readonly pendingOps = new Set<Promise<unknown>>();
+  /** config.json 提交串行化（BLOCKER 2）。 */
+  private configChain: Promise<unknown> = Promise.resolve();
   private stopping = false;
   private running = false;
   private startedAt = 0;
@@ -122,7 +142,7 @@ export class CgrcbDaemon {
     return this.running;
   }
 
-  /** 加载配置 → 起 IPC → 逐 enabled agent 建实例。 */
+  /** 加载配置 → 起 IPC → 逐 enabled agent 建实例（经 per-agent 队列）。 */
   async start(): Promise<void> {
     if (this.running) return;
     this.stopping = false;
@@ -148,17 +168,17 @@ export class CgrcbDaemon {
     this.startedAt = Date.now();
     this.logLine(`daemon 已启动 home=${this.paths.root} pid=${process.pid}`);
 
+    // BLOCKER 1：初始自动启动也进入 per-agent 队列，disable/shutdown 可与之串行并等待
     for (const [id, cfg] of Object.entries(this.config.agents)) {
       if (cfg.enabled) {
-        // 同步登记 starting 记录后异步启动，status 立即可见
-        void this.startInstance(id).catch((err) =>
+        void this.serialize(id, () => this.startInstance(id)).catch((err) =>
           this.logLine(`[${id}] 启动失败: ${errorMessage(err)}`),
         );
       }
     }
   }
 
-  /** 幂等优雅停：先停全部隧道（内部关 app）→ 关 IPC + 清 socket → 停自动刷新。 */
+  /** 幂等优雅停：等待在途实例操作 → 停全部隧道（内部关 app）→ 关 IPC + 清 socket。 */
   shutdown(reason = "manual"): Promise<void> {
     if (!this.stopPromise) {
       this.stopPromise = this.doShutdown(reason);
@@ -177,15 +197,56 @@ export class CgrcbDaemon {
       }
       if (inst.status !== "stopping") inst.status = "stopping";
     }
+    // BLOCKER 1：等待启动/重启/disable 等在途操作收敛，避免其继续建隧道留下孤儿
+    while (this.pendingOps.size > 0) {
+      await Promise.allSettled([...this.pendingOps]);
+    }
     // 先停全部隧道（tunnel.stop 内部调 app.close）
     await Promise.all([...this.instances.values()].map((inst) => this.disposeInstance(inst)));
     this.instances.clear();
+    await this.configChain.catch(() => undefined);
     if (this.ipcServer) {
       await this.ipcServer.close();
       this.ipcServer = null;
     }
     this.authManager?.stopAutoRefresh();
     this.logLine(`daemon 已停止（${reason}）`);
+  }
+
+  // ------------------------------------------------------------- 并发原语
+
+  /** 同 key 操作串行化（per-agent 队列）；前序失败不阻塞后续。 */
+  private serialize<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = this.locks.get(key) ?? Promise.resolve();
+    const task = prev.then(fn);
+    const guarded = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.locks.set(key, guarded);
+    this.pendingOps.add(guarded);
+    void guarded.then(() => {
+      this.pendingOps.delete(guarded);
+    });
+    return task;
+  }
+
+  /** 仅在写盘成功后发布内存配置（BLOCKER 2：失败不改内存；跨 agent 串行不丢更新）。 */
+  private commitConfig(mutate: (config: CgrcbConfig) => CgrcbConfig): Promise<void> {
+    const task = this.configChain.then(async () => {
+      const next = mutate(this.config);
+      await writeConfig(this.paths.configPath, next);
+      this.config = next;
+    });
+    this.configChain = task.then(
+      () => undefined,
+      () => undefined,
+    );
+    return task;
+  }
+
+  private isStale(inst: InstanceRuntime): boolean {
+    return this.stopping || this.instances.get(inst.id) !== inst;
   }
 
   // ------------------------------------------------------------------ 实例
@@ -199,7 +260,6 @@ export class CgrcbDaemon {
       error: null,
       attempts: 0,
       restartTimer: null,
-      everEnrolled: false,
       warnings: [],
       identityWarnings: [],
     };
@@ -217,15 +277,24 @@ export class CgrcbDaemon {
     const module = getAgent(id);
     try {
       await this.startInto(inst, module);
+      if (this.isStale(inst)) {
+        await this.disposeInstance(inst);
+        return;
+      }
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
       this.logLine(`[${id}] 实例在线`);
     } catch (err) {
+      await this.disposeInstance(inst);
+      if (err instanceof InstanceCancelledError) {
+        this.logLine(`[${inst.id}] ${err.message}`);
+        if (this.instances.get(inst.id) === inst) inst.status = "stopping";
+        return;
+      }
       inst.status = "failed";
       inst.error = errorMessage(err);
       this.logLine(`[${id}] 实例启动失败: ${inst.error}`);
-      await this.disposeInstance(inst);
       // 未注册模块不可恢复，不调度重启
       if (module) this.scheduleRestart(inst);
     }
@@ -233,17 +302,12 @@ export class CgrcbDaemon {
 
   /** 建 app（工厂）→ 建 tunnel → 订阅事件 → start。工厂同步抛错由调用方捕获。 */
   private async startInto(inst: InstanceRuntime, module: AgentModule | undefined): Promise<void> {
+    // BLOCKER 5：缺模块必须 throw（走失败分支保留 failed），不得正常返回被覆盖成 online
     if (!module) {
-      inst.status = "failed";
-      inst.error = `agent 模块未注册: ${inst.id}`;
-      this.logLine(`[${inst.id}] agent 模块未注册，无法启动`);
-      return;
+      throw new Error(`agent 模块未注册: ${inst.id}`);
     }
     const dir = instanceDirFor(this.paths.root, inst.id);
     await this.ensureInstanceDir(dir); // 首次创建 → 写 lifecycle.json
-    const paths = instancePaths(dir);
-    const lifecycle = await readLifecycle(paths.lifecycle);
-    inst.everEnrolled = lifecycle?.everEnrolled === true;
 
     let tunnelRef: WhamTunnel | null = null;
     const ctx: AgentInstanceContext = {
@@ -285,7 +349,17 @@ export class CgrcbDaemon {
     tunnel.on("fault", (err, context) =>
       this.onInstanceFault(inst.id, err, String(context)),
     );
+
+    // BLOCKER 1：建隧道后、启动前/后复查代次；失效即停隧道并取消
+    if (this.isStale(inst)) {
+      await tunnel.stop();
+      throw new InstanceCancelledError("daemon 停止/实例失效");
+    }
     await tunnel.start();
+    if (this.isStale(inst)) {
+      await tunnel.stop();
+      throw new InstanceCancelledError("daemon 停止/实例失效（启动后）");
+    }
   }
 
   private async disposeInstance(inst: InstanceRuntime): Promise<void> {
@@ -318,7 +392,8 @@ export class CgrcbDaemon {
     this.logLine(`[${inst.id}] ${delay}ms 后重启（第 ${inst.attempts} 次退避）`);
     inst.restartTimer = setTimeout(() => {
       inst.restartTimer = null;
-      void this.restartInstance(inst.id).catch((err) =>
+      // 重启同样进入 per-agent 队列，与 disable/shutdown 串行
+      void this.serialize(inst.id, () => this.restartInstance(inst.id)).catch((err) =>
         this.logLine(`[${inst.id}] 重启失败: ${errorMessage(err)}`),
       );
     }, delay);
@@ -329,18 +404,28 @@ export class CgrcbDaemon {
     const inst = this.instances.get(id);
     if (!inst || this.config.agents[id]?.enabled !== true) return;
     await this.disposeInstance(inst);
+    if (this.isStale(inst)) return;
     inst.status = "starting";
     try {
       await this.startInto(inst, getAgent(id));
+      if (this.isStale(inst)) {
+        await this.disposeInstance(inst);
+        return;
+      }
       inst.status = "online";
       inst.error = null;
       inst.attempts = 0;
       this.logLine(`[${id}] 实例已恢复在线`);
     } catch (err) {
+      await this.disposeInstance(inst);
+      if (err instanceof InstanceCancelledError) {
+        this.logLine(`[${inst.id}] ${err.message}`);
+        if (this.instances.get(inst.id) === inst) inst.status = "stopping";
+        return;
+      }
       inst.status = "failed";
       inst.error = errorMessage(err);
       this.logLine(`[${id}] 实例恢复失败: ${inst.error}`);
-      await this.disposeInstance(inst);
       this.scheduleRestart(inst);
     }
   }
@@ -349,6 +434,14 @@ export class CgrcbDaemon {
     if (this.stopping) return;
     const inst = this.instances.get(id);
     if (!inst) return;
+    // MATERIAL 6：per-request fault（handleRequest rejection）tunnel 已尽力回 JSON-RPC error
+    // 并自行恢复；不拆整实例，否则远端可周期触发无限拆建、掉线已配对手机。
+    if (context.startsWith("handleRequest")) {
+      this.logLine(
+        `[${id}] 忽略 per-request fault（tunnel 已恢复）：${context}: ${errorMessage(err)}`,
+      );
+      return;
+    }
     inst.error = `${context}: ${errorMessage(err)}`;
     if (inst.status === "online") inst.status = "failed";
     this.scheduleRestart(inst);
@@ -356,22 +449,18 @@ export class CgrcbDaemon {
 
   /**
    * enrollment 事件 → lifecycle.everEnrolled 置 true。
-   * 文件缺失（历史不明）时**不补写**（S04 (c) 分支②依赖此语义）。
+   * 文件缺失/损坏（历史不明）时**不补写**（S04 (c) 分支②依赖此语义）。
    */
   private async onEnrollment(inst: InstanceRuntime): Promise<void> {
     const dir = instanceDirFor(this.paths.root, inst.id);
     const paths = instancePaths(dir);
     const current = await readLifecycle(paths.lifecycle);
     if (!current) {
-      this.logLine(`[${inst.id}] lifecycle.json 缺失，不补写（历史不明）`);
+      this.logLine(`[${inst.id}] lifecycle.json 缺失/损坏，不补写（历史不明）`);
       return;
     }
-    if (current.everEnrolled) {
-      inst.everEnrolled = true;
-      return;
-    }
+    if (current.everEnrolled) return;
     await writeLifecycle(paths.lifecycle, { ...current, everEnrolled: true });
-    inst.everEnrolled = true;
     this.logLine(`[${inst.id}] lifecycle.everEnrolled=true`);
   }
 
@@ -394,6 +483,9 @@ export class CgrcbDaemon {
 
   private async handleIpc(request: IpcRequest): Promise<IpcResponse> {
     try {
+      if (this.stopping && (request.op === "enable" || request.op === "disable")) {
+        return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
+      }
       switch (request.op) {
         case "status":
           return { ok: true, data: await this.statusPayload() };
@@ -423,13 +515,14 @@ export class CgrcbDaemon {
 
   private async doEnable(id: string | undefined): Promise<IpcResponse> {
     if (!id || !getAgent(id)) return unknownAgent(id);
+    if (this.stopping) return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
     const auth = await this.authManager!.getStatus();
     if (!auth.loggedIn) {
       return { ok: false, error: "NOT_LOGGED_IN", message: "未登录：请先执行 chatgpt login" };
     }
     if (this.config.agents[id]?.enabled !== true) {
-      this.config = withAgentEnabled(this.config, id, true);
-      await writeConfig(this.paths.configPath, this.config);
+      // 写盘失败会 throw → 上层 INTERNAL，内存/实例均不动
+      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, true));
     }
     const inst = this.instances.get(id);
     if (!inst || inst.status === "disabled") {
@@ -446,9 +539,9 @@ export class CgrcbDaemon {
 
   private async doDisable(id: string | undefined): Promise<IpcResponse> {
     if (!id || !this.isKnownAgent(id)) return unknownAgent(id);
+    if (this.stopping) return { ok: false, error: "INTERNAL", message: "daemon 正在停止" };
     if (this.config.agents[id]?.enabled === true) {
-      this.config = withAgentEnabled(this.config, id, false);
-      await writeConfig(this.paths.configPath, this.config);
+      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
     }
     const inst = this.instances.get(id);
     if (inst) {
@@ -465,25 +558,13 @@ export class CgrcbDaemon {
     return { ok: true, data: await this.agentStatus(id) };
   }
 
-  /** 同 agent 的 enable/disable/重启串行化，避免半状态。 */
-  private async withAgentLock(
+  /** 同 agent 的 enable/disable 经 per-agent 队列串行化，避免半状态。 */
+  private withAgentLock(
     id: string | undefined,
     fn: () => Promise<IpcResponse>,
   ): Promise<IpcResponse> {
-    if (!id) return unknownAgent(id);
-    const prev = this.locks.get(id) ?? Promise.resolve();
-    let release!: () => void;
-    const next = new Promise<void>((resolve) => (release = resolve));
-    this.locks.set(
-      id,
-      prev.then(() => next),
-    );
-    await prev;
-    try {
-      return await fn();
-    } finally {
-      release();
-    }
+    if (!id) return Promise.resolve(unknownAgent(id));
+    return this.serialize(id, fn);
   }
 
   // ------------------------------------------------------------------ status
@@ -518,7 +599,7 @@ export class CgrcbDaemon {
     const registered = !!getAgent(id);
     const dir = instanceDirFor(this.paths.root, id);
     const lifecycle = await readLifecycle(instancePaths(dir).lifecycle);
-    const everEnrolled = lifecycle ? lifecycle.everEnrolled === true : null;
+    const everEnrolled = lifecycle ? lifecycle.everEnrolled : null;
     if (!inst) {
       const enabled = cfg?.enabled === true;
       return {

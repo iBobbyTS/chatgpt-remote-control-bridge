@@ -9,8 +9,10 @@ import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 import { test, after } from "node:test";
+import { BridgeAuthManager } from "../src/auth/manager.ts";
 import { makeTestJwt } from "../src/auth/jwt.ts";
 import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import {
@@ -28,6 +30,8 @@ import type {
 import { MockWhamServer, type MockWhamOptions } from "../src/wham/mockServer.ts";
 import { REST_PATHS, WS_HEADERS } from "../src/wham/protocol.ts";
 import {
+  MAX_SOCKET_PATH_BYTES,
+  assertSocketPathFits,
   cgrcbPaths,
   instancePaths,
   resolveCgrcbHome,
@@ -44,6 +48,7 @@ import { CgrcbDaemon, type CgrcbDaemonOptions } from "../src/daemon/daemon.ts";
 import {
   requestIpc,
   DaemonAlreadyRunningError,
+  MAX_IPC_LINE_BYTES,
   type AgentRuntimeStatus,
   type DaemonStatusPayload,
 } from "../src/daemon/ipc.ts";
@@ -55,8 +60,9 @@ after(async () => {
 });
 
 async function tempDir(slug: string): Promise<string> {
-  // 注意：daemon.sock 的绝对路径受 macOS sun_path (~104B) 限制，基目录必须短。
-  const base = join(process.cwd(), ".agent-work", "tmp", "dt");
+  // 注意：daemon.sock 绝对路径受 macOS sun_path（≤100B，见 assertSocketPathFits）限制，
+  // 基目录必须短（直接放 .agent-work/tmp 下）。
+  const base = join(process.cwd(), ".agent-work", "tmp");
   await mkdir(base, { recursive: true });
   const dir = await mkdtemp(join(base, `${slug}-`));
   cleanupDirs.push(dir);
@@ -470,7 +476,8 @@ test("AC3② 实例隔离：handleRequest 持续 reject 不影响另一实例、
   const okId = uniqueId("ac3-ok");
   const rejectStub = registerStub(rejectId);
   registerStub(okId);
-  const daemon = makeDaemon(home, mock, { restartBaseDelayMs: 60_000 });
+  // 短退避：若把 per-request fault 误当结构性故障，会在这里迅速重建（MATERIAL 6 回归）
+  const daemon = makeDaemon(home, mock, { restartBaseDelayMs: 20, restartMaxDelayMs: 40 });
   try {
     await wantLoggedIn(home);
     await daemon.start();
@@ -486,18 +493,20 @@ test("AC3② 实例隔离：handleRequest 持续 reject 不影响另一实例、
     assert.ok(r1.error, "reject 应回 JSON-RPC error");
     assert.match(String(r1.error?.message), /agent error/);
 
-    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, rejectId)).status === "failed", 5000, "reject failed");
+    // per-request fault 由 tunnel 自愈：实例保持 online、隧道连接保持、无重建
+    await new Promise((r) => setTimeout(r, 120));
+    const rejectStatus = await ipcAgentStatus(paths.socketPath, rejectId);
+    assert.equal(rejectStatus.status, "online");
+    assert.equal(rejectStatus.connected, true);
+    assert.equal(rejectStub.instances, 1, "per-request reject 不得触发隧道重建");
+
     // 另一实例仍在线且已连接（未受影响）
     const okStatus = await ipcAgentStatus(paths.socketPath, okId);
     assert.equal(okStatus.status, "online");
     assert.equal(okStatus.connected, true);
     assert.equal(daemon.isRunning, true);
 
-    // reject 实例的隧道仍存活（每请求错误化，不拖死），可继续持有连接
-    const rejectStatus = await ipcAgentStatus(paths.socketPath, rejectId);
-    assert.equal(rejectStatus.connected, true);
-
-    await new Promise((r) => setTimeout(r, 100));
+    await new Promise((r) => setTimeout(r, 60));
     assert.deepEqual(unhandled, [], "不得产生 unhandledRejection");
   } finally {
     process.off("unhandledRejection", onUnhandled);
@@ -656,8 +665,12 @@ test("AC6a lifecycle：新实例目录首建写 everEnrolled=false，首 enrollm
 
     const ip = instancePaths(join(paths.instancesDir, id));
     assert.equal(existsSync(ip.enrollment), true, "enrollment.json 由隧道写入并存在");
-    const lifecycle = await readLifecycle(ip.lifecycle);
-    assert.equal(lifecycle?.everEnrolled, true, "首个 enrollment 事件应把 everEnrolled 置 true");
+    // lifecycle 更新是异步 fire-and-forget（enroll 时触发）：等待其落盘
+    await waitFor(
+      async () => (await readLifecycle(ip.lifecycle))?.everEnrolled === true,
+      5000,
+      "lifecycle everEnrolled=true",
+    );
     assert.equal((await ipcAgentStatus(paths.socketPath, id)).everEnrolled, true);
   } finally {
     await daemon.shutdown();
@@ -717,5 +730,285 @@ test("AC6c 崩溃重建：daemon 重启后 enabled 实例自动恢复（身份�
   } finally {
     await daemon2.shutdown();
     await mock.stop();
+  }
+});
+
+// --------------------------------------------------- S02 评审修复回归（BLOCKER 1–5 / MATERIAL 6 / NIT）
+
+/** authHeaders 延迟的登录管理器：把"启动在途"窗口拉长以复现竞态（BLOCKER 1）。 */
+class SlowAuthManager extends BridgeAuthManager {
+  constructor(
+    private readonly delayMs: number,
+    codexHome: string,
+  ) {
+    super({ codexHome });
+  }
+
+  override async authHeaders(): Promise<Record<string, string>> {
+    await new Promise((r) => setTimeout(r, this.delayMs));
+    return super.authHeaders();
+  }
+}
+
+test("BLOCKER1 启动窗口：初始自动启动在途时 disable → 无孤儿隧道、可退出", async () => {
+  const mock = await startMock();
+  const home = await tempDir("b1");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("b1");
+  registerStub(id);
+  await wantLoggedIn(home);
+  // 预置 enabled=true：daemon.start 走"初始自动启动"路径（不经 IPC，正是孤儿来源）
+  await writeConfig(paths.configPath, withAgentEnabled(defaultConfig(), id, true));
+  const daemon = makeDaemon(home, mock, {
+    authManager: new SlowAuthManager(150, paths.codexHome),
+  });
+
+  try {
+    await daemon.start();
+    // 启动在途（enroll 被延迟的 authHeaders 拖住）时发起 disable
+    const dis = await requestIpc(paths.socketPath, "disable", { agent: id });
+    assert.equal(dis.ok, true, JSON.stringify(dis));
+    const st = await ipcAgentStatus(paths.socketPath, id);
+    assert.equal(st.enabled, false);
+    assert.equal(st.status, "disabled");
+    assert.equal(st.connected, false);
+
+    // 无孤儿隧道：mock 侧 codex socket 必须已关闭
+    await waitFor(() => mock["codexSocket"] === null, 5000, "无孤儿 WSS");
+    // 再等一个窗口，确认没有异步"补建"出新实例/隧道
+    await new Promise((r) => setTimeout(r, 250));
+    assert.equal((await ipcAgentStatus(paths.socketPath, id)).status, "disabled");
+    assert.equal(mock["codexSocket"], null, "不得补建隧道");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("BLOCKER2 config 提交串行化：跨 agent 并发切换不丢开关，重启后一致", async () => {
+  const mock = await startMock();
+  const home = await tempDir("b2");
+  const paths = cgrcbPaths(home);
+  const a = uniqueId("b2-a");
+  const b = uniqueId("b2-b");
+  registerStub(a);
+  registerStub(b);
+  await wantLoggedIn(home);
+  const daemon = makeDaemon(home, mock);
+  try {
+    await daemon.start();
+    // 并发 enable 两个不同 agent（各持旧快照）→ 两开关都必须落盘
+    const [ea, eb] = await Promise.all([
+      requestIpc(paths.socketPath, "enable", { agent: a }),
+      requestIpc(paths.socketPath, "enable", { agent: b }),
+    ]);
+    assert.equal(ea.ok, true, JSON.stringify(ea));
+    assert.equal(eb.ok, true, JSON.stringify(eb));
+    let onDisk = await readConfig(paths.configPath);
+    assert.equal(onDisk.agents[a]!.enabled, true);
+    assert.equal(onDisk.agents[b]!.enabled, true);
+    await daemon.shutdown();
+
+    // 重启：两开关均从磁盘重建并自动恢复
+    const daemon2 = makeDaemon(home, mock);
+    try {
+      await daemon2.start();
+      await waitFor(
+        async () =>
+          (await ipcAgentStatus(paths.socketPath, a)).online &&
+          (await ipcAgentStatus(paths.socketPath, b)).online,
+        5000,
+        "两 agent 自动恢复",
+      );
+    } finally {
+      await daemon2.shutdown();
+    }
+
+    // 再并发 disable 两个 agent → 两开关都必须置 false
+    const daemon3 = makeDaemon(home, mock);
+    try {
+      await daemon3.start();
+      const [da, db] = await Promise.all([
+        requestIpc(paths.socketPath, "disable", { agent: a }),
+        requestIpc(paths.socketPath, "disable", { agent: b }),
+      ]);
+      assert.equal(da.ok, true, JSON.stringify(da));
+      assert.equal(db.ok, true, JSON.stringify(db));
+      onDisk = await readConfig(paths.configPath);
+      assert.equal(onDisk.agents[a]!.enabled, false);
+      assert.equal(onDisk.agents[b]!.enabled, false);
+    } finally {
+      await daemon3.shutdown();
+    }
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("BLOCKER3 lifecycle 损坏归一：{} 与非布尔 everEnrolled → 历史不明（null）", async () => {
+  const dir = await tempDir("b3");
+  const lc = join(dir, "lifecycle.json");
+
+  await writeFile(lc, "{}");
+  assert.equal(await readLifecycle(lc), null, "{} 不得被当成 everEnrolled=false");
+  await writeFile(lc, JSON.stringify({ everEnrolled: "yes" }));
+  assert.equal(await readLifecycle(lc), null);
+  await writeFile(lc, JSON.stringify({ everEnrolled: 1 }));
+  assert.equal(await readLifecycle(lc), null);
+  await writeFile(lc, JSON.stringify({ everEnrolled: true }));
+  assert.deepEqual(await readLifecycle(lc), { everEnrolled: true });
+  await writeFile(lc, JSON.stringify({ everEnrolled: false }));
+  assert.deepEqual(await readLifecycle(lc), { everEnrolled: false });
+
+  // status 出口同样归 null（S04 不得据此"证明从未 enroll"而跳过吊销）
+  const home = await tempDir("b3-home");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("b3");
+  registerStub(id);
+  await mkdir(join(paths.instancesDir, id), { recursive: true });
+  await writeFile(instancePaths(join(paths.instancesDir, id)).lifecycle, "{}");
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await daemon.start();
+    assert.equal((await ipcAgentStatus(paths.socketPath, id)).everEnrolled, null);
+  } finally {
+    await daemon.shutdown();
+  }
+});
+
+test("BLOCKER4 双 daemon 抢占：并发启动恰一个成功，另一个 DaemonAlreadyRunningError", async () => {
+  const home = await tempDir("b4");
+  const paths = cgrcbPaths(home);
+  const d1 = new CgrcbDaemon({ home, log: () => {} });
+  const d2 = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    const results = await Promise.allSettled([d1.start(), d2.start()]);
+    const ok = results.filter((r) => r.status === "fulfilled");
+    const failed = results.filter((r) => r.status === "rejected") as PromiseRejectedResult[];
+    assert.equal(ok.length, 1, `恰一个成功：${JSON.stringify(results.map((r) => r.status))}`);
+    assert.equal(failed.length, 1);
+    assert.ok(
+      failed[0]!.reason instanceof DaemonAlreadyRunningError,
+      `败者应为 DaemonAlreadyRunningError，实际 ${String(failed[0]!.reason)}`,
+    );
+    // 胜者 socket 未被败者删除，仍可服务
+    assert.equal((await requestIpc(paths.socketPath, "status")).ok, true);
+  } finally {
+    await Promise.all([d1.shutdown(), d2.shutdown()]);
+  }
+});
+
+test("BLOCKER5 未注册模块：config-enabled 启动 daemon → failed（绝非 online）", async () => {
+  const home = await tempDir("b5");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("ghost"); // 不 registerAgent
+  await writeConfig(paths.configPath, withAgentEnabled(defaultConfig(), id, true));
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await daemon.start();
+    await waitFor(
+      async () => (await ipcAgentStatus(paths.socketPath, id)).status === "failed",
+      5000,
+      "failed",
+    );
+    const st = await ipcAgentStatus(paths.socketPath, id);
+    assert.equal(st.enabled, true);
+    assert.equal(st.status, "failed");
+    assert.equal(st.online, false);
+    assert.equal(st.connected, false);
+    assert.match(String(st.error), /未注册/);
+  } finally {
+    await daemon.shutdown();
+  }
+});
+
+test("MATERIAL6 per-request fault 不拆整实例：持续 reject → connected 保持、无重建", async () => {
+  const mock = await startMock();
+  const home = await tempDir("m6");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("m6");
+  const stub = registerStub(id);
+  // 短退避：若错误地把 per-request fault 当结构性故障，会立即重建
+  const daemon = makeDaemon(home, mock, { restartBaseDelayMs: 20, restartMaxDelayMs: 40 });
+  try {
+    await wantLoggedIn(home);
+    await daemon.start();
+    await requestIpc(paths.socketPath, "enable", { agent: id });
+    await waitFor(async () => (await ipcAgentStatus(paths.socketPath, id)).connected, 5000, "connected");
+    assert.equal(stub.instances, 1);
+
+    for (const app of stub.apps) app.rejectAll = true;
+    for (let i = 0; i < 3; i += 1) {
+      const r = await mock.rpc("boom", {}, 5000);
+      assert.ok("error" in r, "reject 应回 JSON-RPC error");
+    }
+    await new Promise((r) => setTimeout(r, 200));
+
+    const st = await ipcAgentStatus(paths.socketPath, id);
+    assert.equal(st.status, "online", "per-request fault 不得把实例拆成 failed");
+    assert.equal(st.connected, true, "隧道应保持连接");
+    assert.equal(stub.instances, 1, "工厂不得被再次调用（无隧道重建）");
+  } finally {
+    await daemon.shutdown();
+    await mock.stop();
+  }
+});
+
+test("NIT② IPC 请求行超限：连接被断开且 daemon 仍可服务", async () => {
+  const home = await tempDir("nit2");
+  const paths = cgrcbPaths(home);
+  const daemon = new CgrcbDaemon({ home, log: () => {} });
+  try {
+    await daemon.start();
+    const socket = createConnection(paths.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", () => resolve());
+      socket.once("error", reject);
+    });
+    socket.write("x".repeat(MAX_IPC_LINE_BYTES + 10)); // 无换行且超限
+    await new Promise<void>((resolve) => socket.once("close", () => resolve()));
+    assert.equal(socket.destroyed, true);
+    assert.equal((await requestIpc(paths.socketPath, "status")).ok, true);
+  } finally {
+    await daemon.shutdown();
+  }
+});
+
+test("NIT③ sun_path 长度守卫：超长 socket 路径明确报错", () => {
+  const long = `/tmp/${"x".repeat(120)}/daemon.sock`;
+  assert.throws(() => assertSocketPathFits(long), /路径过长/);
+  assert.doesNotThrow(() => assertSocketPathFits("/tmp/cgrcb/daemon.sock"));
+  assert.ok(MAX_SOCKET_PATH_BYTES <= 100);
+});
+
+test("AC6 首建生活周期：实例目录首次创建即写 everEnrolled=false（enroll 前）", async () => {
+  const home = await tempDir("ac6lc");
+  const paths = cgrcbPaths(home);
+  const id = uniqueId("ac6lc");
+  registerStub(id);
+  await wantLoggedIn(home);
+  // enroll 指向不可达端口：实例最终 failed，但 ensureInstanceDir 已在 enroll 前写 lifecycle
+  const daemon = new CgrcbDaemon({
+    home,
+    baseUrl: "http://127.0.0.1:1",
+    reconnectDelayMs: 0,
+    log: () => {},
+  });
+  try {
+    await daemon.start();
+    const res = await requestIpc(paths.socketPath, "enable", { agent: id });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    await waitFor(
+      async () => (await ipcAgentStatus(paths.socketPath, id)).status === "failed",
+      8000,
+      "enroll 失败 → failed",
+    );
+    const ip = instancePaths(join(paths.instancesDir, id));
+    assert.deepEqual(await readLifecycle(ip.lifecycle), { everEnrolled: false });
+    assert.equal((await ipcAgentStatus(paths.socketPath, id)).everEnrolled, false);
+    assert.equal(existsSync(ip.enrollment), false, "enroll 未成功则无 enrollment.json");
+  } finally {
+    await daemon.shutdown();
   }
 });
