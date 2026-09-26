@@ -711,6 +711,52 @@ test("S03 B槽 reset×并发 persistState：播种写为串行序最后写，旧
   }
 });
 
+test("S03 B槽 reset 播种写：入列即冻结序列化，并发 turn/start 改动不得混入播种态", async () => {
+  const key = { clientId: "c", streamId: "s" };
+  const slow = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  for (let i = 0; i < 3; i++) {
+    const dir = await tempDir("reset-freeze");
+    const statePath = simStatePath(dir);
+    // 巨大 stepDelay：并发 turn 在测试窗口内不完成，避免其 finish 落盘干扰
+    const app = new SimApp({ codexHome: dir, statePath, stepDelayMs: 10_000, deltaIntervalMs: 10_000 });
+    try {
+      await app.handleRequest(key, 0, "initialize", { clientInfo: { name: "t" } });
+      // 先制造非播种线程，使 reset 前快照与播种态不同
+      await app.handleRequest(key, 1, "thread/start", { cwd: "/tmp-freeze" });
+
+      const internal = app as unknown as { saveQueue: Promise<void>; threads: Map<string, unknown> };
+      let release!: () => void;
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      internal.saveQueue = internal.saveQueue.then(() => gate);
+
+      const resetP = app.resetToSeed();
+      // 追加慢任务：reset 恢复后播种写排在它之后（执行被延后），留出改动内存的窗口
+      internal.saveQueue = internal.saveQueue.then(() => slow(80));
+      release();
+      // 等 reset 完成内存播种（只剩 1 个预置线程），此时播种写已入列但尚未执行
+      await waitFor(() => internal.threads.size === 1, 1000, "reset 内存播种");
+      const seedId = [...internal.threads.keys()][0]!;
+      // 对预置线程发 turn/start（改内存：push 新 turn+item），发生在播种写入列之后、执行之前
+      const started = (await app.handleRequest(key, 2, "turn/start", {
+        threadId: seedId,
+        input: [{ type: "text", text: "RACE-TURN" }],
+      })) as { result?: { turn?: { id: string } } };
+      assert.ok(started.result?.turn?.id, "并发 turn/start 应成功");
+
+      await resetP;
+      await slow(50);
+      const raw = await readFile(statePath, "utf8");
+      const disk = JSON.parse(raw) as LooseStoreEntry[];
+      assert.deepEqual(normStore(disk), SEED_SEMANTICS, `第 ${i + 1} 次：播种写须为入列时冻结内容`);
+      assert.equal(raw.includes("RACE-TURN"), false, "播种写不得混入并发 turn 的输入");
+    } finally {
+      app.close(); // 失败时也清掉 10s 在途定时器，避免进程挂起
+    }
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

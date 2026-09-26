@@ -209,7 +209,9 @@ export class SimApp extends EventEmitter implements AgentApp {
    * reset 路径的播种写（S03 B 槽新缺陷修复）：把播种写作为任务**入列 saveQueue 尾部**，
    * 与运行期 persistState 保持**同一串行顺序**，从而 reset 写必为串行序中的"最后一个写"——
    * 即便 reset 排空等待期间并发 persistState 追加了旧快照写，它也排在播种写之前，不会后落盘覆盖。
-   * 快照在**入列时**捕获（此时内存已播种），避免任务执行前内存被并发请求改动。
+   *
+   * 内容**入列时即冻结**：`JSON.stringify` 在入列处完成（不是队列任务执行时），否则浅拷贝的
+   * thread/items 仍引用可变对象，任务执行前并发 turn/start 等改内存会被序列化进播种写。
    *
    * 错误传递：返回 one-shot promise，写失败时 reject 给 resetToSeed；但 saveQueue 链本身
    * 仍吞错（不 reject），运行期吞错语义不变。
@@ -217,7 +219,7 @@ export class SimApp extends EventEmitter implements AgentApp {
   private enqueueSeedWrite(): Promise<void> {
     const statePath = this.opts.statePath;
     if (!statePath) return Promise.resolve();
-    const snapshot = this.snapshotEntries();
+    const serialized = JSON.stringify(this.snapshotEntries()); // 入列即冻结，锁死播种态
     const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
     let resolveDone!: () => void;
     let rejectDone!: (err: unknown) => void;
@@ -226,7 +228,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       rejectDone = reject;
     });
     const task = this.saveQueue.then(async () => {
-      await writeFile(tmp, JSON.stringify(snapshot), "utf8");
+      await writeFile(tmp, serialized, "utf8");
       await rename(tmp, statePath);
     });
     // 链尾吞错（与 persistState 一致）：失败只 reject one-shot done，不让 saveQueue 断裂
