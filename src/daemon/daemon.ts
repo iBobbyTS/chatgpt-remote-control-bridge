@@ -32,8 +32,15 @@ import {
   type AgentModule,
 } from "../agents/registry.ts";
 import { BridgeAuthManager } from "../auth/manager.ts";
+import { WhamClient } from "../wham/client.ts";
+import type { RemoteControlClient } from "../wham/protocol.ts";
 import { WhamTunnel } from "../wham/tunnel.ts";
 import { readLifecycle, readConfig, writeConfig, writeLifecycle, withAgentEnabled, type AgentConfig, type CgrcbConfig } from "./config.ts";
+import {
+  PairingManager,
+  readEnrollmentFile,
+  type PairingStatus,
+} from "./pairing.ts";
 import {
   cgrcbPaths,
   instanceDirFor,
@@ -65,6 +72,10 @@ export interface CgrcbDaemonOptions {
   reconnectDelayMs?: number;
   pingIntervalMs?: number;
   refreshThresholdMs?: number;
+  /** S04：配对 claim 轮询周期（默认 2000ms；测试注入短周期）。 */
+  pairingClaimPollIntervalMs?: number;
+  /** S04：配对续码检查周期（默认 5000ms；测试注入短周期）。 */
+  pairingRenewalCheckIntervalMs?: number;
   agentLabel?: string;
   /** 故障重启退避基数；默认 1000ms。 */
   restartBaseDelayMs?: number;
@@ -93,6 +104,13 @@ interface InstanceRuntime {
   identityWarnings: string[];
 }
 
+/** status 出口：S04 在 AgentRuntimeStatus 上追加 pairing（pending 码/claim/已配对 clients）。 */
+export type AgentRuntimeStatusWithPairing = AgentRuntimeStatus & { pairing: PairingStatus };
+
+/** S04 吊销复核最大轮数（收敛上限）。 */
+const REVOKE_RECHECK_ROUNDS = 3;
+const DISABLE_RECOVERY_HINT = "先登录使 enroll 成功后再 disable";
+
 /** 启动/重启在 stopping 或实例代次失效时主动取消（BLOCKER 1）。 */
 class InstanceCancelledError extends Error {
   constructor(reason: string) {
@@ -104,8 +122,6 @@ class InstanceCancelledError extends Error {
 const DAEMON_STOPPED_MESSAGE = "daemon 已停止，请创建新实例";
 
 const NOT_IMPLEMENTED_OPS = new Set<IpcRequest["op"]>([
-  "pair",
-  "pair-status",
   "auth-reset",
 ]);
 
@@ -116,6 +132,8 @@ export class CgrcbDaemon {
   private config: CgrcbConfig = { version: 1, agents: {} };
   private ipcServer: IpcServer | null = null;
   private readonly instances = new Map<string, InstanceRuntime>();
+  /** S04：per-instance PairingManager（enable 自动配对/续码/claim 轮询/status）。 */
+  private readonly pairings = new Map<string, PairingManager>();
   /** per-agent 操作队列（串行化）：启动/重启/disable 同一 key 排队。 */
   private readonly locks = new Map<string, Promise<unknown>>();
   /** 在途操作（shutdown 等待其收敛，防孤儿隧道）。 */
@@ -276,6 +294,11 @@ export class CgrcbDaemon {
     // 先停全部隧道（tunnel.stop 内部调 app.close）
     await Promise.all([...this.instances.values()].map((inst) => this.disposeInstance(inst)));
     this.instances.clear();
+    // S04：释放全部 PairingManager（停定时器/退订），不再写盘
+    for (const pairing of this.pairings.values()) {
+      pairing.dispose();
+    }
+    this.pairings.clear();
     await this.configChain.catch(() => undefined);
     if (this.ipcServer) {
       await this.ipcServer.close();
@@ -359,6 +382,7 @@ export class CgrcbDaemon {
       inst.error = null;
       inst.attempts = 0;
       this.logLine(`[${id}] 实例在线`);
+      await this.notifyInstanceOnline(inst);
     } catch (err) {
       await this.disposeInstance(inst);
       if (err instanceof InstanceCancelledError) {
@@ -385,6 +409,75 @@ export class CgrcbDaemon {
       identity: () => this.instances.get(id)?.tunnel?.identity() ?? null,
       log: (line) => this.logLine(`[${id}] ${line}`),
     };
+  }
+
+  // -------------------------------------------------------------- S04 配对
+
+  /** 取/建 per-instance PairingManager（authManager 已在 doStart 建立）。 */
+  private pairingFor(id: string): PairingManager {
+    let manager = this.pairings.get(id);
+    if (!manager) {
+      manager = new PairingManager({
+        agentId: id,
+        instanceDir: instanceDirFor(this.paths.root, id),
+        authManager: this.authManager!,
+        baseUrl: this.opts.baseUrl,
+        log: (line) => this.logLine(`[${id}] ${line}`),
+        isEnabled: () => this.config.agents[id]?.enabled === true,
+        isOnline: () => {
+          // 配对只需实例在线且 enrollment 就绪（tunnel.start 返回即具备），
+          // 不要求 WSS 已 OPEN：connectWs 是 fire-and-forget，握手完成晚于 start()。
+          const inst = this.instances.get(id);
+          return !!inst && inst.status === "online" && !!inst.tunnel;
+        },
+        claimPollIntervalMs: this.opts.pairingClaimPollIntervalMs,
+        renewalCheckIntervalMs: this.opts.pairingRenewalCheckIntervalMs,
+      });
+      this.pairings.set(id, manager);
+    }
+    return manager;
+  }
+
+  /**
+   * 实例上线后自动配对（S04 交付物 1）。失败只记日志，绝不影响实例在线状态
+   * （配对是 best-effort；调用方 await 但内部吞错）。
+   */
+  private async notifyInstanceOnline(inst: InstanceRuntime): Promise<void> {
+    if (this.config.agents[inst.id]?.enabled !== true) return;
+    const manager = this.pairings.get(inst.id);
+    if (!manager) return;
+    try {
+      await manager.onInstanceOnline();
+    } catch (err) {
+      this.logLine(`[${inst.id}] 自动配对失败: ${errorMessage(err)}`);
+    }
+  }
+
+  /** status / pair-status 的 pairing 数据源；refreshClients=true 时实时刷新 clients 缓存。 */
+  private async pairingStatusFor(id: string, refreshClients: boolean): Promise<PairingStatus> {
+    const manager = this.pairings.get(id);
+    if (manager) {
+      return manager.status({ refreshClients });
+    }
+    return {
+      agentId: id,
+      pending: null,
+      claimed: false,
+      clients: [],
+      clientsRefreshedAt: null,
+      environmentId: null,
+      warnings: [],
+    };
+  }
+
+  private knownAgentIds(): string[] {
+    return [
+      ...new Set<string>([
+        ...Object.keys(this.config.agents),
+        ...listAgents().map((m) => m.id),
+        ...this.instances.keys(),
+      ]),
+    ];
   }
 
   /** 建 app（工厂）→ 建 tunnel → 订阅事件 → start。工厂同步抛错由调用方捕获。 */
@@ -429,6 +522,8 @@ export class CgrcbDaemon {
     tunnel.on("fault", (err, context) =>
       this.onInstanceFault(inst.id, err, String(context)),
     );
+    // S04：PairingManager 订阅 tunnel enrollment 事件（token 续期同步 pending）
+    await this.pairingFor(inst.id).attach(tunnel);
 
     // BLOCKER 1：建隧道后、启动前/后复查代次；失效即停隧道并取消
     if (this.isStale(inst)) {
@@ -505,6 +600,7 @@ export class CgrcbDaemon {
       inst.error = null;
       inst.attempts = 0;
       this.logLine(`[${id}] 实例已恢复在线`);
+      await this.notifyInstanceOnline(inst);
     } catch (err) {
       await this.disposeInstance(inst);
       if (err instanceof InstanceCancelledError) {
@@ -564,6 +660,121 @@ export class CgrcbDaemon {
     await writeLifecycle(instancePaths(dir).lifecycle, { everEnrolled: false });
   }
 
+  // ---------------------------------------------------- S04 disable 吊销/恢复
+
+  /** cursor 穷尽列出 environment 下全部已配对客户端（账号鉴权，limit=100）。 */
+  private async listAllClients(
+    client: WhamClient,
+    environmentId: string,
+  ): Promise<RemoteControlClient[]> {
+    const all: RemoteControlClient[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined;
+    for (;;) {
+      const page = await client.listClients({
+        environmentId,
+        limit: 100,
+        order: "desc",
+        ...(cursor ? { cursor } : {}),
+      });
+      all.push(...page.items);
+      const next = page.cursor ?? undefined;
+      if (!next) break;
+      if (seenCursors.has(next)) break; // 防游标循环
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return all;
+  }
+
+  /**
+   * disable 第 (d)+(e) 步：初始穷尽吊销 + 停隧道后复核轮（每轮重新 listClients，
+   * 吊销期间被 claim 的 client 继续吊销），收敛上限 REVOKE_RECHECK_ROUNDS 轮。
+   * 返回 false = 3 轮复核后仍不收敛（调用方中止 disable）。
+   * 收敛后再做一次残余窗口扫描：仍有 client → WARN（后端无 pending 失效 API，不阻塞）。
+   */
+  private async revokeEnvironmentClients(
+    client: WhamClient,
+    id: string,
+    environmentId: string,
+  ): Promise<boolean> {
+    const initial = await this.listAllClients(client, environmentId);
+    for (const item of initial) {
+      await client.revokeClient({ environmentId, clientId: item.client_id });
+    }
+    this.logLine(`[${id}] 已吊销 ${initial.length} 个客户端（初始穷尽）`);
+
+    let rechecks = 0;
+    for (;;) {
+      const remaining = await this.listAllClients(client, environmentId);
+      if (remaining.length === 0) {
+        const residual = await this.listAllClients(client, environmentId).catch(() => []);
+        if (residual.length > 0) {
+          this.logLine(
+            `[${id}] WARN 残余窗口：吊销收敛后仍有 ${residual.length} 个客户端被 claim` +
+              `（后端无 pending 码失效 API，留待下次 enable→disable 周期清理）`,
+          );
+        }
+        return true;
+      }
+      if (rechecks >= REVOKE_RECHECK_ROUNDS) return false;
+      rechecks += 1;
+      this.logLine(
+        `[${id}] 吊销复核第 ${rechecks}/${REVOKE_RECHECK_ROUNDS} 轮：仍有 ${remaining.length} 个客户端`,
+      );
+      for (const item of remaining) {
+        await client.revokeClient({ environmentId, clientId: item.client_id });
+      }
+    }
+  }
+
+  /**
+   * disable 中止后恢复实例：resume 配对并重建隧道（S02 监管者接管），保持 enabled。
+   * 实例已在则重建；未注册/不可达则落 failed 并由退避重启继续尝试。
+   */
+  private async restoreAfterAbort(id: string): Promise<void> {
+    const pairing = this.pairings.get(id);
+    pairing?.resume();
+    const inst = this.instances.get(id);
+    if (!inst || this.stopping) return;
+    this.clearRestartTimer(inst);
+    inst.tunnel = null;
+    inst.app = null;
+    inst.status = "failed";
+    inst.error = null;
+    try {
+      await this.startInstance(id);
+    } catch (err) {
+      this.logLine(`[${id}] disable 中止后恢复实例失败: ${errorMessage(err)}`);
+    }
+  }
+
+  /**
+   * disable 成功收尾（第 (e) 步收敛后）：enabled=false、停实例、清 pairing.json、
+   * 释放 PairingManager。
+   */
+  private async finalizeDisable(
+    id: string,
+    inst: InstanceRuntime | undefined,
+    wasEnabled: boolean,
+  ): Promise<void> {
+    if (wasEnabled) {
+      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
+    }
+    const pairing = this.pairings.get(id);
+    if (pairing) {
+      pairing.dispose();
+      this.pairings.delete(id);
+    }
+    if (inst) {
+      this.clearRestartTimer(inst);
+      inst.status = "stopping";
+      await this.disposeInstance(inst);
+      if (this.instances.get(id) === inst) this.instances.delete(id);
+    }
+    await rm(instancePaths(instanceDirFor(this.paths.root, id)).pairing, { force: true });
+  }
+
   // -------------------------------------------------------------------- IPC
 
   private isKnownAgent(id: string): boolean {
@@ -587,6 +798,10 @@ export class CgrcbDaemon {
           return await this.withAgentLock(request.agent, () => this.doEnable(request.agent));
         case "disable":
           return await this.withAgentLock(request.agent, () => this.doDisable(request.agent));
+        case "pair":
+          return await this.withAgentLock(request.agent, () => this.doPair(request.agent));
+        case "pair-status":
+          return await this.doPairStatus(request.agent);
         case "agent-init":
           return await this.withAgentLock(request.agent, () =>
             this.doAgentInitReset(request.agent, "init"),
@@ -641,22 +856,131 @@ export class CgrcbDaemon {
     return { ok: true, data: await this.agentStatus(id) };
   }
 
+  /**
+   * S04 disable 五步（顺序强制，封闭并发 claim 窗口）：
+   * (a) 停该实例续码/claim 定时器、停发新码；(b) 停 WSS 隧道（此后新 claim 得不到服务）；
+   * (c) 定位 environment_id：内存 enrollment → 磁盘 enrollment.json（不看 token 过期）→
+   *     皆无时按 lifecycle.json 判定（everEnrolled=false → 无可吊销对象直接完成；
+   *     缺失=历史不明 / everEnrolled=true 但记录丢 → 报错中止，不得 fresh-enroll 兜底）；
+   * (d) listClients cursor 穷尽逐个 revokeClient（账号鉴权）；(e) 停隧道后复核轮（上限 3 轮）
+   *     → 收敛后 enabled=false、清 pairing.json。任一轮失败/不收敛 → 报错中止（保持 enabled，
+   *     实例由监管者重新拉起隧道恢复在线服务）。
+   *
+   * 从未启用且无实例：幂等快路径（清 pairing.json 直接返回，不做吊销判定）。
+   */
   private async doDisable(id: string | undefined): Promise<IpcResponse> {
     if (!id || !this.isKnownAgent(id)) return unknownAgent(id);
     if (this.stopping) return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
-    if (this.config.agents[id]?.enabled === true) {
-      await this.commitConfig((cfg) => withAgentEnabled(cfg, id, false));
-    }
+    const wasEnabled = this.config.agents[id]?.enabled === true;
     const inst = this.instances.get(id);
-    if (inst) {
-      this.clearRestartTimer(inst);
-      inst.status = "stopping";
-      await this.disposeInstance(inst);
-      this.instances.delete(id);
+    const dir = instanceDirFor(this.paths.root, id);
+    const paths = instancePaths(dir);
+
+    // 幂等快路径：从未启用且无实例 → 无可吊销对象
+    if (!wasEnabled && !inst) {
+      await rm(paths.pairing, { force: true });
+      return { ok: true, data: await this.agentStatus(id) };
     }
-    // 占位：清 pairing 状态（真正的吊销/清理在 S04）
-    await rm(instancePaths(instanceDirFor(this.paths.root, id)).pairing, { force: true });
+
+    // (a) 停发新码 / 作废在途配对操作
+    this.pairings.get(id)?.suspend();
+
+    // 内存 enrollment 快照（停隧道前捕获；tunnel.stop 不清空 enrollment）
+    const memoryEnrollment = inst?.tunnel?.enrollmentSnapshot ?? null;
+
+    // (b) 停 WSS 隧道；保留 inst 引用以便中止后恢复
+    if (inst?.tunnel) {
+      try {
+        await inst.tunnel.stop();
+      } catch (err) {
+        this.logLine(`[${id}] 停隧道失败: ${errorMessage(err)}`);
+      }
+      inst.status = "stopping";
+    }
+
+    // (c) 定位 environment_id
+    const diskEnrollment = await readEnrollmentFile(dir);
+    const environmentId = memoryEnrollment?.environment_id ?? diskEnrollment?.environment_id ?? null;
+
+    if (!environmentId) {
+      const lifecycle = await readLifecycle(paths.lifecycle);
+      if (lifecycle && lifecycle.everEnrolled === false) {
+        // 该实例从未成功 enroll（跨 daemon 重启成立）→ 无可吊销对象
+        await this.finalizeDisable(id, inst, wasEnabled);
+        return { ok: true, data: await this.agentStatus(id) };
+      }
+      await this.restoreAfterAbort(id);
+      const reason =
+        lifecycle === null
+          ? "lifecycle.json 缺失/损坏（历史不明）"
+          : `everEnrolled=${lifecycle.everEnrolled} 但 enrollment.json 丢失`;
+      throw new Error(
+        `[${id}] 无法定位 environment_id（${reason}），已中止 disable（保持 enabled）。` +
+          `恢复路径：${DISABLE_RECOVERY_HINT}。`,
+      );
+    }
+
+    // (d)+(e) 账号鉴权吊销 + 复核轮
+    if (!this.authManager) {
+      await this.restoreAfterAbort(id);
+      throw new Error(`[${id}] daemon 未就绪，已中止 disable（保持 enabled）`);
+    }
+    const client = new WhamClient({
+      authManager: this.authManager,
+      baseUrl: this.opts.baseUrl,
+      installationDir: dir,
+    });
+    let converged: boolean;
+    try {
+      converged = await this.revokeEnvironmentClients(client, id, environmentId);
+    } catch (err) {
+      await this.restoreAfterAbort(id);
+      throw new Error(
+        `[${id}] 吊销失败，已中止 disable（保持 enabled）：${errorMessage(err)}`,
+      );
+    }
+    if (!converged) {
+      await this.restoreAfterAbort(id);
+      throw new Error(
+        `[${id}] 吊销未收敛（environment=${environmentId} 仍有已配对客户端），` +
+          `已中止 disable（保持 enabled，可重试）`,
+      );
+    }
+
+    await this.finalizeDisable(id, inst, wasEnabled);
     return { ok: true, data: await this.agentStatus(id) };
+  }
+
+  /** IPC pair：enabled 实例追加配对码（覆盖旧 pending；多设备并存无上限）。 */
+  private async doPair(id: string | undefined): Promise<IpcResponse> {
+    if (!id || !this.isKnownAgent(id)) return unknownAgent(id);
+    if (this.stopping) return { ok: false, error: "DAEMON_BUSY", message: "daemon 正在停止" };
+    if (this.config.agents[id]?.enabled !== true) {
+      return { ok: false, error: "INTERNAL", message: `agent 未启用：请先 enable ${id}` };
+    }
+    if (!this.authManager) {
+      return { ok: false, error: "INTERNAL", message: "daemon 未就绪" };
+    }
+    const pending = await this.pairingFor(id).requestNewCode();
+    if (!pending) {
+      return {
+        ok: false,
+        error: "INTERNAL",
+        message: `无法生成配对码：实例 ${id} 尚未 enroll 或正在停止`,
+      };
+    }
+    return { ok: true, data: { agent: id, pending } };
+  }
+
+  /** IPC pair-status：各实例 pending 码/到期/claim 状态 + 已配对 clients（实时刷新）。 */
+  private async doPairStatus(id: string | undefined): Promise<IpcResponse> {
+    if (id !== undefined && !this.isKnownAgent(id)) return unknownAgent(id);
+    const ids = id !== undefined ? [id] : this.knownAgentIds();
+    const agents: Record<string, PairingStatus> = {};
+    for (const agentId of ids) {
+      agents[agentId] = await this.pairingStatusFor(agentId, true);
+    }
+    return { ok: true, data: { agents } };
   }
 
   /**
@@ -707,7 +1031,7 @@ export class CgrcbDaemon {
       ...listAgents().map((m) => m.id),
       ...this.instances.keys(),
     ]);
-    const agents: Record<string, AgentRuntimeStatus> = {};
+    const agents: Record<string, AgentRuntimeStatusWithPairing> = {};
     for (const id of ids) {
       agents[id] = await this.agentStatus(id);
     }
@@ -724,13 +1048,15 @@ export class CgrcbDaemon {
     };
   }
 
-  async agentStatus(id: string): Promise<AgentRuntimeStatus> {
+  async agentStatus(id: string): Promise<AgentRuntimeStatusWithPairing> {
     const cfg = this.config.agents[id];
     const inst = this.instances.get(id);
     const registered = !!getAgent(id);
     const dir = instanceDirFor(this.paths.root, id);
     const lifecycle = await readLifecycle(instancePaths(dir).lifecycle);
     const everEnrolled = lifecycle ? lifecycle.everEnrolled : null;
+    // S04：pairing（不实时刷新 clients，避免 status 反复网请求；pair-status 走实时）
+    const pairing = await this.pairingStatusFor(id, false);
     if (!inst) {
       const enabled = cfg?.enabled === true;
       return {
@@ -747,6 +1073,7 @@ export class CgrcbDaemon {
         identityWarnings: [],
         warnings: [],
         error: enabled && !registered ? `agent 模块未注册: ${id}` : null,
+        pairing,
       };
     }
     const tunnel = inst.tunnel;
@@ -765,6 +1092,7 @@ export class CgrcbDaemon {
       identityWarnings: tunnel?.identityWarnings ?? [],
       warnings: tunnel?.warnings ?? [],
       error: inst.error,
+      pairing,
     };
   }
 

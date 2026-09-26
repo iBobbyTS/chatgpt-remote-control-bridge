@@ -51,6 +51,27 @@ export interface MockWhamOptions {
    * 不改变 mock 内部 storage。
    */
   refreshResponsePatch?: Partial<EnrollRemoteServerResponse>;
+  /**
+   * pair 发放的手输码有效期（毫秒）；默认 10min。测试注入短 TTL 触发 S04 自动续码。
+   */
+  pairTtlMs?: number;
+  /**
+   * GET clients 强制页大小（测试注入分页穷尽）：>0 时页大小取 min(limit, 该值)，
+   * 使少量 client 也能触发 cursor 多页。默认不设（页大小 = limit）。
+   */
+  forceClientPageSize?: number;
+  /**
+   * 每次 GET clients 计算完页面、回响应前回调（测试注入时序，如"末页 list 之后才 claim"）。
+   * 回调可新建 client（S04 AC6 复核轮捕获）。
+   */
+  afterListClients?: (info: {
+    environmentId: string;
+    cursor: string | null;
+    pageSize: number;
+    requestIndex: number;
+  }) => void | Promise<void>;
+  /** 前 N 次 DELETE clients 返回 500（测试注入 S04 吊销失败）。 */
+  revokeFailuresRemaining?: number;
   log?: (line: string) => void;
 }
 
@@ -122,6 +143,31 @@ export class MockWhamServer {
   /** 端点调用计数（AC7 的「enroll 增量为 0」判据）。 */
   enrollCount = 0;
   refreshCount = 0;
+  /**
+   * S04 配对 claim 模拟：pair(manual_code) 发放的手输码 → {environmentId, claimed}。
+   * `addClient(environmentId, …)` 视为该 environment 下发的手输码均已 claim（模拟手机配对成功）。
+   */
+  private readonly pendingPairings = new Map<
+    string,
+    { environmentId: string; claimed: boolean }
+  >();
+  /** 手输码序号：首个 = "123-456"（保持既有探测断言），后续递增互异。 */
+  private manualCodeSeq = 0;
+  /** pair 请求记录（测试断言码生成/覆盖）。 */
+  readonly pairRequests: Array<{
+    body: unknown;
+    headers: Record<string, string>;
+    response: unknown;
+  }> = [];
+  /** pair/status 请求记录（测试断言轮询所用 token）。 */
+  readonly pairStatusRequests: Array<{
+    body: unknown;
+    headers: Record<string, string>;
+    claimed: boolean;
+  }> = [];
+  /** 剩余强制失败的 DELETE 次数（测试注入吊销失败；运行期可改）。 */
+  revokeFailuresRemaining = 0;
+  private listRequestCount = 0;
 
   constructor(opts: MockWhamOptions) {
     this.opts = opts;
@@ -132,6 +178,7 @@ export class MockWhamServer {
   }
 
   async start(): Promise<void> {
+    this.revokeFailuresRemaining = this.opts.revokeFailuresRemaining ?? 0;
     const address = await new Promise<string>((resolve, reject) => {
       this.server = createServer((req, res) => {
         void this.handleRest(req, res);
@@ -272,22 +319,52 @@ export class MockWhamServer {
         return;
       }
       const request = JSON.parse(body) as { manual_code: boolean };
+      const manualCode = request.manual_code ? this.nextManualCode() : null;
+      if (manualCode) {
+        this.pendingPairings.set(manualCode, {
+          environmentId: this.enrollment.environmentId,
+          claimed: false,
+        });
+      }
       const response = {
         pairing_code: `pc_${randomUUID().slice(0, 8)}`,
-        manual_pairing_code: request.manual_code ? "123-456" : null,
+        manual_pairing_code: manualCode,
         server_id: this.enrollment.serverId,
         environment_id: this.enrollment.environmentId,
-        expires_at: new Date(Date.now() + 10 * 60_000).toISOString(),
+        expires_at: new Date(Date.now() + (this.opts.pairTtlMs ?? 10 * 60_000)).toISOString(),
       };
+      this.pairRequests.push({ body: request, headers: headerRecord(req), response });
       this.log(`pair: ${JSON.stringify(request)} → ${JSON.stringify(response)}`);
       await this.replyJson(res, response);
       return;
     }
     if (url.pathname === REST_PATHS.pairStatus) {
-      // 模拟手机已 claim：直接 claimed=true（探测时手机端就是 mock 自己）
-      const response = { claimed: true };
-      this.log(`pair/status: ${body} → ${JSON.stringify(response)}`);
-      await this.replyJson(res, response);
+      const request = JSON.parse(body) as {
+        pairing_code?: string;
+        manual_pairing_code?: string;
+      };
+      const manual = request.manual_pairing_code;
+      if (manual !== undefined) {
+        // S04 claim 轮询：只传 manualPairingCode + remoteControlToken（校验 token 新鲜度）
+        if (!this.remoteControlTokenIsValid(bearer)) {
+          this.pairStatusRequests.push({
+            body: request,
+            headers: headerRecord(req),
+            claimed: false,
+          });
+          await this.replyJson(res, { error: "invalid_token" }, 401);
+          return;
+        }
+        const claimed = this.pendingPairings.get(manual)?.claimed ?? false;
+        this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed });
+        this.log(`pair/status: ${body} → ${JSON.stringify({ claimed })}`);
+        await this.replyJson(res, { claimed });
+        return;
+      }
+      // 兼容旧探测语义：无 manual code → claimed=true（手机端就是 mock 自己）
+      this.pairStatusRequests.push({ body: request, headers: headerRecord(req), claimed: true });
+      this.log(`pair/status: ${body} → {"claimed":true}`);
+      await this.replyJson(res, { claimed: true });
       return;
     }
     res.writeHead(404).end();
@@ -354,6 +431,11 @@ export class MockWhamServer {
     const envClients = this.clientsByEnvironment.get(environmentId) ?? [];
 
     if (method === "DELETE") {
+      if (this.revokeFailuresRemaining > 0) {
+        this.revokeFailuresRemaining -= 1;
+        await this.replyJson(res, { error: "injected_revoke_failure" }, 500);
+        return;
+      }
       if (!clientId) {
         await this.replyJson(res, { error: "client_id_required" }, 400);
         return;
@@ -388,10 +470,40 @@ export class MockWhamServer {
       const bt = Date.parse(b.last_seen_at ?? "") || 0;
       return order === "asc" ? at - bt : bt - at;
     });
-    const page = sorted.slice(offset, offset + limit);
+    // 强制页大小（测试注入）：仅影响响应分页，不改变客户端传入 limit 的语义
+    const pageSize =
+      this.opts.forceClientPageSize && this.opts.forceClientPageSize > 0
+        ? Math.min(limit, this.opts.forceClientPageSize)
+        : limit;
+    const page = sorted.slice(offset, offset + pageSize);
     const nextOffset = offset + page.length;
     const cursor = nextOffset < sorted.length ? encodeCursor(nextOffset) : null;
+    this.listRequestCount += 1;
+    if (this.opts.afterListClients) {
+      await this.opts.afterListClients({
+        environmentId,
+        cursor: url.searchParams.get("cursor"),
+        pageSize: page.length,
+        requestIndex: this.listRequestCount,
+      });
+    }
     await this.replyJson(res, { items: page, cursor });
+  }
+
+  /** 手输码：首个 "123-456"（保持既有探测断言），后续 "123-457" … 互异。 */
+  private nextManualCode(): string {
+    this.manualCodeSeq += 1;
+    return `123-${String(455 + this.manualCodeSeq).padStart(3, "0")}`;
+  }
+
+  /** remote_control_token 有效性（pair/status 的 bearer；含 refresh 轮换后的旧值）。 */
+  private remoteControlTokenIsValid(bearer: string): boolean {
+    if (!bearer) return false;
+    if (this.enrollment?.token === bearer) return true;
+    for (const enrollment of this.enrollmentsByKey.values()) {
+      if (enrollment.token === bearer) return true;
+    }
+    return false;
   }
 
   /** 账号鉴权：bearer ∈ 该账号历次有效 token 集合，且不同于 remote_control_token。 */
@@ -435,6 +547,12 @@ export class MockWhamServer {
     };
     list.push(entry);
     this.clientsByEnvironment.set(environmentId, list);
+    // S04 claim 模拟：该 environment 下发的手输码视为已 claim（手机配对成功）
+    for (const pending of this.pendingPairings.values()) {
+      if (pending.environmentId === environmentId) {
+        pending.claimed = true;
+      }
+    }
     return entry;
   }
 
