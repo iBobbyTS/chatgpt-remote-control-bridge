@@ -152,6 +152,12 @@ interface ThreadState {
    * 结果为 active 时按先前状态重判，goal 持久化状态本身已足以在重启后恢复判定。
    */
   goalRunResume: boolean;
+  /**
+   * goal turn 轮次计数（内存态，不持久化）：每开跑一个 goal turn 递增；第 2 个
+   * goal turn 的模拟 wait 为 30 秒，其余 10 秒。新 goal（无既有 goal 的 set）与
+   * goal/clear 时归零。
+   */
+  goalTurnCount: number;
   /** compact 刚完成标记（内存态，不持久化）；下一个普通 turn 回复首行提示后清除。 */
   justCompacted: boolean;
   /** 后台终端（不持久化）：thread/shellCommand 完成后登记。 */
@@ -160,7 +166,7 @@ interface ThreadState {
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, justCompacted: false, backgroundTerminals: [] };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, justCompacted: false, backgroundTerminals: [] };
 }
 
 type AnyParams = Record<string, any>;
@@ -189,7 +195,7 @@ const HELP_TEXT = [
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
   "",
   "模拟功能（对齐 codex）：",
-  "goal 启用后自动续跑：首轮输出3条后标记blocked，再次启动输出1条后标记complete",
+  "goal 启用后自动续跑：每轮先执行模拟wait命令（第2轮30秒，其余10秒），首轮3条输出后标记blocked，再次启动1条输出后标记complete",
   "compact 约 5 秒完成且下一条回复标记",
   "Plan 模式回复带前缀",
   "shell 命令生成模拟命令条目",
@@ -1124,8 +1130,13 @@ export class SimApp extends EventEmitter implements AgentApp {
    * 纯 setTimeout 不依赖 shell。条目同时入 turn.items 与 thread items 索引，
    * 手机端历史回看（items/list）同样可见。
    */
-  private simulateCommandWait(state: ThreadState, sim: SimTurnRuntime, done: () => void): void {
-    const command = "wait 15 seconds";
+  private simulateCommandWait(
+    state: ThreadState,
+    sim: SimTurnRuntime,
+    done: () => void,
+    opts?: { command?: string; waitMs?: number },
+  ): void {
+    const command = opts?.command ?? "wait 15 seconds";
     const item = makeCommandExecution(command, state.thread.cwd);
     const startedAtMs = Date.now();
     this.emit("event", this.notification("item/started", {
@@ -1160,7 +1171,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       state.items.push({ turnId: sim.turn.id, item: completed, startedAtMs, completedAtMs: at });
       sim.turn.items.push(completed);
       done();
-    }, this.opts.commandWaitMs);
+    }, opts?.waitMs ?? this.opts.commandWaitMs);
   }
 
   private streamAgentMessage(state: ThreadState, sim: SimTurnRuntime, fullText: string, done: () => void): void {
@@ -1401,6 +1412,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     const state = this.threadState(p);
     const now = Math.floor(Date.now() / 1000);
     const existing = state.goal;
+    if (!existing) {
+      // 新 goal：轮种与轮次计数归零（goal/clear 亦归零）
+      state.goalRunResume = false;
+      state.goalTurnCount = 0;
+    }
     // codex 对 objective 做 trim（api.rs set_thread_goal：GoalObjectiveUpdate::Set → trim）
     const objective =
       p.objective === undefined || p.objective === null ? (existing?.objective ?? "") : String(p.objective).trim();
@@ -1469,6 +1485,8 @@ export class SimApp extends EventEmitter implements AgentApp {
     const state = this.threadState(p);
     if (!state.goal) return { cleared: false };
     state.goal = null;
+    state.goalRunResume = false;
+    state.goalTurnCount = 0;
     this.persistState();
     // 响应先行（同 goalSet）：goal/cleared 用宏任务补发，避免微任务抢在响应之前。
     this.schedule(null, () => {
@@ -1500,10 +1518,11 @@ export class SimApp extends EventEmitter implements AgentApp {
    * goal 续跑 turn（runtime.rs continue_if_idle → start_turn_if_idle，
    * turn_trigger "goal"）：输入是隐藏内部上下文（steering.rs
    * continuation_steering_item → ContextualUserFragment，不下发客户端），故本
-   * turn 无 userMessage item；手机端看到 turn/started → agentMessage →
-   * turn/completed。可被 steer（含 stop 规则，消息边界排水）。目标模拟脚本：
-   * 首轮激活输出 3 条后把 goal 标记 blocked；从 blocked 再次激活的续跑轮输出
-   * 1 条后标记 complete（轮种由 goalSet 写入 state.goalRunResume）。
+   * turn 无 userMessage item。每轮 turn 开始先执行一个模拟 wait 命令（第 2 个
+   * goal turn 30 秒，其余 10 秒），然后输出消息。可被 steer（含 stop 规则，
+   * 消息边界排水）。目标模拟脚本：首轮激活输出 3 条后把 goal 标记 blocked；
+   * 从 blocked 再次激活的续跑轮输出 1 条后标记 complete（轮种由 goalSet 写入
+   * state.goalRunResume）。
    */
   private beginGoalTurn(state: ThreadState): SimTurnRuntime {
     const turn = makeTurn("inProgress");
@@ -1518,6 +1537,9 @@ export class SimApp extends EventEmitter implements AgentApp {
           "（goal 3/3）本轮结束，目标标记为 blocked；再次启动目标将继续（1 条输出后完成）。",
         ];
     const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "goal", goalEndStatus: resume ? "complete" : "blocked" };
+    // 轮次计数：第 2 个 goal turn 的模拟 wait 为 30 秒，其余 10 秒
+    const round = (state.goalTurnCount += 1);
+    const waitSeconds = round === 2 ? 30 : 10;
     state.sim = sim;
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
@@ -1545,7 +1567,13 @@ export class SimApp extends EventEmitter implements AgentApp {
             this.processSteers(state, sim, () => step(index + 1));
           });
         };
-        step(0);
+        // 每轮先插入一个模拟 wait 命令执行，等待结束排水 steer（stop 在此生效）
+        this.simulateCommandWait(state, sim, () => {
+          this.processSteers(state, sim, () => step(0));
+        }, {
+          command: `wait ${waitSeconds} seconds`,
+          waitMs: Math.max(1, Math.round((waitSeconds * this.opts.commandWaitMs) / 15)),
+        });
       }, this.opts.stepDelayMs);
     }, 0);
     return sim;

@@ -531,3 +531,18 @@ status active）后续跑轮输出 1 条后标记 **complete**。
 （同 runScriptedTurn，stop 规则生效——中途停止按首轮终态 blocked 收尾）。计量仍
 每 goal turn 1234 token。真机推论：blocked 后手机 goal 卡片应出现「继续/重试」
 入口，点击即走续跑轮。
+
+### 追记：goal turn 每轮插入模拟 wait（第 2 轮 30 秒，其余 10 秒）（同日）
+
+用户规则再更新：每个 goal turn 开始先插入**一个**模拟 wait 命令执行——第 2 个
+goal turn 为 `wait 30 seconds`，其余（第 1、3、4…个）为 `wait 10 seconds`，然后
+才输出该轮消息。
+
+实现：`simulateCommandWait` 参数化（`opts.command` / `opts.waitMs`，默认仍为
+"wait 15 seconds" + commandWaitMs，test steer 行为不变）；`beginGoalTurn` 开跑时
+递增内存态 `ThreadState.goalTurnCount`（新 goal 的 set 与 goal/clear 归零），
+按轮次取 wait 秒数，真实时长 = 秒数 × commandWaitMs/15（部署默认 15s 比例 →
+10s/30s 实际等待；测试设小 commandWaitMs 等比加速）。等待结束排水 steer（stop
+规则在等待边界生效，中途停止按该轮终态 blocked/complete 收尾）。两个 goal 回归
+测试补 wait 条目断言（每轮恰 1 个、10/30 秒标签、与 test queue 用户 turn 的
+wait 按 turnId 区分），全量 182/182。
