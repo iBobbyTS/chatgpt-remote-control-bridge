@@ -675,6 +675,42 @@ test("S03 BLOCKER2 resetToSeed：落盘失败向上抛（不经 persistState 吞
   app.close();
 });
 
+test("S03 B槽 reset×并发 persistState：播种写为串行序最后写，旧快照不得后落盘覆盖", async () => {
+  const key = { clientId: "c", streamId: "s" };
+  const slow = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+  // 多轮：原缺陷为 4/30 偶发；此处用可控门闩 + 注入慢写把交错确定性放大（每轮必现于无修复）
+  for (let i = 0; i < 5; i++) {
+    const dir = await tempDir("reset-race");
+    const statePath = simStatePath(dir);
+    const app = new SimApp({ codexHome: dir, statePath });
+    await app.handleRequest(key, 0, "initialize", { clientInfo: { name: "t" } });
+    // 制造非播种线程：使 reset 前快照与播种态不同
+    await app.handleRequest(key, 1, "thread/start", { cwd: "/tmp-race-a" });
+    await app.handleRequest(key, 2, "thread/start", { cwd: "/tmp-race-b" });
+
+    const internal = app as unknown as { saveQueue: Promise<void> };
+    // 可控门闩：reset 的前置排空会卡在这里，保证并发追加落在 reset 恢复之前（确定性交错）
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    internal.saveQueue = internal.saveQueue.then(() => gate);
+
+    const resetP = app.resetToSeed();
+    // 追加慢任务 + 一个"旧快照"运行期写（persistState 在内存播种前调用，捕获 pre-reset 内存）
+    internal.saveQueue = internal.saveQueue.then(() => slow(40));
+    await app.handleRequest(key, 3, "thread/start", { cwd: "/tmp-race-old" });
+    release();
+    await resetP;
+
+    // 静置超过注入慢写窗口：无修复时旧快照写会在此后落地，把磁盘从播种态改回 reset 前
+    await slow(150);
+    const disk = JSON.parse(await readFile(statePath, "utf8")) as LooseStoreEntry[];
+    assert.deepEqual(normStore(disk), SEED_SEMANTICS, `第 ${i + 1} 次：reset 后磁盘必须为播种态`);
+    app.close();
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

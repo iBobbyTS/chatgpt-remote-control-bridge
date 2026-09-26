@@ -206,16 +206,38 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /**
-   * reset 路径的显式播种落盘（S03 BLOCKER2）：原子 tmp + rename，唯一临时名避免与
-   * persistState 的固定 `.tmp` 冲突。与 persistState 不同，**错误向上抛**——reset 调用方
-   * （daemon IPC agent-reset）必须据此报失败，否则"报成功而磁盘非播种态"。
+   * reset 路径的播种写（S03 B 槽新缺陷修复）：把播种写作为任务**入列 saveQueue 尾部**，
+   * 与运行期 persistState 保持**同一串行顺序**，从而 reset 写必为串行序中的"最后一个写"——
+   * 即便 reset 排空等待期间并发 persistState 追加了旧快照写，它也排在播种写之前，不会后落盘覆盖。
+   * 快照在**入列时**捕获（此时内存已播种），避免任务执行前内存被并发请求改动。
+   *
+   * 错误传递：返回 one-shot promise，写失败时 reject 给 resetToSeed；但 saveQueue 链本身
+   * 仍吞错（不 reject），运行期吞错语义不变。
    */
-  private async persistSeedNow(): Promise<void> {
+  private enqueueSeedWrite(): Promise<void> {
     const statePath = this.opts.statePath;
-    if (!statePath) return;
+    if (!statePath) return Promise.resolve();
+    const snapshot = this.snapshotEntries();
     const tmp = `${statePath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString("hex")}`;
-    await writeFile(tmp, JSON.stringify(this.snapshotEntries()), "utf8");
-    await rename(tmp, statePath);
+    let resolveDone!: () => void;
+    let rejectDone!: (err: unknown) => void;
+    const done = new Promise<void>((resolve, reject) => {
+      resolveDone = resolve;
+      rejectDone = reject;
+    });
+    const task = this.saveQueue.then(async () => {
+      await writeFile(tmp, JSON.stringify(snapshot), "utf8");
+      await rename(tmp, statePath);
+    });
+    // 链尾吞错（与 persistState 一致）：失败只 reject one-shot done，不让 saveQueue 断裂
+    this.saveQueue = task.then(
+      () => resolveDone(),
+      (err) => {
+        this.opts.log?.(`reset 播种落盘失败: ${err instanceof Error ? err.message : err}`);
+        rejectDone(err);
+      },
+    );
+    return done;
   }
 
   // ------------------------------------------------------------------ 客户端
@@ -250,8 +272,10 @@ export class SimApp extends EventEmitter implements AgentApp {
    * S03：把运行态重置为播种态——清空线程/turn/items/queue/ephemeral 与**全部**在途定时器
    * （含队列续跑计时器），重新播种 fixedThreads 并落盘。
    *
-   * 与 saveQueue 的交错：先排空在途写，避免 reset 前排队中的旧快照在播种后落盘覆盖。
-   * 落盘走 persistSeedNow（可失败变体）——失败向上抛，daemon IPC 据此报 {ok:false,INTERNAL}。
+   * 与 saveQueue 的交错（B 槽缺陷修复）：先排空在途写；随后**同步**内存播种 + 把播种写
+   * 入列 saveQueue 尾部（同一串行顺序），保证 reset 写是"最后一个写"——排空等待期间并发
+   * persistState 追加的旧快照写都排在播种写之前，不会后落盘覆盖。入列后再排空一次才返回。
+   * 播种写失败经 one-shot promise 上抛，daemon IPC 据此报 {ok:false,INTERNAL}。
    *
    * 保留语义（NIT，明确声明）：
    * - `clients`：不动。在线手机连接须跨 reset 保持，否则 reset 会踢掉已配对会话。
@@ -260,10 +284,12 @@ export class SimApp extends EventEmitter implements AgentApp {
    * 二者均为运行态连接/环境模拟，不属于 store 播种语义。
    */
   async resetToSeed(): Promise<void> {
-    await this.saveQueue.catch(() => undefined);
+    await this.saveQueue.catch(() => undefined); // 先排空在途旧写
     this.clearAllTimers();
-    this.seedPresetThreads();
-    await this.persistSeedNow();
+    this.seedPresetThreads(); // 同步内存播种：此后并发 persistState 均看到播种态
+    const seedDone = this.enqueueSeedWrite(); // 播种写入列队列尾部（最后写）
+    await seedDone; // 播种写失败 → 上抛
+    await this.saveQueue.catch(() => undefined); // 再排空，确保落盘完成才返回
   }
 
   // ------------------------------------------------------------------ 分发
