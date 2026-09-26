@@ -68,7 +68,7 @@ interface Loop {
   authHome: string;
 }
 
-async function startLoop(): Promise<Loop> {
+async function startLoop(simExtra: { commandWaitMs?: number } = {}): Promise<Loop> {
   const authHome = await tempDir("home");
   await writeAuthStore(authHome, fakeAuth());
   const authManager = new BridgeAuthManager({ codexHome: authHome });
@@ -85,6 +85,7 @@ async function startLoop(): Promise<Loop> {
     stepDelayMs: 10,
     deltaIntervalMs: 2,
     deltaChars: 16,
+    ...simExtra,
   });
   const tunnel = new WhamTunnel({
     authManager,
@@ -408,6 +409,191 @@ test("回环：interrupt → interrupted；steer 注入；queue 自动消费", a
           "排队消息 A",
     );
     assert.ok(queuedUserMsg, "排队消息应作为第二个 turn 的 userMessage 出现");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：特殊指令 help / test steer / test queue（3 消息 + 2 次模拟 wait 命令）", async () => {
+  const loop = await startLoop({ commandWaitMs: 300 });
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "t" },
+      capabilities: { optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const completedItems = () =>
+      loop.mock.receivedNotifications
+        .filter((n) => n.method === "item/completed")
+        .map((n) => (n.params as { item: { type: string } & Record<string, unknown> }).item);
+
+    // help：trim + 大小写不敏感完全匹配，回复帮助文本
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "  HELP " }] });
+    await waitFor(
+      () => completedItems().some((i) => i.type === "agentMessage"),
+      5000,
+      "help 回复未到达",
+    );
+    const helpText = (completedItems().find((i) => i.type === "agentMessage") as unknown as { text: string }).text;
+    assert.ok(helpText.startsWith("特殊指令："), "help 回复应以「特殊指令：」开头");
+    assert.ok(helpText.includes("test steer"));
+    assert.ok(helpText.includes("test queue"));
+
+    // test steer：3 条消息 + 2 次模拟 wait；等待期间 steer 注入并即时回复
+    loop.mock.receivedNotifications.length = 0;
+    const steerTurn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "Test Steer" }],
+    })) as { result: { turn: { id: string } } };
+    // 响应先于通知返回：此刻 turn 尚在第一条消息/第一次等待内，
+    // steer 必然在第一次等待结束时被处理（顺序确定，可做严格断言）
+    await loop.mock.rpc("turn/steer", {
+      threadId,
+      expectedTurnId: steerTurn.result.turn.id,
+      input: [{ type: "text", text: "插入一下" }],
+      clientUserMessageId: "steer-1",
+    });
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "turn/completed" &&
+            (n.params as { turn: { status: string } }).turn.status === "completed",
+        ),
+      15_000,
+      "test steer turn 未完成",
+    );
+    const steerItems = completedItems();
+    // 顺序：用户消息 → 消息1 → wait1 → steer 注入 → steer 回复 → 消息2 → wait2 → 消息3
+    assert.deepEqual(
+      steerItems.map((i) => i.type),
+      [
+        "userMessage",
+        "agentMessage",
+        "commandExecution",
+        "userMessage",
+        "agentMessage",
+        "agentMessage",
+        "commandExecution",
+        "agentMessage",
+      ],
+    );
+    const agents = steerItems.filter((i) => i.type === "agentMessage") as unknown as Array<{ text: string }>;
+    assert.ok(agents[0]!.text.includes("test steer 1/3"));
+    assert.ok(agents[1]!.text.includes("插入指令"), "steer 回复应含「插入指令」");
+    assert.ok(agents[2]!.text.includes("test steer 2/3"));
+    assert.ok(agents[3]!.text.includes("test steer 3/3"));
+    assert.equal(
+      (steerItems[3] as { content?: Array<{ text: string }> }).content?.[0]?.text,
+      "插入一下",
+      "steer 消息应作为 userMessage 插入第一次等待之后、消息2 之前",
+    );
+    const cmds = steerItems.filter((i) => i.type === "commandExecution") as unknown as Array<{
+      command: string;
+      status: string;
+      exitCode: number | null;
+      aggregatedOutput: string | null;
+      durationMs: number | null;
+    }>;
+    assert.equal(cmds.length, 2);
+    for (const c of cmds) {
+      assert.equal(c.command, "wait 15 seconds");
+      assert.equal(c.status, "completed");
+      assert.equal(c.exitCode, 0);
+      assert.ok(c.aggregatedOutput && c.aggregatedOutput.length > 0);
+      assert.ok((c.durationMs ?? 0) >= 250, "真实等待时长应接近注入的 commandWaitMs=300");
+    }
+    // outputDelta 与真实命令条目流一致
+    assert.ok(
+      loop.mock.receivedNotifications.some(
+        (n) => n.method === "item/commandExecution/outputDelta",
+      ),
+      "模拟命令应发 item/commandExecution/outputDelta",
+    );
+
+    // test queue：等待期间排队，turn 完成后自动开跑
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "TEST QUEUE" }] });
+    await loop.mock.rpc("thread/queue/add", {
+      threadId,
+      input: [{ type: "text", text: "排队消息 B" }],
+      clientUserMessageId: "q-2",
+    });
+    const qList = (await loop.mock.rpc("thread/queue/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(qList.result.data.length, 1);
+    await waitFor(
+      () => loop.mock.receivedNotifications.filter((n) => n.method === "turn/completed").length >= 2,
+      15_000,
+      "排队消息未被自动消费",
+    );
+    const queueItems = completedItems();
+    assert.equal(
+      queueItems.filter((i) => i.type === "commandExecution").length,
+      2,
+      "test queue turn 应含 2 条模拟 wait 命令",
+    );
+    assert.equal(
+      (queueItems.filter((i) => i.type === "agentMessage") as unknown as Array<{ text: string }>).filter((a) =>
+        a.text.includes("test queue"),
+      ).length,
+      3,
+    );
+    assert.ok(
+      queueItems.some(
+        (i) =>
+          i.type === "userMessage" &&
+          (i as { content?: Array<{ text: string }> }).content?.[0]?.text === "排队消息 B",
+      ),
+      "排队消息应作为第二个 turn 的 userMessage 出现",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：turn 结束后的 steer → -32600 no active turn to steer（对齐 codex turn_steer_inner）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "t" },
+      capabilities: { optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "第一轮" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      5000,
+      "第一轮 turn 未完成",
+    );
+    loop.mock.receivedNotifications.length = 0;
+    // turn 已结束：真实 codex 返回 invalid_request（-32600）而非开新 turn
+    const steer = (await loop.mock.rpc("turn/steer", {
+      threadId,
+      expectedTurnId: "01a0dc13-0000-0000-0000-000000000000",
+      input: [{ type: "text", text: "迟到的 steer" }],
+    })) as { error?: { code: number; message: string } };
+    assert.equal(steer.error?.code, -32600);
+    assert.equal(steer.error?.message, "no active turn to steer");
+    // 不冷启动新 turn：无 turn/started、turns 数不变
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.ok(
+      !loop.mock.receivedNotifications.some((n) => n.method === "turn/started"),
+      "迟到的 steer 不得触发 turn/started",
+    );
+    const turns = (await loop.mock.rpc("thread/turns/list", { threadId })) as {
+      result: { data: unknown[] };
+    };
+    assert.equal(turns.result.data.length, 1, "迟到的 steer 不得创建第二个 turn");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();

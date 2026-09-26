@@ -216,6 +216,35 @@ multiAgentMode），模拟层只回 `{thread}`。手机 Swift 把这些会话上
 `thread/start` 返回全套上下文；回归测试断言响应键集与真实抓包一致（14 键
 deepEqual + sandbox/approvalPolicy 抽查），stash 证伪通过。
 
+## 特殊指令：help / test steer / test queue（2026-09-25 深夜五）
+
+供真机验证 steer / queue 链路的辅助指令（trim + 大小写不敏感完全匹配，
+`specialCommandOf()`）：
+
+- `help` → 帮助文本（buildReply 分支，单条 agentMessage）。
+- `test steer` / `test queue` → 脚本化 turn（`runScriptedTurn`）：3 条
+  agentMessage，相邻两条之间各执行一次模拟命令 **wait 15 seconds**——
+  真实等待 `commandWaitMs`（默认 15000ms），纯 setTimeout 不经 shell，但按
+  真实 `commandExecution` 条目形状（抓包 2026-09-25T19:21:34Z）下发
+  item/started → outputDelta → item/completed（exitCode 0、durationMs 实测
+  值），手机端按普通命令调用渲染。
+- 每次等待结束后**先处理等待期间到达的 steer 再发下一条消息**：对齐真实
+  codex（steered userMessage 在当前命令完成后出现在同一 turn 内，抓包
+  19:21:32 steer → 19:21:35 userMessage 插入）。queue 消息走既有
+  `thread/queue/add` → `consumeQueue` 自动接跑，无需新逻辑。
+- 回归测试断言完整条目顺序（userMessage → msg1 → wait → steer 注入+回复
+  → msg2 → wait → msg3）、2 条命令条目的 exitCode/durationMs，以及
+  queue 排队消息在 turn/completed 后自动开跑；stash 证伪通过。
+
+### turn 结束后的 steer：对齐 codex 报错语义（2026-09-25 深夜六）
+
+核对 vendored 源码 `app-server/src/request_processors/turn_processor.rs`
+`turn_steer_inner`：无活动 turn 的 steer（NoActiveTurn/NotIdle 等）返回
+`invalid_request(-32600) "no active turn to steer"`，**并不开新 turn**。
+模拟层原先对迟到 steer 冷启动新 turn，已对齐为同码同文案报错（其余分支
+如 expectedTurnId 校验不在范围）。回归测试断言错误封包 + 无 turn/started +
+turns 数不变，stash 证伪通过。
+
 ## 对齐 codex 线程生命周期（源码实证）
 
 codex 中不存在"零 turn 却长期列出的线程"（`thread/list` 只读磁盘 rollout；

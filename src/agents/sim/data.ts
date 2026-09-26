@@ -32,7 +32,28 @@ export interface AgentMessageItem {
   questions: null;
 }
 
-export type SimItem = UserMessageItem | AgentMessageItem;
+export interface CommandExecutionAction {
+  type: "unknown";
+  command: string;
+}
+
+export interface CommandExecutionItem {
+  type: "commandExecution";
+  id: string;
+  pluginId: null;
+  scriptPath: null;
+  command: string;
+  cwd: string;
+  processId: string;
+  source: string;
+  status: "inProgress" | "completed" | "failed" | "interrupted";
+  commandActions: CommandExecutionAction[];
+  aggregatedOutput: string | null;
+  exitCode: number | null;
+  durationMs: number | null;
+}
+
+export type SimItem = UserMessageItem | AgentMessageItem | CommandExecutionItem;
 
 export interface TurnRecord {
   id: string;
@@ -247,6 +268,33 @@ export function makeAgentMessage(text = ""): AgentMessageItem {
     memoryCitation: null,
     delivery: null,
     questions: null,
+  };
+}
+
+/** 模拟进程号：真实 codex 为 shell 进程 pid 字符串，手机端只作展示。 */
+let simProcessSeq = 60_000;
+
+/**
+ * commandExecution 条目形状蓝本：抓包 2026-09-25T19:21:34Z（item/started 时
+ * status:"inProgress"、exitCode/durationMs/aggregatedOutput 为 null）。特殊指令
+ * "test steer"/"test queue" 的模拟命令 "wait 15 seconds" 以该形状下发，手机端按
+ * 普通命令调用渲染。
+ */
+export function makeCommandExecution(command: string, cwd: string): CommandExecutionItem {
+  return {
+    type: "commandExecution",
+    id: `exec-${uuidv7()}`,
+    pluginId: null,
+    scriptPath: null,
+    command,
+    cwd,
+    processId: String(simProcessSeq++),
+    source: "unifiedExecStartup",
+    status: "inProgress",
+    commandActions: [{ type: "unknown", command }],
+    aggregatedOutput: null,
+    exitCode: null,
+    durationMs: null,
   };
 }
 

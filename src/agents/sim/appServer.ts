@@ -20,8 +20,10 @@ import {
   PLUGINS,
   SECTIONS,
   SKILLS,
+  type CommandExecutionItem,
   fixedThreads,
   makeAgentMessage,
+  makeCommandExecution,
   makeThread,
   makeTurn,
   makeUserMessage,
@@ -73,6 +75,8 @@ export interface SimAppOptions {
   deltaIntervalMs?: number;
   /** 每个 delta 的字符数。默认 8。 */
   deltaChars?: number;
+  /** 特殊指令模拟命令 "wait 15 seconds" 的真实等待时长。默认 15000ms（测试可调小）。 */
+  commandWaitMs?: number;
   /** 服务器信息（remoteControl/status/changed 通知用），由 server 注入。 */
   getServerInfo?: () => { serverName: string; installationId: string; environmentId: string } | null;
   accountInfo?: { authMode: string; planType: string | null };
@@ -109,13 +113,32 @@ type AnyParams = Record<string, any>;
 const ERR_NOT_INITIALIZED = { code: -32600, message: "Not initialized" };
 const ERR_METHOD_NOT_FOUND = { code: -32601, message: "Method not found" };
 
+/** 特殊指令帮助文本（手机端发送对应指令即得本条回复）。 */
+const HELP_TEXT = [
+  "特殊指令：",
+  "help: 输出本条帮助信息",
+  'test steer：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试steer强制插入消息的效果。',
+  'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
+].join("\n");
+
+/** 特殊指令识别：trim + 大小写不敏感的完全匹配。 */
+function specialCommandOf(userText: string): "help" | "test-steer" | "test-queue" | null {
+  const t = userText.trim().toLowerCase();
+  if (t === "help") return "help";
+  if (t === "test steer") return "test-steer";
+  if (t === "test queue") return "test-queue";
+  return null;
+}
+
 export class SimApp extends EventEmitter implements AgentApp {
   private readonly clients = new Map<string, SimClientState>();
   private readonly threads = new Map<string, ThreadState>();
   /** 虚拟目录覆盖层：绝对路径 → 存在的目录（模拟 mkdir，不落盘）。 */
   private readonly overlayDirs = new Set<string>();
   private readonly overlayChildren = new Map<string, Set<string>>();
-  private readonly opts: Required<Pick<SimAppOptions, "codexHome" | "stepDelayMs" | "deltaIntervalMs" | "deltaChars">> &
+  private readonly opts: Required<
+    Pick<SimAppOptions, "codexHome" | "stepDelayMs" | "deltaIntervalMs" | "deltaChars" | "commandWaitMs">
+  > &
     SimAppOptions;
   private closed = false;
   private saveQueue: Promise<void> = Promise.resolve();
@@ -131,6 +154,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       stepDelayMs: 250,
       deltaIntervalMs: 90,
       deltaChars: 8,
+      commandWaitMs: 15_000,
       ...opts,
     };
     if (this.opts.statePath) {
@@ -599,8 +623,11 @@ export class SimApp extends EventEmitter implements AgentApp {
       state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
       return { turnId: p.expectedTurnId ?? state.sim.turn.id };
     }
-    const sim = this.beginSimTurn(state, input, clientUserMessageId);
-    return { turnId: sim.turn.id };
+    // 对齐真实 codex（app-server/src/request_processors/turn_processor.rs
+    // turn_steer_inner：NoActiveTurn/NotIdle → invalid_request "no active
+    // turn to steer"，code -32600）。turn 已结束后的 steer 不冷启动新 turn，
+    // 由手机端自行决定后续（改走 turn/start）。
+    throw new SimMethodError(-32600, "no active turn to steer");
   }
 
   private turnInterrupt(p: AnyParams): unknown {
@@ -644,7 +671,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.items.push({ turnId: turn.id, item: userItem, startedAtMs, completedAtMs: startedAtMs });
     turn.items.push(userItem);
 
-    // turn/start（含 turn/steer 冷启动）的响应必须先于本 turn 的通知到达手机：
+    // turn/start 的响应必须先于本 turn 的通知到达手机：
     // 真实 codex 的 userMessage item 事件比响应晚 ~600ms，手机依赖该次序把本地
     // 回显与服务器 item 对账；通知先于响应上线会让对账失败 → 用户消息双渲染
     // （2026-09-25 真机复现，docs/research/07）。通知推迟一个宏任务发射——
@@ -672,15 +699,22 @@ export class SimApp extends EventEmitter implements AgentApp {
         completedAtMs: startedAtMs,
       }, state.thread.id));
 
-      // agentMessage：流式模拟回复
+      // agentMessage：流式模拟回复；特殊指令 test steer / test queue 走
+      // 「3 条消息 + 2 次模拟等待」脚本，help 在 buildReply 内返回帮助文本
       this.schedule(sim, () => {
-        const reply = this.buildReply(userText, state.thread);
-        this.streamAgentMessage(state, sim, reply, () => {
+        const finishTurn = () => {
           this.processSteers(state, sim, () => {
             this.finishSimTurn(state, "completed");
             this.consumeQueue(state);
           });
-        });
+        };
+        const special = specialCommandOf(userText);
+        if (special === "test-steer" || special === "test-queue") {
+          this.runScriptedTurn(state, sim, special, finishTurn);
+          return;
+        }
+        const reply = this.buildReply(userText, state.thread);
+        this.streamAgentMessage(state, sim, reply, finishTurn);
       }, this.opts.stepDelayMs);
     }, 0);
     return sim;
@@ -712,6 +746,93 @@ export class SimApp extends EventEmitter implements AgentApp {
       const reply = `（steer 注入）已收到插入指令：「${next.text}」。模拟层已按 steer 语义在当前 turn 内追加处理。`;
       this.streamAgentMessage(state, sim, reply, () => this.processSteers(state, sim, done));
     }, this.opts.stepDelayMs);
+  }
+
+  /**
+   * test steer / test queue 特殊指令脚本：3 条 agentMessage，相邻两条之间各执行
+   * 一次模拟命令 "wait 15 seconds"（真实等待 commandWaitMs，不经 shell）。每次
+   * 等待结束后先处理等待期间到达的 steer（对齐真实 codex：steered userMessage
+   * 在当前命令完成后出现在同一 turn 内），再发下一条脚本消息——保证测试窗口
+   * 内发送的消息能观察到即时效果。
+   */
+  private runScriptedTurn(
+    state: ThreadState,
+    sim: SimTurnRuntime,
+    kind: "test-steer" | "test-queue",
+    done: () => void,
+  ): void {
+    const label = kind === "test-steer" ? "test steer" : "test queue";
+    const hint =
+      kind === "test-steer"
+        ? "现在发送的消息会以 turn/steer 强制插入当前 turn，并在本次等待结束后立刻得到回复。"
+        : "现在发送的消息会经 thread/queue/add 排队，不打断当前 turn，turn 结束后自动开跑。";
+    const messages = [
+      `【${label} 1/3】turn 进行中，即将执行模拟命令 wait 15 seconds。${hint}`,
+      `【${label} 2/3】第一次等待结束。${
+        kind === "test-steer"
+          ? "若刚才发送了消息，它应已作为 userMessage 插入上方并收到回复；可趁下一次等待再试。"
+          : "排队中的消息将在 turn/completed 后自动启动为新 turn。"
+      }`,
+      `【${label} 3/3】脚本执行完毕，turn 即将结束，${kind === "test-steer" ? "steer 测试窗口关闭" : "若有排队消息它马上开跑"}。`,
+    ];
+    const step = (index: number): void => {
+      if (sim.ended) return;
+      this.streamAgentMessage(state, sim, messages[index]!, () => {
+        if (index === messages.length - 1) {
+          done();
+          return;
+        }
+        this.simulateCommandWait(state, sim, () => {
+          this.processSteers(state, sim, () => step(index + 1));
+        });
+      });
+    };
+    step(0);
+  }
+
+  /**
+   * 模拟命令条目 "wait 15 seconds"：按真实 commandExecution 形状发 item 事件流
+   * （started → outputDelta → completed，exitCode 0），等待 commandWaitMs，
+   * 纯 setTimeout 不依赖 shell。条目同时入 turn.items 与 thread items 索引，
+   * 手机端历史回看（items/list）同样可见。
+   */
+  private simulateCommandWait(state: ThreadState, sim: SimTurnRuntime, done: () => void): void {
+    const command = "wait 15 seconds";
+    const item = makeCommandExecution(command, state.thread.cwd);
+    const startedAtMs = Date.now();
+    this.emit("event", this.notification("item/started", {
+      item,
+      threadId: state.thread.id,
+      turnId: sim.turn.id,
+      startedAtMs,
+    }, state.thread.id));
+    this.schedule(sim, () => {
+      if (sim.ended) return;
+      const output = `（模拟命令 ${command} 完成，未调用 shell）`;
+      const at = Date.now();
+      this.emit("event", this.notification("item/commandExecution/outputDelta", {
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        itemId: item.id,
+        delta: output,
+      }, state.thread.id));
+      const completed: CommandExecutionItem = {
+        ...item,
+        status: "completed",
+        aggregatedOutput: output,
+        exitCode: 0,
+        durationMs: Math.max(1, at - startedAtMs),
+      };
+      this.emit("event", this.notification("item/completed", {
+        item: completed,
+        threadId: state.thread.id,
+        turnId: sim.turn.id,
+        completedAtMs: at,
+      }, state.thread.id));
+      state.items.push({ turnId: sim.turn.id, item: completed, startedAtMs, completedAtMs: at });
+      sim.turn.items.push(completed);
+      done();
+    }, this.opts.commandWaitMs);
   }
 
   private streamAgentMessage(state: ThreadState, sim: SimTurnRuntime, fullText: string, done: () => void): void {
@@ -819,6 +940,9 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   private buildReply(userText: string, thread: ThreadRecord): string {
+    if (specialCommandOf(userText) === "help") {
+      return HELP_TEXT;
+    }
     if (thread.ephemeral) {
       // 手机起名线程：输入是"…User prompt:\n<用户首条消息>"，回复须是 ≤36 字符单行标题
       const m = userText.match(/User prompt:\s*([\s\S]+)$/);
