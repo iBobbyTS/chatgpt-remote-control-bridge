@@ -1138,6 +1138,217 @@ test("S03 B槽 reset 播种写：入列即冻结序列化，并发 turn/start �
   }
 });
 
+test("回环：thread/queue/delete 真删除（deleted 标志 + queue/changed 通知）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/qdel" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    const queued = (await loop.mock.rpc("thread/queue/add", {
+      threadId,
+      input: [{ type: "text", text: "Hi" }],
+      clientUserMessageId: "q-del-1",
+    })) as { result: { queuedSubmission: { id: string } } };
+    const queuedId = queued.result.queuedSubmission.id;
+    assert.ok(queuedId);
+    let qList = (await loop.mock.rpc("thread/queue/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(qList.result.data.length, 1);
+
+    // 删除存在的条目 → {deleted:true}，队列为空，且发 thread/queue/changed
+    const deleted = (await loop.mock.rpc("thread/queue/delete", {
+      threadId,
+      queuedSubmissionId: queuedId,
+    })) as { result: { deleted: boolean } };
+    assert.deepEqual(deleted.result, { deleted: true });
+    qList = (await loop.mock.rpc("thread/queue/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(qList.result.data.length, 0, "删除后队列应为空");
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "thread/queue/changed" &&
+            (n.params as { threadId: string }).threadId === threadId,
+        ),
+      2000,
+      "queue/delete 未发 thread/queue/changed",
+    );
+
+    // 删除不存在的条目 → {deleted:false}
+    const missing = (await loop.mock.rpc("thread/queue/delete", {
+      threadId,
+      queuedSubmissionId: "01a0dc13-0000-0000-0000-000000000000",
+    })) as { result: { deleted: boolean } };
+    assert.deepEqual(missing.result, { deleted: false });
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：活动期 turn/start 转 steer（对齐 start_or_steer_turn，不新建 turn）", async () => {
+  const loop = await startLoop({ commandWaitMs: 300 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/steer-on-start" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    loop.mock.receivedNotifications.length = 0;
+
+    // test queue 脚本 turn：两次 commandExecution 等待窗口
+    const active = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "test queue" }],
+    })) as { result: { turn: { id: string } } };
+    const activeTurnId = active.result.turn.id;
+
+    // 等第一次模拟命令进入 inProgress（item/started 的 commandExecution）
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "item/started" &&
+            (n.params as { item: { type: string } }).item.type === "commandExecution",
+        ),
+      8000,
+      "第一次模拟命令未进入 inProgress",
+    );
+
+    // 活动期 turn/start：转 steer，返回同一 turn（items 空 / itemsView notLoaded）
+    const steered = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "中途消息" }],
+      clientUserMessageId: "steer-on-start-1",
+    })) as { result: { turn: { id: string; items: unknown[]; itemsView: string } } };
+    assert.equal(steered.result.turn.id, activeTurnId, "活动期 turn/start 必须返回同一 turn");
+    assert.deepEqual(steered.result.turn.items, []);
+    assert.equal(steered.result.turn.itemsView, "notLoaded");
+
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "turn/completed" &&
+            (n.params as { threadId: string }).threadId === threadId,
+        ),
+      15_000,
+      "turn 未完成",
+    );
+
+    // 只有 1 个 turn：不得出现第二个 turn/started（不新建、不排队）
+    assert.equal(
+      loop.mock.receivedNotifications.filter(
+        (n) =>
+          n.method === "turn/started" && (n.params as { threadId: string }).threadId === threadId,
+      ).length,
+      1,
+      "活动期 turn/start 不得触发第二个 turn/started",
+    );
+    const turns = (await loop.mock.rpc("thread/turns/list", { threadId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(turns.result.data.length, 1, "活动期 turn/start 不得创建第二个 turn");
+
+    // steer 注入的 userMessage 与其后的 steer 回复都在同一 turn 内
+    const completedItems = loop.mock.receivedNotifications
+      .filter(
+        (n) =>
+          n.method === "item/completed" && (n.params as { threadId: string }).threadId === threadId,
+      )
+      .map((n) => (n.params as { item: { type: string } & Record<string, unknown> }).item);
+    const steerUserIndex = completedItems.findIndex(
+      (i) => i.type === "userMessage" && (i.content as Array<{ text: string }>)?.[0]?.text === "中途消息",
+    );
+    assert.ok(steerUserIndex >= 0, "steer 注入的 userMessage 未出现");
+    const steerReply = completedItems
+      .slice(steerUserIndex + 1)
+      .find((i) => i.type === "agentMessage" && String(i.text).includes("steer 注入"));
+    assert.ok(steerReply, "steer 注入后应出现含「steer 注入」的回复");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：thread/resume 重订阅（清除 unsubscribe 标记，通知恢复）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/resub" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    // 退订该线程：此后该 thread 的通知被 fanOut 丢弃
+    const unsub = (await loop.mock.rpc("thread/unsubscribe", { threadId })) as {
+      result: { status: string };
+    };
+    assert.equal(unsub.result.status, "unsubscribed");
+    loop.mock.receivedNotifications.length = 0;
+
+    const ping = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "ping" }],
+      clientUserMessageId: "resub-ping",
+    })) as { result: { turn: { id: string } } };
+    // 退订期间无通知可等，轮询 turns/list 判定完成
+    let pingCompleted = false;
+    for (let i = 0; i < 100 && !pingCompleted; i++) {
+      const turns = (await loop.mock.rpc("thread/turns/list", { threadId })) as {
+        result: { data: Array<{ id: string; status: string }> };
+      };
+      pingCompleted = turns.result.data.some(
+        (t) => t.id === ping.result.turn.id && t.status === "completed",
+      );
+      if (!pingCompleted) await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.ok(pingCompleted, "ping turn 未完成");
+    assert.ok(
+      !loop.mock.receivedNotifications.some(
+        (n) =>
+          n.method === "item/started" &&
+          (n.params as { threadId: string; turnId: string }).turnId === ping.result.turn.id,
+      ),
+      "退订期间不得收到该 turn 的 item/started",
+    );
+    assert.ok(
+      !loop.mock.receivedNotifications.some(
+        (n) => (n.params as { threadId?: string }).threadId === threadId,
+      ),
+      "退订期间不得收到该 thread 的任何通知",
+    );
+
+    // resume 重新订阅：通知恢复
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("thread/resume", { threadId });
+    const pong = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "pong" }],
+    })) as { result: { turn: { id: string } } };
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "item/started" &&
+            (n.params as { turnId: string }).turnId === pong.result.turn.id,
+        ),
+      8000,
+      "resume 后 item/started 未恢复",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 function waitFor(predicate: () => boolean, timeoutMs: number, message: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const start = Date.now();

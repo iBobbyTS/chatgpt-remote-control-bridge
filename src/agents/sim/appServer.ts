@@ -356,6 +356,10 @@ export class SimApp extends EventEmitter implements AgentApp {
       case "thread/start":
         return this.threadStart(p);
       case "thread/resume":
+        // resume 即重新订阅：对齐 codex thread_processor.rs:1018-1043 的 resume
+        // 语义（最终走 thread_state.rs:559-581 try_ensure_connection_subscribed），
+        // 否则先 unsubscribe 再 resume 的连接会永久收不到该线程通知
+        client.unsubscribed.delete(p.threadId ?? p.thread_id);
         return this.threadResume(p);
       case "thread/unsubscribe":
         client.unsubscribed.add(p.threadId ?? p.thread_id);
@@ -386,7 +390,7 @@ export class SimApp extends EventEmitter implements AgentApp {
           nextCursor: null,
         };
       case "thread/queue/delete":
-        return { deleted: true };
+        return this.queueDelete(p);
       case "thread/compact/start":
         return {};
       case "thread/settings/update":
@@ -606,9 +610,11 @@ export class SimApp extends EventEmitter implements AgentApp {
     const input = normalizeInput(p.input);
     const clientUserMessageId = p.clientUserMessageId ?? null;
     if (state.sim && !state.sim.ended) {
-      // 已有进行中的 turn：排队（真实 codex 会报错，手机端正常不会走到这里）
-      state.queue.push({ id: uuidv7(), input, clientUserMessageId });
-      this.emitSoon("thread/queue/changed", { threadId: state.thread.id }, state.thread.id);
+      // 活动期 turn/start 转 steer：对齐 codex start_or_steer_turn
+      // （turn_processor.rs:651-684，TurnInputSubmission::Steered）——输入注入当前
+      // turn，返回同一 turn。不新建 turn、不排队，避免旧 sim 定时器孤儿化。
+      state.sim.steerInputs.push({ text: input.map((c) => c.text).join(""), clientUserMessageId });
+      return { turn: { ...this.serializeTurn(state.sim.turn), items: [], itemsView: "notLoaded" as const } };
     }
     const sim = this.beginSimTurn(state, input, clientUserMessageId);
     // 真实 turn/start 响应：items 空、itemsView notLoaded
@@ -650,6 +656,23 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.persistState();
     this.emitSoon("thread/queue/changed", { threadId: state.thread.id }, state.thread.id);
     return { queuedSubmission: { id: queued.id, input, clientUserMessageId: queued.clientUserMessageId } };
+  }
+
+  /**
+   * thread/queue/delete：按 queuedSubmissionId 删除队列条目（对齐 codex
+   * thread_queue_processor.rs:161-172 + 协议 v2/thread.rs ThreadQueueDeleteParams，
+   * camelCase 参数名 threadId + queuedSubmissionId）。找不到返回 {deleted:false}。
+   */
+  private queueDelete(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    const index = state.queue.findIndex((q) => q.id === p.queuedSubmissionId);
+    if (index < 0) {
+      return { deleted: false };
+    }
+    state.queue.splice(index, 1);
+    this.persistState();
+    this.emitSoon("thread/queue/changed", { threadId: state.thread.id }, state.thread.id);
+    return { deleted: true };
   }
 
   private beginSimTurn(
