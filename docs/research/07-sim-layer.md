@@ -682,3 +682,37 @@ initialize 也能收到快照）；全量 190/190。
 processor.rs:4166-4190）。App 重建期（~0.7-1.3s 再水化）的短闪与重启边界首周期
 的空窗为 App 侧行为，与真实 codex 一致，服务器侧不再额外缓解。replayTokenUsage
 助手保留（同一逻辑的抽取，行为不变）。全量 189/189。
+
+### 追记：side chat 启动失败——补 thread/inject_items 与 thread/name/set（2026-09-27）
+
+真机复现（02:29-02:30 帧证据）：App 发起 side conversation 的流程为
+`thread/fork{excludeTurns:true}`（成功）→ **`thread/inject_items`**（注入
+"Side conversation boundary…" 边界指令，role:user message + input_text
+content）→ 后续 `thread/name/set`。两条 RPC sim 均未实现 → -32601 → App 直接
+报「Codex 服务器返回了错误」，side chat 无法启动。
+
+按 codex 对齐实现：
+
+1. **thread/inject_items**（v2/thread.rs:1691-1700；turn_processor.rs:974-1003
+   + codex_thread.rs:738-784）：原始 Responses API items 追加进线程模型可见
+   历史——不起 turn、无任何通知、响应 `{}`。空 items / 非对象 / 缺字符串
+   type / message 形状不全 → -32600（对齐 ResponseItem 反序列化失败文案
+   `items[N] is not a valid response item: …`）。message/role=user →
+   userMessage、role=assistant → agentMessage，其余变体原样保存（新增
+   InjectedResponseItem passthrough 变体）。注入的 user/assistant 字符**即时**
+   计入上下文占用（真实 codex 下一轮 TokenCount 带上这段历史）；turnId 归属
+   最近一个 turn（零 turn 线程为 null，items/list 全量查询仍可见；ItemEntry
+   .turnId 放宽为 string|null）。
+2. **thread/name/set**（v2/thread.rs:782-797；thread_processor.rs:1836-1864）：
+   名字 trim 归一化（core/util.rs:90-97），空名 -32600；响应 `{}` 后广播
+   `thread/name/updated{threadId, threadName}`（响应先行）。ThreadRecord.name
+   由字面量 null 放宽为 string|null。
+3. **fork 附带对齐**：`excludeTurns:true` 时响应 thread.turns 不填充
+   （v2/thread.rs:608-612，客户端随即分页拉取，历史本体仍全量继承）；fork
+   复制父线程 contextUserChars/contextAgentChars/contextBaseline 与最近
+   tokenUsage 快照（真实 codex 的 fork 重放源 rollout，TokenCount 随之带入）——
+   side chat 首轮占用 = 继承 + 注入 + 本轮。
+
+SimItem 联合加宽后字面量比较不再收窄，新增 isUserMessageItem/isAgentMessageItem
+谓词集中收窄（finishSimTurn 计数等 3 处改用）。新增回环测试覆盖 side chat 全流
+程与三组非法入参；sim 52/52，全量 190/190。

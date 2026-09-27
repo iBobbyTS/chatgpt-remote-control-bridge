@@ -62,11 +62,22 @@ export interface ContextCompactionItem {
   id: string;
 }
 
+/**
+ * thread/inject_items 注入的原始 Responses API 项（message/user、message/
+ * assistant 之外的变体）：codex 原样记入线程历史（turn_processor.rs:974-1003
+ * 只做 ResponseItem 反序列化校验，不做形状转换），sim 同样原样保存。
+ */
+export interface InjectedResponseItem {
+  type: string;
+  [key: string]: unknown;
+}
+
 export type SimItem =
   | UserMessageItem
   | AgentMessageItem
   | CommandExecutionItem
-  | ContextCompactionItem;
+  | ContextCompactionItem
+  | InjectedResponseItem;
 
 /**
  * 协作模式：wire 字段名 **snake_case**（config_types.rs:708-783；:780 的 Settings
@@ -158,16 +169,30 @@ export interface ThreadRecord {
   agentNickname: null;
   agentRole: null;
   gitInfo: ThreadGitInfo | null;
-  name: null;
+  /** 会话名（thread/name/set 写入；未命名为 null）。 */
+  name: string | null;
   daybreakEnabled: boolean | null;
   turns: TurnRecord[];
 }
 
 export interface ItemEntry {
-  turnId: string;
+  /** 归属 turn；thread/inject_items 在零 turn 线程上注入时为 null。 */
+  turnId: string | null;
   item: SimItem;
   startedAtMs: number;
   completedAtMs: number;
+}
+
+/**
+ * 类型守卫：SimItem 联合含 passthrough 变体（type: string），字面量比较不再
+ * 收窄，集中用谓词收窄。
+ */
+export function isUserMessageItem(item: SimItem): item is UserMessageItem {
+  return item.type === "userMessage";
+}
+
+export function isAgentMessageItem(item: SimItem): item is AgentMessageItem {
+  return item.type === "agentMessage";
 }
 
 export const CLI_VERSION = "0.157.0";

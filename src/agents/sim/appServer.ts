@@ -31,6 +31,9 @@ import {
   makeTurn,
   makeUserMessage,
   readConfig,
+  type InjectedResponseItem,
+  isAgentMessageItem,
+  isUserMessageItem,
   type ItemEntry,
   type SimGoal,
   type SimGoalStatus,
@@ -598,6 +601,10 @@ export class SimApp extends EventEmitter implements AgentApp {
         return this.metadataUpdate(p);
       case "thread/fork":
         return this.threadFork(p);
+      case "thread/name/set":
+        return this.threadNameSet(p);
+      case "thread/inject_items":
+        return this.threadInjectItems(p);
       case "server/diagnostics":
         return this.diagnostics();
       case "remoteControl/status/read":
@@ -1366,11 +1373,11 @@ export class SimApp extends EventEmitter implements AgentApp {
       state.contextBaseline = CONTEXT_BASELINE_AFTER_COMPACT;
     } else {
       for (const item of sim.turn.items) {
-        if (item.type === "userMessage") {
+        if (isUserMessageItem(item)) {
           const chars = item.content.reduce((sum, c) => sum + c.text.length, 0);
           state.contextUserChars += chars;
           turnUserChars += chars;
-        } else if (item.type === "agentMessage") {
+        } else if (isAgentMessageItem(item)) {
           state.contextAgentChars += item.text.length;
           turnAgentChars += item.text.length;
         }
@@ -2054,20 +2061,112 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     const turnIds = new Set(sourceTurns.map((t) => t.id));
     fork.turns = sourceTurns.map((t) => ({ ...t, items: [...t.items] }));
+    // turnId 为 null 的条目（零 turn 线程上注入的项）不属于任何被复制的 turn，
+    // 近似地从 fork 中省略（真实 codex 按 rollout 原样重放全史）。
     const items = source.items
-      .filter((e) => turnIds.has(e.turnId))
+      .filter((e) => e.turnId !== null && turnIds.has(e.turnId))
       .map((e) => ({ ...e, item: e.item }));
 
-    this.threads.set(fork.id, makeThreadState(fork, items));
+    const forkState = makeThreadState(fork, items);
+    // 历史整体继承 → 上下文计数与最近 tokenUsage 快照随 rollout 复制（真实
+    // codex 的 fork 重放源 rollout，TokenCount 记录随之带入；lastTurnId 截断
+    // 场景为近似）。resume 补发据此还原 side chat 继承的父线程占用。
+    forkState.contextUserChars = source.contextUserChars;
+    forkState.contextAgentChars = source.contextAgentChars;
+    forkState.contextBaseline = source.contextBaseline;
+    forkState.tokenUsage = source.tokenUsage
+      ? { turnId: source.tokenUsage.turnId, usage: source.tokenUsage.usage }
+      : null;
+    this.threads.set(fork.id, forkState);
     if (!fork.ephemeral) {
       this.persistState();
     }
     this.emitSoon("thread/started", { thread: this.serializeThread(fork, []) });
     // threadContext 固定以 turns:[] 序列化（thread/start 用）；fork 需带回截断历史，
-    // 故覆盖 thread 为实值，保持 ForkResponse 其余 13 键形状不变。
+    // 故覆盖 thread 为实值，保持 ForkResponse 其余 13 键形状不变。excludeTurns=true
+    // 时只回元数据不填充 turns（v2/thread.rs:608-612，客户端随即用 turns/items
+    // list 分页拉取）——App 的 side conversation 即走此路径。
     const context = this.threadContext(fork);
-    context.thread = this.serializeThread(fork, fork.turns);
+    context.thread = this.serializeThread(fork, p.excludeTurns === true ? [] : fork.turns);
     return context;
+  }
+
+  /**
+   * thread/name/set（v2/thread.rs:782-797；thread_processor.rs:1836-1864）：
+   * 名字 trim 归一化（core/src/util.rs:90-97），空名 -32600；写元数据后响应 {}，
+   * 随后广播 thread/name/updated{threadId, threadName}（common.rs:1927）——
+   * 响应先于通知（thread_set_name 先 send_response 再发通知）。
+   */
+  private threadNameSet(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    const name = typeof p.name === "string" ? p.name.trim() : "";
+    if (!name) {
+      throw new SimMethodError(-32600, "thread name must not be empty");
+    }
+    state.thread.name = name;
+    this.persistState();
+    this.emitSoon(
+      "thread/name/updated",
+      { threadId: state.thread.id, threadName: name },
+      state.thread.id,
+    );
+    return {};
+  }
+
+  /**
+   * thread/inject_items（v2/thread.rs:1691-1700；turn_processor.rs:974-1003 +
+   * core/src/codex_thread.rs:738-784）：把原始 Responses API items 追加进线程
+   * 模型可见历史——不起 turn、无任何通知，响应 {}。App 的 side conversation
+   * 在 fork(excludeTurns) 后、首个 turn/start 前用它注入边界指令；缺这条 RPC
+   * 会让 side chat 启动直接报「Codex 服务器返回了错误」（2026-09-26 真机）。
+   * message/role=user → userMessage、role=assistant → agentMessage，其余变体
+   * 原样保存；注入的 user/assistant 字符即时计入上下文占用（真实 codex 的
+   * 下一轮 TokenCount 会带上这段历史）。turnId 归属最近一个 turn（无 turn 时
+   * null：items/list 全量查询仍可见，按 turn 过滤的查询不包含）。
+   */
+  private threadInjectItems(p: AnyParams): unknown {
+    const state = this.threadState(p);
+    if (!Array.isArray(p.items) || p.items.length === 0) {
+      throw new SimMethodError(-32600, "items must not be empty");
+    }
+    const turnId = state.thread.turns.length
+      ? state.thread.turns[state.thread.turns.length - 1]!.id
+      : null;
+    const at = Date.now();
+    for (const [index, raw] of (p.items as unknown[]).entries()) {
+      const item = this.injectedItem(raw, index);
+      state.items.push({ turnId, item, startedAtMs: at, completedAtMs: at });
+      if (isUserMessageItem(item)) {
+        state.contextUserChars += item.content.reduce((sum, c) => sum + c.text.length, 0);
+      } else if (isAgentMessageItem(item)) {
+        state.contextAgentChars += item.text.length;
+      }
+    }
+    this.persistState();
+    return {};
+  }
+
+  /** 单个注入项 → SimItem；非对象 / 缺字符串 type / message 形状不全 → -32600（对齐 ResponseItem 反序列化失败）。 */
+  private injectedItem(raw: unknown, index: number): SimItem {
+    const invalid = (detail: string) =>
+      new SimMethodError(-32600, `items[${index}] is not a valid response item: ${detail}`);
+    if (typeof raw !== "object" || raw === null) {
+      throw invalid("expected an object");
+    }
+    const value = raw as { type?: unknown; role?: unknown; content?: unknown };
+    if (typeof value.type !== "string") {
+      throw invalid("expected a string type");
+    }
+    if (value.type !== "message") {
+      return { ...(raw as InjectedResponseItem) };
+    }
+    if ((value.role !== "user" && value.role !== "assistant") || !Array.isArray(value.content)) {
+      throw invalid("message items need role user|assistant and a content array");
+    }
+    const text = (value.content as Array<{ text?: unknown }>)
+      .map((c) => String(c.text ?? ""))
+      .join("");
+    return value.role === "user" ? makeUserMessage(text, null) : makeAgentMessage(text);
   }
 
   // ---------------------------------------------------------------- 状态 / 技能

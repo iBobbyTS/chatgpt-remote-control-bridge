@@ -3491,3 +3491,129 @@ test("回环：上下文占用 = 会话消息 char 数（新会话 0 基线，�
     await loop.mock.stop();
   }
 });
+
+test("回环：side conversation——fork(excludeTurns) 响应不带 turns；inject_items 注入边界（计入历史与上下文）；name/set 更新并广播", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    // 父线程：一轮对话打底（side chat 从它 fork）
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/sidechat" })) as {
+      result: { thread: { id: string } };
+    };
+    const parentId = started.result.thread.id;
+    await loop.mock.rpc("turn/start", { threadId: parentId, input: [{ type: "text", text: "父线程消息" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "父线程 turn/completed 未收到",
+    );
+    const parentUsage = (
+      loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").pop()!
+        .params as { tokenUsage: { total: { totalTokens: number } } }
+    ).tokenUsage.total.totalTokens;
+    assert.ok(parentUsage > 0, "父线程先产生非零占用");
+
+    // fork excludeTurns：响应只带元数据（turns 空），线程本体仍继承全部历史
+    await new Promise((resolve) => setTimeout(resolve, 150)); // 等 emitSoon 浮面
+    loop.mock.receivedNotifications.length = 0;
+    const fork = (await loop.mock.rpc("thread/fork", { threadId: parentId, excludeTurns: true })) as {
+      result: { thread: { id: string; forkedFromId: string | null; turns: unknown[] } };
+    };
+    const sideId = fork.result.thread.id;
+    assert.notEqual(sideId, parentId);
+    assert.equal(fork.result.thread.forkedFromId, parentId);
+    assert.equal(fork.result.thread.turns.length, 0, "excludeTurns=true 响应不填充 turns");
+    const forkTurns = (await loop.mock.rpc("thread/turns/list", { threadId: sideId })) as {
+      result: { data: Array<{ id: string }> };
+    };
+    assert.equal(forkTurns.result.data.length, 1, "fork 本体仍继承父线程 turn 历史");
+
+    // inject_items：App 实发形状（role:user message + input_text content）；
+    // 响应 {}，且不产生任何通知（codex 纯历史写入，无 server notification）
+    await new Promise((resolve) => setTimeout(resolve, 150)); // 等 fork 的 thread/started 浮面
+    loop.mock.receivedNotifications.length = 0;
+    const boundary =
+      "Side conversation boundary.\n\nEverything before this boundary is inherited history from the parent thread.";
+    const inject = (await loop.mock.rpc("thread/inject_items", {
+      threadId: sideId,
+      items: [{ role: "user", type: "message", content: [{ type: "input_text", text: boundary }] }],
+    })) as { result: unknown };
+    assert.deepEqual(inject.result, {});
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(loop.mock.receivedNotifications.length, 0, "inject_items 不产生通知");
+    // 注入项进 items/list，文本一致
+    const items = (await loop.mock.rpc("thread/items/list", { threadId: sideId })) as {
+      result: { data: Array<{ item: { type: string; content?: Array<{ text: string }> } }> };
+    };
+    const injected = items.result.data.find(
+      (e) => e.item.type === "userMessage" && e.item.content?.[0]?.text === boundary,
+    );
+    assert.ok(injected, "注入的边界消息应出现在 items/list");
+
+    // side 首轮上下文 = 继承的父线程占用 + 边界注入 + 本轮消息（fork 复制计数 + inject 即时计入）
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId: sideId, input: [{ type: "text", text: "side 问题" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "side turn/completed 未收到",
+    );
+    const sideUsage = (
+      loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").pop()!
+        .params as { tokenUsage: { total: { totalTokens: number } } }
+    ).tokenUsage.total.totalTokens;
+    const sideAgentItem = (
+      loop.mock.receivedNotifications.find((n) => n.method === "turn/completed")!.params as {
+        turn: { items: Array<{ type: string; text?: string }> };
+      }
+    ).turn.items.find((i) => i.type === "agentMessage");
+    const sideAgentChars = (sideAgentItem?.text ?? "").length;
+    assert.equal(
+      sideUsage,
+      parentUsage + boundary.length + "side 问题".length + sideAgentChars,
+      "side 首轮占用 = 继承 + 注入 + 本轮",
+    );
+
+    // name/set：响应 {} + thread/name/updated（trim 归一化），thread/list 生效
+    loop.mock.receivedNotifications.length = 0;
+    const named = (await loop.mock.rpc("thread/name/set", { threadId: sideId, name: "  hi  " })) as {
+      result: unknown;
+    };
+    assert.deepEqual(named.result, {});
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "thread/name/updated"),
+      2000,
+      "thread/name/updated 未收到",
+    );
+    const nameNotif = loop.mock.receivedNotifications.find(
+      (n) => n.method === "thread/name/updated",
+    )!.params as { threadId: string; threadName: string };
+    assert.equal(nameNotif.threadId, sideId);
+    assert.equal(nameNotif.threadName, "hi");
+    const list = (await loop.mock.rpc("thread/list", {})) as {
+      result: { data: Array<{ id: string; name: string | null }> };
+    };
+    assert.equal(list.result.data.find((t) => t.id === sideId)?.name, "hi");
+
+    // 非法入参：空 items / 坏 item / 空名 → -32600（对齐 codex invalid_request）
+    const badItems = (await loop.mock.rpc("thread/inject_items", { threadId: sideId, items: [] })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(badItems.error?.code, -32600);
+    assert.equal(badItems.error?.message, "items must not be empty");
+    const badItem = (await loop.mock.rpc("thread/inject_items", {
+      threadId: sideId,
+      items: [{ type: "message", content: "not-array" }],
+    })) as { error?: { code: number; message: string } };
+    assert.equal(badItem.error?.code, -32600);
+    assert.match(String(badItem.error?.message), /items\[0\] is not a valid response item/);
+    const badName = (await loop.mock.rpc("thread/name/set", { threadId: sideId, name: "   " })) as {
+      error?: { code: number; message: string };
+    };
+    assert.equal(badName.error?.code, -32600);
+    assert.equal(badName.error?.message, "thread name must not be empty");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
