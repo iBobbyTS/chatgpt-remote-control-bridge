@@ -674,3 +674,11 @@ resume 响应 → tokenUsage 补发（196/258000，数值正确）→ goal/clear
 
 测试：resume 补发测试加二次重申断言；新增 attach 重放测试（不 resume 只
 initialize 也能收到快照）；全量 190/190。
+
+### 追记：按用户决定回退上一节的偏离——tokenUsage 补发严格对齐 codex（同日）
+
+用户选择与 codex 逐字对齐：撤销 resume 后 1500ms 二次重申与 initialize attach
+重放，保留**单次**补发（resume 响应 → tokenUsage/updated → goal 快照，thread_
+processor.rs:4166-4190）。App 重建期（~0.7-1.3s 再水化）的短闪与重启边界首周期
+的空窗为 App 侧行为，与真实 codex 一致，服务器侧不再额外缓解。replayTokenUsage
+助手保留（同一逻辑的抽取，行为不变）。全量 189/189。

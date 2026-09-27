@@ -214,11 +214,6 @@ function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState 
 const CONTEXT_CHARS_MAX = 257_999;
 /** compact 后的上下文占用基线（压缩摘要占位）。 */
 const CONTEXT_BASELINE_AFTER_COMPACT = 200;
-/**
- * resume 补发后的二次重申延迟：越过 App 重连后的再水化突发（实测 turns/items
- * 列表合并持续 ~0.7-1.3s），防止重建尾声覆盖第一次补发的用量显示。
- */
-const TOKEN_USAGE_REASSERT_MS = 1500;
 
 type AnyParams = Record<string, any>;
 
@@ -676,20 +671,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     // 状态变化时发（auth 变更 / 隧道连接迁移）。此前每次 initialize 都推（planType
     // 还是 null），手机每 ~30s 重连即收到一次「账户信息变更」，status 页上下文显示
     // 被打回「不可用」直到 resume 补发恢复——实测来回跳的根因。按需读取走
-    // account/rateLimits/read 与 remoteControl/status/read。
-    // attach 重放：环境重启边界（presence 轮换后的首个周期）实测 App 只 initialize
-    // 不 resume，用量显示会空到下一周期（~30s）。codex 把补发绑在 resume 上；这里
-    // 对 attach 也重放最近活跃线程的同一快照（幂等，仅补齐 App 跳过 resume 的窗口）。
-    // 响应先行由宏任务 schedule 保证（「响应先行陷阱」）。
-    const recent = [...this.threads.values()]
-      .filter((t) => !t.thread.ephemeral && t.tokenUsage)
-      .sort((a, b) => (b.thread.recencyAt ?? 0) - (a.thread.recencyAt ?? 0))[0];
-    if (recent) {
-      const recentThreadId = recent.thread.id;
-      this.schedule(null, () => {
-        if (!this.closed) this.replayTokenUsage(recentThreadId);
-      }, 0);
-    }
+    // account/rateLimits/read 与 remoteControl/status/read。tokenUsage 补发也严格
+    // 绑定在 resume 上（曾试验 initialize 附带重放 + resume 后二次重申以缓解 App
+    // 重建期闪动，按用户决定回退，保持与 codex 逐字对齐）。
     return {
       userAgent: this.opts.userAgent ?? `codex_cli_rs/${CLI_VERSION} (Mac OS ${release()}; ${process.arch}) bridge-sim`,
       codexHome: this.opts.codexHome,
@@ -785,13 +769,6 @@ export class SimApp extends EventEmitter implements AgentApp {
         this.emit("event", this.notification("thread/goal/cleared", { threadId: current.thread.id }, current.thread.id));
       }
     }, 0);
-    // 二次重申：App 重连的再水化突发（turns/items 列表合并，实测 ~0.7-1.3s）可能在
-    // 重建尾声覆盖第一次补发的用量显示（status 页每 30s 短闪「不可用」）。codex 只
-    // 发一次；这里在再水化窗口结束后重申同一快照——同负载幂等合并，仅压缩客户端
-    // 可见空窗（刻意偏离，见 docs/research/07-sim-layer.md）。
-    this.schedule(null, () => {
-      if (!this.closed) this.replayTokenUsage(state.thread.id);
-    }, TOKEN_USAGE_REASSERT_MS);
     return {
       ...this.threadContext(state.thread),
       collaborationMode: state.thread.collaborationMode,
