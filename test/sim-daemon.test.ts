@@ -374,10 +374,11 @@ test("S03 BLOCKER2 IPC agent-reset：state.json 落盘失败 → 返回失败而
 // ------------------------------------------------------------ AUD-002 帧日志开关
 
 test("AUD-002 帧日志开关：默认关不写 frames.jsonl；config logFrames=true 开启", async () => {
-  async function bootWithFramesConfig(
+  // slug 须短：CGRCB_HOME 路径 + slug + mkdtemp 后缀 + /daemon.sock ≤ 100B（sun_path）
+  async function bootAndEnable(
     slug: string,
     logFrames: boolean | undefined,
-  ): Promise<{ framePath: string; online: Promise<void>; daemon: CgrcbDaemon; mock: MockWhamServer; socketPath: string }> {
+  ): Promise<{ framePath: string; daemon: CgrcbDaemon; mock: MockWhamServer }> {
     const mock = await startMock();
     const home = await tempDir(slug);
     const paths = cgrcbPaths(home);
@@ -389,18 +390,17 @@ test("AUD-002 帧日志开关：默认关不写 frames.jsonl；config logFrames=
     await daemon.start();
     const enable = await requestIpc(paths.socketPath, "enable", { agent: "sim" });
     assert.equal(enable.ok, true, JSON.stringify(enable));
-    const online = waitFor(
+    await waitFor(
       async () => (await ipcAgentStatus(paths.socketPath, "sim")).online,
       5000,
       "sim online",
     );
-    return { framePath: join(paths.instancesDir, "sim", "frames.jsonl"), online, daemon, mock, socketPath: paths.socketPath };
+    return { framePath: join(paths.instancesDir, "sim", "frames.jsonl"), daemon, mock };
   }
 
   // 默认（无 logFrames 字段）：不写帧日志
-  const off = await bootWithFramesConfig("simd-frames-off", undefined);
+  const off = await bootAndEnable("simd-fo", undefined);
   try {
-    await off.online;
     await off.mock.rpc("initialize", { clientInfo: { name: "t" } });
     assert.equal(
       await stat(off.framePath).then(
@@ -416,9 +416,8 @@ test("AUD-002 帧日志开关：默认关不写 frames.jsonl；config logFrames=
   }
 
   // config logFrames=true：写帧日志
-  const on = await bootWithFramesConfig("simd-frames-on", true);
+  const on = await bootAndEnable("simd-on", true);
   try {
-    await on.online;
     await on.mock.rpc("initialize", { clientInfo: { name: "t" } });
     await waitFor(
       () => stat(on.framePath).then(() => true, () => false),

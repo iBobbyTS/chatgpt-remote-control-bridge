@@ -6,17 +6,31 @@
  * .agent-work/tmp/sim-layer/catalog*.json）。
  */
 import { EventEmitter } from "node:events";
-import { execFile } from "node:child_process";
-import { readFileSync, realpathSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
+import { rename, writeFile } from "node:fs/promises";
 import { homedir, release } from "node:os";
-import { basename, dirname, join } from "node:path";
-import { promisify } from "node:util";
+import { dirname, join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
-  ATTACHMENTS_DIR_PREFIX,
-  resolveContainedSavePath,
-} from "../files.ts";
+  ERR_METHOD_NOT_FOUND,
+  ERR_NOT_INITIALIZED,
+  SimMethodError,
+  type AnyParams,
+  type JsonRpcOutcome,
+  type SimClientKey,
+  type SimClientState,
+  type SimNotification,
+} from "./protocol.ts";
+import {
+  AUTO_NAME_PREFIX,
+  firstFiveChars,
+  HELP_TEXT,
+  specialCommandOf,
+  titleForPrompt,
+  titleSchemaOf,
+} from "./naming.ts";
+import { VirtualFs, renderAttachment, type AttachmentEcho } from "./fsOverlay.ts";
+import { emulateShellScript, unwrapSandboxCommand } from "./shellEmulation.ts";
 import {
   approvalModeLabel,
   CLI_VERSION,
@@ -54,38 +68,7 @@ import {
 import { uuidv7 } from "./ids.ts";
 import type { AgentApp } from "../types.ts";
 
-export interface SimClientKey {
-  clientId: string;
-  streamId: string;
-}
 
-export interface SimClientState {
-  clientInfo: { name?: string; title?: string; version?: string } | null;
-  optOut: Set<string>;
-  unsubscribed: Set<string>;
-  /** attach 过的线程（正向订阅跟踪，仅服务空闲卸载判定）。 */
-  attached: Set<string>;
-  initialized: boolean;
-}
-
-export interface SimNotification {
-  method: string;
-  params: Record<string, unknown>;
-  /** 存在时仅投递给订阅了该 thread 的客户端。 */
-  threadId?: string;
-  /** 存在时仅投递给该连接（连接级通知，如 command/exec/outputDelta）。 */
-  target?: SimClientKey;
-}
-
-export interface JsonRpcSuccess {
-  id: number | string;
-  result: unknown;
-}
-export interface JsonRpcFailure {
-  id: number | string;
-  error: { code: number; message: string; data?: unknown };
-}
-export type JsonRpcOutcome = JsonRpcSuccess | JsonRpcFailure;
 
 export interface SimAppOptions {
   codexHome: string;
@@ -265,11 +248,6 @@ const CONTEXT_BASELINE_AFTER_COMPACT = 200;
  */
 const THREAD_UNLOAD_DELAY_MS = 60_000;
 
-type AnyParams = Record<string, any>;
-
-const ERR_NOT_INITIALIZED = { code: -32600, message: "Not initialized" };
-const ERR_METHOD_NOT_FOUND = { code: -32601, message: "Method not found" };
-
 /** thread/goal/set 允许的 status 取值（v2/thread.rs ThreadGoalStatus 枚举）。 */
 const GOAL_STATUSES: readonly SimGoalStatus[] = [
   "active",
@@ -283,179 +261,11 @@ const GOAL_STATUSES: readonly SimGoalStatus[] = [
 /** goal 计量每 turn 累加的模拟 token 数（与 tokenUsage 通知的 total 1234 一致）。 */
 const GOAL_TURN_TOKENS = 1234;
 
-/** 特殊指令帮助文本（手机端发送对应指令即得本条回复）。 */
-const HELP_TEXT = [
-  "特殊指令：",
-  "help: 输出本条帮助信息",
-  'test steer：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试steer强制插入消息的效果；期间steer发送stop会在当前步骤结束后停止脚本。',
-  'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
-  "",
-  "模拟功能（对齐 codex）：",
-  "goal 启用后自动续跑共4个goal turn（每个=1次模拟wait+1条输出；第2个turn的wait为30秒、其余10秒）：前3个后标记blocked，再次启动第4个后标记complete；turn运行中发消息会steer插入当前turn，停止/中止只结束当前turn、goal仍自动续跑，中止后排队消息不会自动开跑",
-  "compact 约 5 秒完成且下一条回复标记",
-  "Plan 模式回复带前缀",
-  "shell 命令生成模拟命令条目",
-  "branch 经 thread/metadata/update 设置、fork 复制历史",
-  "消息含 $技能名 会确认加载",
-].join("\n");
-
-/** 特殊指令识别：trim + 大小写不敏感的完全匹配。 */
-function specialCommandOf(userText: string): "help" | "test-steer" | "test-queue" | null {
-  const t = userText.trim().toLowerCase();
-  if (t === "help") return "help";
-  if (t === "test steer") return "test-steer";
-  if (t === "test queue") return "test-queue";
-  return null;
-}
-
-/**
- * 识别手机的任务标题生成 turn（turnTrigger=remote_ios + outputSchema{title}）：
- * 手机用 LLM 为用户消息生成 ≤36 字符的 UI 标题，期待 agentMessage 文本为符合
- * schema 的 JSON（{"title":"…"}）。2026-09-26 真机复现：该 turn 被当普通消息
- * 回复长文本（非 JSON）→ 手机 outputSchema 解析失败 → UI 渲染冻结 + 30s 重连
- * 循环（docs/research/07-sim-layer.md）。返回 title.maxLength（无则 36）；非
- * 标题 turn 返回 null。
- */
-function titleSchemaOf(p: AnyParams): number | null {
-  const schema = p.outputSchema;
-  if (typeof schema !== "object" || schema === null) return null;
-  const props = (schema as { properties?: unknown }).properties;
-  const title = typeof props === "object" && props !== null
-    ? (props as Record<string, unknown>).title
-    : undefined;
-  if (typeof title !== "object" || title === null) return null;
-  const max = (title as { maxLength?: unknown }).maxLength;
-  if (typeof max === "number" && Number.isFinite(max) && max > 0) return max;
-  return 36;
-}
-
-/** 自动命名模板前缀；命名格式为「自动命名：{用户请求的前5个字符}」。 */
-const AUTO_NAME_PREFIX = "自动命名：";
-
-/** 请求文本前 5 个 Unicode 码点（Array.from 防止拆代理对），去尾随空白。 */
-function firstFiveChars(request: string): string {
-  return Array.from(request).slice(0, 5).join("").trimEnd();
-}
-
-/**
- * 标题生成 turn 的自动命名：从 prompt 尾部 "User prompt:\n<msg>" 提取用户请求
- * （单行化、去引号），命名「自动命名：<请求前5码点>」。真机帧证据
- * （2026-09-27）：手机拿本 turn 的 JSON 输出回填 thread/name/set（title JSON
- * 完成于 name/set 之前 ~0.5s）——线程名完全由此模板决定，故超长请求不再
- * 回显整段；末尾按 schema maxLength 码点截断保契约（36 时恒不触发）。
- */
-function titleForPrompt(prompt: string, maxLength: number): string {
-  const marker = "User prompt:";
-  const idx = prompt.lastIndexOf(marker);
-  const raw = idx >= 0 ? prompt.slice(idx + marker.length) : prompt;
-  const request = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "") || "Task";
-  const title = AUTO_NAME_PREFIX + firstFiveChars(request);
-  const cps = Array.from(title);
-  return cps.length > maxLength ? cps.slice(0, maxLength).join("") : title;
-}
-
-// ---------------------------------------------------------------- 附件上传
-
-/** 按扩展名判定图片（决定是否执行 exiftool）。 */
-const IMAGE_EXTENSIONS = new Set([
-  "jpg", "jpeg", "jfif", "png", "heic", "heif", "avif", "webp", "gif", "tif", "tiff", "bmp", "jxl", "svg",
-]);
-function isImagePath(path: string): boolean {
-  const m = /\.([a-z0-9]+)$/i.exec(path);
-  return m != null && IMAGE_EXTENSIONS.has(m[1]!.toLowerCase());
-}
-
-const execFileP = promisify(execFile);
-/** daemon 环境 PATH 可能缺 /opt/homebrew/bin，exiftool 逐候选回退。 */
-const EXIFTOOL_CANDIDATES = [
-  process.env.EXIFTOOL_PATH,
-  "exiftool",
-  "/opt/homebrew/bin/exiftool",
-  "/usr/local/bin/exiftool",
-].filter((v): v is string => typeof v === "string" && v.length > 0);
-
-/**
- * 校验标准 base64（长度 4 倍数、至多 2 个结尾 =、字符集 [A-Za-z0-9+/]）。
- * 线性扫描而非正则——分组量词正则（如 (?:…{4})*）在 V8 中按次递归回溯，
- * 8MB 文件的 ~11MB base64 会直接 Maximum call stack size exceeded
- * （真机 2026-09-27T05:58Z 复现），charCodeAt 循环为 O(n) 常数栈。
- */
-export function isValidBase64(s: string): boolean {
-  if (s.length === 0 || s.length % 4 !== 0) return false;
-  let end = s.length;
-  if (s[end - 1] === "=") end -= 1;
-  if (s[end - 1] === "=") end -= 1;
-  if (s.length - end > 2) return false;
-  for (let i = 0; i < end; i++) {
-    const c = s.charCodeAt(i);
-    if (
-      !(c >= 65 && c <= 90) && !(c >= 97 && c <= 122) &&
-      !(c >= 48 && c <= 57) && c !== 43 && c !== 47
-    ) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/** 执行 exiftool 取全量元数据文本；失败（缺二进制/无法识别）返回 null。 */
-async function runExiftool(file: string): Promise<string | null> {
-  for (const bin of EXIFTOOL_CANDIDATES) {
-    try {
-      const { stdout } = await execFileP(bin, [file], { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 });
-      const text = stdout.trim();
-      if (text) return text;
-    } catch {
-      // 试下一个候选路径
-    }
-  }
-  return null;
-}
-
-/** fs/writeFile 上传记录：虚拟路径（手机可见）→ files/ 内落盘信息（进程内映射）。 */
-interface UploadedFileRecord {
-  virtualPath: string;
-  savedPath: string;
-  /** 从附件路径解析出的线程 ID（非附件目录上传为 null）。 */
-  threadId: string | null;
-  sizeBytes: number;
-  /** 图片上传时预跑的 exiftool 全量输出；非图片 / 失败为 null。 */
-  exiftool: string | null;
-  /** 是否已在某条回复中回执过（每文件只回执一次）。 */
-  echoed: boolean;
-}
-
-/** 回复中回执的附件条目。 */
-type AttachmentEcho =
-  | { kind: "image"; path: string; sizeBytes: number; exiftool: string | null }
-  | { kind: "file"; path: string; sizeBytes: number }
-  | { kind: "missing"; path: string };
-
-/** 附件回执渲染：图片附 exiftool 全量输出，其他文件给保存路径。 */
-function renderAttachment(a: AttachmentEcho): string {
-  if (a.kind === "missing") {
-    return `- 附件未找到：${a.path}`;
-  }
-  const size = `${(a.sizeBytes / 1024).toFixed(1)} KB`;
-  if (a.kind === "image") {
-    return (
-      `- 图片已保存：${a.path}（${size}）\nexiftool 完整信息：\n` +
-      (a.exiftool ?? "（exiftool 执行失败或不可用）")
-    );
-  }
-  return `- 文件已保存：${a.path}（${size}）`;
-}
-
 export class SimApp extends EventEmitter implements AgentApp {
   private readonly clients = new Map<string, SimClientState>();
   private readonly threads = new Map<string, ThreadState>();
-  /** 虚拟目录覆盖层：绝对路径 → 存在的目录（模拟 mkdir，不落盘）。 */
-  private readonly overlayDirs = new Set<string>();
-  private readonly overlayChildren = new Map<string, Set<string>>();
-  /** fs/writeFile 上传记录：手机可见虚拟路径 → files/ 内落盘信息。 */
-  private readonly overlayFiles = new Map<string, UploadedFileRecord>();
-  /** 上传落盘根目录（<CGRCB_HOME>/files）。 */
-  private readonly filesDir: string;
+  /** 虚拟 FS 覆盖层（上传收容/目录模拟/附件回执；跨 reset 保留，见 fsOverlay.ts）。 */
+  private readonly fs: VirtualFs;
   private readonly opts: Required<
     Pick<
       SimAppOptions,
@@ -482,7 +292,10 @@ export class SimApp extends EventEmitter implements AgentApp {
       shellWaitMs: 2_000,
       ...opts,
     };
-    this.filesDir = this.opts.filesDir ?? join(dirname(this.opts.codexHome), "files");
+    this.fs = new VirtualFs({
+      filesDir: this.opts.filesDir ?? join(dirname(this.opts.codexHome), "files"),
+      log: (line) => this.opts.log?.(line),
+    });
     if (this.opts.statePath) {
       this.loadStateSync(this.opts.statePath);
     }
@@ -883,16 +696,16 @@ export class SimApp extends EventEmitter implements AgentApp {
       case "thread/settings/update":
         return this.settingsUpdate(p);
       case "fs/readDirectory":
-        return this.fsReadDirectory(p);
+        return this.fs.listDirectory(p.path);
       case "fs/getMetadata":
-        return this.fsGetMetadata(p);
+        return this.fs.getMetadata(p.path);
       case "fs/createDirectory":
-        this.overlayMkdir(p.path);
+        this.fs.mkdirOverlay(p.path);
         return {};
       case "fs/writeFile":
-        return this.fsWriteFile(p);
+        return this.fs.writeFile(p);
       case "fs/readFile":
-        return this.fsReadFile(p);
+        return this.fs.readFile(p);
       case "process/spawn":
         return this.processSpawn(p);
       case "command/exec":
@@ -1369,7 +1182,7 @@ export class SimApp extends EventEmitter implements AgentApp {
           return;
         }
         // 附件回执（exiftool 可能在此异步执行）：标题/特殊指令分支不掺入
-        const attachments = await this.collectAttachments(state, sim);
+        const attachments = await this.fs.collectEchoes(state.thread.id, sim.rawInput);
         const reply = this.composeReply(state, userText, attachments);
         this.streamAgentMessage(state, sim, reply, finishTurn);
       }, this.opts.stepDelayMs);
@@ -2647,222 +2460,16 @@ export class SimApp extends EventEmitter implements AgentApp {
     };
   }
 
-  // ------------------------------------------------------------------ 虚拟 FS
-
-  private fsReadDirectory(p: AnyParams): Promise<unknown> {
-    return this.listDirectory(p.path);
-  }
-
-  private async listDirectory(path: string): Promise<unknown> {
-    if (!path) throw new SimMethodError(-32602, "missing path");
-    const names = new Map<string, boolean>(); // name → isDirectory
-    let exists = this.overlayDirs.has(path);
-    try {
-      const entries = await readdir(path, { withFileTypes: true });
-      exists = true;
-      for (const e of entries) {
-        names.set(e.name, e.isDirectory());
-      }
-    } catch {
-      // 真实目录不存在：仅用覆盖层
-    }
-    for (const child of this.overlayChildren.get(path) ?? []) {
-      names.set(child, this.overlayDirs.has(join(path, child)));
-    }
-    for (const virtual of this.overlayFiles.keys()) {
-      if (dirname(virtual) === path) {
-        names.set(basename(virtual), false);
-      }
-    }
-    if (!exists) {
-      exists = [...this.overlayFiles.keys()].some((v) => v.startsWith(`${path}/`));
-    }
-    if (!exists) {
-      throw new SimMethodError(-32000, `readDirectory: ${path}: no such file or directory`);
-    }
-    return {
-      entries: [...names.entries()]
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([fileName, isDirectory]) => ({ fileName, isDirectory, isFile: !isDirectory })),
-    };
-  }
-
-  private async fsGetMetadata(p: AnyParams): Promise<unknown> {
-    const path = p.path;
-    try {
-      const s = await stat(path);
-      return {
-        isDirectory: s.isDirectory(),
-        isFile: s.isFile(),
-        isSymlink: s.isSymbolicLink(),
-        // 真实 codex（Rust）返回整毫秒；Node stat 的纳秒精度带小数，
-        // 手机 Swift 解码器按整数解码小数毫秒即「无法解码Codex响应」
-        // （2026-09-25 真机复现：仅时间戳恰为整秒的目录能显示）
-        createdAtMs: Math.round(s.birthtimeMs),
-        modifiedAtMs: Math.round(s.mtimeMs),
-      };
-    } catch {
-      const uploaded = this.overlayFiles.get(path);
-      if (uploaded) {
-        const s = await stat(uploaded.savedPath).catch(() => null);
-        return {
-          isDirectory: false,
-          isFile: true,
-          isSymlink: false,
-          createdAtMs: Math.round(s?.birthtimeMs ?? 0),
-          modifiedAtMs: Math.round(s?.mtimeMs ?? 0),
-        };
-      }
-      if (this.overlayDirs.has(path)) {
-        const now = Date.now();
-        return { isDirectory: true, isFile: false, isSymlink: false, createdAtMs: now, modifiedAtMs: now };
-      }
-      throw new SimMethodError(-32000, `getMetadata: ${path}: no such file or directory`);
-    }
-  }
-
-  /** 覆盖层 mkdir -p。 */
-  private overlayMkdir(path: string | undefined): void {
-    if (!path) return;
-    const expanded = path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-    const segments = expanded.replace(/^\//, "").split("/").filter(Boolean);
-    let prev = "";
-    for (let i = 0; i < segments.length; i++) {
-      const current = `/${segments.slice(0, i + 1).join("/")}`;
-      this.overlayDirs.add(current);
-      if (prev) {
-        const children = this.overlayChildren.get(prev) ?? new Set<string>();
-        children.add(segments[i]!);
-        this.overlayChildren.set(prev, children);
-      }
-      prev = current;
-    }
-  }
-
-  /**
-   * fs/writeFile 虚拟路径 → files/ 内落盘路径。附件目录保留
-   * `<threadId>/<uuid>/<文件名>` 结构；其余绝对路径镜像收进 files/mirror/。
-   * 段校验（拒绝 `..` 等）在共享助手内（src/agents/files.ts，后续 serving-agent 复用）。
-   */
-  private savedPathFor(virtualPath: string): string {
-    return resolveContainedSavePath(this.filesDir, virtualPath);
-  }
-
-  /**
-   * fs/writeFile（v2/fs.rs:29-40）：{path, dataBase64} → 落盘返回 {}。错误对齐
-   * codex fs_processor.write_file：坏 base64 → -32600，IO 失败 → -32603。
-   * 图片（按扩展名）同步跑 exiftool 缓存全量输出，供下一条回复回执。
-   */
-  private async fsWriteFile(p: AnyParams): Promise<unknown> {
-    const path = typeof p.path === "string" ? p.path : "";
-    if (!path.startsWith("/")) {
-      throw new SimMethodError(-32602, "fs/writeFile requires an absolute path");
-    }
-    const data = p.dataBase64;
-    if (typeof data !== "string" || !isValidBase64(data)) {
-      throw new SimMethodError(-32600, "fs/writeFile requires valid base64 dataBase64: Invalid byte");
-    }
-    const bytes = Buffer.from(data, "base64");
-    let savedPath: string;
-    try {
-      savedPath = this.savedPathFor(path);
-    } catch (err) {
-      throw new SimMethodError(-32602, `fs/writeFile: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    try {
-      await mkdir(dirname(savedPath), { recursive: true });
-      await writeFile(savedPath, bytes);
-    } catch (err) {
-      throw new SimMethodError(-32603, `fs/writeFile: ${err instanceof Error ? err.message : String(err)}`);
-    }
-    const record: UploadedFileRecord = {
-      virtualPath: path,
-      savedPath,
-      threadId: path.startsWith(ATTACHMENTS_DIR_PREFIX)
-        ? path.slice(ATTACHMENTS_DIR_PREFIX.length).split("/")[0] || null
-        : null,
-      sizeBytes: bytes.length,
-      exiftool: null,
-      echoed: false,
-    };
-    if (isImagePath(path)) {
-      record.exiftool = await runExiftool(savedPath);
-    }
-    this.overlayFiles.set(path, record);
-    this.opts.log?.(`附件已保存：${path} → ${savedPath}（${bytes.length} B${record.exiftool != null ? "，exiftool ✓" : ""}）`);
-    return {};
-  }
-
-  /**
-   * fs/readFile（v2/fs.rs:11-23）：仅回读 sim 自己落盘的上传文件——手机流程
-   * 只回读附件；不开放任意主机路径读取。
-   */
-  private async fsReadFile(p: AnyParams): Promise<unknown> {
-    const path = typeof p.path === "string" ? p.path : "";
-    const record = this.overlayFiles.get(path);
-    if (!record) {
-      throw new SimMethodError(-32000, `readFile: ${path}: no such file or directory`);
-    }
-    const data = await readFile(record.savedPath);
-    return { dataBase64: data.toString("base64") };
-  }
-
-  /**
-   * 收集本 turn 回复要回执的附件：
-   * ① 本线程未回显的上传（附件路径含 threadId——上传与发送之间无引用也保证有回执）；
-   * ② 输入项 localImage/localAudio（v2/turn.rs:440-448）显式引用的路径：已上传
-   *    则对账落盘文件；未上传但真实存在则按主机文件处理（codex LocalImage 语义
-   *    即读取该路径）；不存在报「未找到」。
-   */
-  private async collectAttachments(state: ThreadState, sim: SimTurnRuntime): Promise<AttachmentEcho[]> {
-    const echoes: AttachmentEcho[] = [];
-    const seen = new Set<string>();
-    for (const record of this.overlayFiles.values()) {
-      if (record.threadId === state.thread.id && !record.echoed) {
-        record.echoed = true;
-        seen.add(record.virtualPath);
-        echoes.push(this.echoOfRecord(record));
-      }
-    }
-    for (const item of sim.rawInput ?? []) {
-      if (!item || typeof item !== "object") continue;
-      const e = item as { type?: unknown; path?: unknown };
-      if (e.type !== "localImage" && e.type !== "localAudio") continue;
-      if (typeof e.path !== "string" || seen.has(e.path)) continue;
-      const record = this.overlayFiles.get(e.path);
-      if (record) {
-        record.echoed = true;
-        seen.add(record.virtualPath);
-        echoes.push(this.echoOfRecord(record));
-        continue;
-      }
-      seen.add(e.path);
-      const s = await stat(e.path).catch(() => null);
-      if (s?.isFile() !== true) {
-        echoes.push({ kind: "missing", path: e.path });
-      } else if (isImagePath(e.path)) {
-        echoes.push({ kind: "image", path: e.path, sizeBytes: s.size, exiftool: await runExiftool(e.path) });
-      } else {
-        echoes.push({ kind: "file", path: e.path, sizeBytes: s.size });
-      }
-    }
-    return echoes;
-  }
-
-  private echoOfRecord(record: UploadedFileRecord): AttachmentEcho {
-    return isImagePath(record.virtualPath)
-      ? { kind: "image", path: record.savedPath, sizeBytes: record.sizeBytes, exiftool: record.exiftool }
-      : { kind: "file", path: record.savedPath, sizeBytes: record.sizeBytes };
-  }
-
   // -------------------------------------------------------------- 进程模拟
 
   private processSpawn(p: AnyParams): unknown {
     const command: string[] = Array.isArray(p.command) ? p.command : [];
     const handle = p.processHandle ?? `sim-${uuidv7()}`;
-    const { stdout, stderr, exitCode } = this.emulateShellScript(
+    const { stdout, stderr, exitCode } = emulateShellScript(
       command.join(" "),
       p.env !== null && typeof p.env === "object" ? (p.env as Record<string, unknown>) : undefined,
+      this.fs,
+      this.opts.log,
     );
     this.emit("event", this.notification("process/exited", {
       processHandle: handle,
@@ -2875,48 +2482,6 @@ export class SimApp extends EventEmitter implements AgentApp {
     return {};
   }
 
-  /**
-   * process/spawn 与 command/exec 共用的脚本模式仿真（不真正执行）。
-   * 已知模式按真机语义应答：任务目录 mkdir（覆盖层 + 路径应答）、HOME 探测、
-   * draft git 探测（非 git 目录形状）、其他 mkdir 登记覆盖层、周期 workspace-diff
-   * 静默空应答；未识别脚本留痕后空 stdout / exit 0 兜底。
-   * env 为 command/exec 的环境覆盖（新版任务目录脚本经 CODEX_PROJECTLESS_ROOT
-   * 注入根目录，脚本文本不再含 Documents/Codex 字样）。
-   */
-  private emulateShellScript(
-    script: string,
-    env?: Record<string, unknown>,
-  ): { stdout: string; stderr: string; exitCode: number } {
-    let stdout = "";
-    let stderr = "";
-    let exitCode = 0;
-    const taskDir = this.emulateTaskDirMkdir(script, env);
-    if (taskDir) {
-      // 手机端新建任务：解析 stdout 拿任务目录路径（真实脚本 printf candidate）
-      stdout = `${taskDir}\n`;
-    } else if (script.includes('cd "$HOME" && pwd -P')) {
-      // 工作文件夹选择器入口：手机靠该脚本拿 HOME 物理路径，空 stdout 会让
-      // 选择器直接判「远程文件夹加载失败」（2026-09-25 真机复现，docs/research/07）
-      stdout = `${realpathSync(homedir())}\n`;
-    } else if (script.includes("CODEX_DRAFT_OUTPUT_CURRENT")) {
-      // 选中目录后的 git 分支探测（draft/分支选择）。手机可接受「非 git 目录」
-      // 形状并继续 thread/start（真实抓包 2026-09-25T19:23:04Z）；CODEX_DRAFT_OUTPUT_*
-      // 标记值由 codex 进程注入、抓包未能观测到，故 git 仓库目录也按此形状应答
-      // （draft 分支列表不可用，不影响文件夹选择本身）。
-      exitCode = 128;
-      stderr = "fatal: not a git repository (or any of the parent directories): .git\n";
-    } else if (/\bmkdir\b/.test(script)) {
-      // 其他 mkdir：登记到覆盖层，不真正执行
-      for (const m of script.matchAll(/\bmkdir\s+(?:-[a-zA-Z]+\s+)*(~[^\s'";|&]+|\/[^\s'";|&]+)/g)) {
-        this.overlayMkdir(m[1]);
-      }
-    } else if (!script.includes("collecting a workspace diff")) {
-      // 周期性 workspace-diff 快照不记日志（约 30s 一次会刷屏）；其余未识别脚本
-      // 留痕，便于真机出现新脚本模式时定位（当前以空 stdout / exit 0 兜底应答）
-      this.opts.log?.(`exec 未识别脚本（空 stdout 应答）: ${script.slice(0, 80)}`);
-    }
-    return { stdout, stderr, exitCode };
-  }
 
   /**
    * command/exec：无线程/turn 的一次性命令（ChatGPT iOS 1.2026.258 起在发消息前
@@ -2939,21 +2504,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (command.length === 0) {
       throw new SimMethodError(-32600, "command must not be empty");
     }
-    // codex 沙箱包装（read-only / workspace-write 同形）：
-    // ["/bin/sh","-c","printf '\0'; exec \"$@\"",<wrapper>,"/bin/sh","-lc",<内层脚本>]
-    // ——外壳先输出 NUL 再 exec 内层，仿真保持同形状输出
-    let script = command.join(" ");
-    let nulPrefix = false;
-    if (
-      command.length === 7 && command[1] === "-c" && command[5] === "-lc" &&
-      typeof command[2] === "string" && typeof command[6] === "string" &&
-      command[2].includes("exec \"$@\"")
-    ) {
-      script = command[6];
-      nulPrefix = command[2].includes("printf '\\0'");
-    }
+    const { script, nulPrefix } = unwrapSandboxCommand(command);
     const env = p.env !== null && typeof p.env === "object" ? (p.env as Record<string, unknown>) : undefined;
-    const emulated = this.emulateShellScript(script, env);
+    const emulated = emulateShellScript(script, env, this.fs, this.opts.log);
     const stdout = nulPrefix ? `\0${emulated.stdout}` : emulated.stdout;
     const capBytes = typeof p.outputBytesCap === "number" && Number.isFinite(p.outputBytesCap) &&
       p.outputBytesCap >= 0
@@ -3011,42 +2564,6 @@ export class SimApp extends EventEmitter implements AgentApp {
     throw noActiveCommandExec(p.processId);
   }
 
-  /**
-   * 识别手机端「新建任务目录」脚本并返回应答路径，同时在覆盖层创建目录：
-   * - 旧版（≤1.2026.251）：root="${HOME}/Documents/Codex" 硬编码在脚本文本里；
-   * - 新版（1.2026.258）：root="$CODEX_PROJECTLESS_ROOT"（env 注入根目录），
-   *   base 取消息文本（如 base="hi"），重名加 -N 后缀，应答 printf candidate。
-   */
-  private emulateTaskDirMkdir(script: string, env?: Record<string, unknown>): string | null {
-    if (!/\bbase="([^"]+)"/.test(script)) {
-      return null;
-    }
-    let root: string | null = null;
-    if (script.includes('root="$CODEX_PROJECTLESS_ROOT"')) {
-      const fromEnv = env?.CODEX_PROJECTLESS_ROOT;
-      root = typeof fromEnv === "string" && fromEnv !== "" ? fromEnv : `${homedir()}/Documents/Codex`;
-    } else if (script.includes("Documents/Codex")) {
-      root = `${homedir()}/Documents/Codex`;
-    }
-    if (!root) {
-      return null;
-    }
-    const base = script.match(/\bbase="([^"]+)"/)![1]!;
-    const date = new Date();
-    const yyyy = date.getFullYear();
-    const mm = String(date.getMonth() + 1).padStart(2, "0");
-    const dd = String(date.getDate()).padStart(2, "0");
-    const dateDir = `${root}/${yyyy}-${mm}-${dd}`;
-    this.overlayMkdir(dateDir);
-    let candidate = `${dateDir}/${base}`;
-    let index = 1;
-    while (this.overlayDirs.has(candidate)) {
-      index += 1;
-      candidate = `${dateDir}/${base}-${index}`;
-    }
-    this.overlayMkdir(candidate);
-    return candidate;
-  }
 
   // ------------------------------------------------------------------ 工具
 
@@ -3112,15 +2629,6 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 }
 
-class SimMethodError extends Error {
-  constructor(
-    public readonly code: number,
-    message: string,
-  ) {
-    super(message);
-    this.name = "SimMethodError";
-  }
-}
 
 /** 无活动 command/exec 会话的错误（文案对齐 command_exec.rs send_control，
  * error_repr 为 serde JSON 字符串，即带引号的 processId）。 */

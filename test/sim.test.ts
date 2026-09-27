@@ -18,7 +18,8 @@ import { makeTestJwt } from "../src/auth/jwt.ts";
 import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import { MockWhamServer } from "../src/wham/mockServer.ts";
 import { WhamTunnel } from "../src/wham/tunnel.ts";
-import { SimApp, isValidBase64 } from "../src/agents/sim/appServer.ts";
+import { SimApp } from "../src/agents/sim/appServer.ts";
+import { isValidBase64 } from "../src/agents/sim/fsOverlay.ts";
 import { randomBytes } from "node:crypto";
 import { simInit, simReset, simStatePath, simStoreInitialized } from "../src/agents/sim/store.ts";
 

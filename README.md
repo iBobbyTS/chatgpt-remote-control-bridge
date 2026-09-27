@@ -132,6 +132,25 @@ reset/logout 在 daemon 运行时经 IPC 由 daemon 执行：停自动刷新 →
   支持离线（直接操作 `state.json`），`status` 降级显示静态信息。先 `cgrcb start`。
 - **未登录**：`enable` 返回未登录提示，先 `cgrcb chatgpt login`。
 
+## 语义与信任边界（agent 接入须知）
+
+**桥（本仓库）的职责**：接收并透传 codex 远程控制的全部 app-server 协议语义（方法、
+通知、分片、订阅），把 wham 通道与本地 serving-agent 对接。**语义怎么解释由每个
+接入 agent 自行决定**——包括权限模型、动作审批、路径/网络限制、用量上限等，属于
+agent 实现的责任，桥不代为设卡。
+
+sim（调试 agent，codex 同款语义，AUD-008 决定）的边界示例：
+
+- `fs/readDirectory` / `fs/getMetadata`：直接 stat/readdir **任意主机绝对路径**——
+  手机文件夹选择器/附件引用依赖此语义（真实 codex 即如此）。
+- `fs/readFile`：仅回读 sim 自己落盘的上传文件，不开放任意主机路径读取。
+- `fs/writeFile`：无论虚拟路径为何，一律收容落盘到 `<CGRCB_HOME>/files/` 之下
+  （共享助手 `src/agents/files.ts`，路径穿越直接拒绝）。
+- `process/spawn` / `command/exec`：纯脚本模式仿真，**不真正执行**。
+
+接入新 agent（如 zcode）时应按自身风险模型重新决定上述每一条的解释方式，而不是
+默认沿用 sim 的边界。
+
 ## 开发
 
 ```bash

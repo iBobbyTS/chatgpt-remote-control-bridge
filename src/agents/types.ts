@@ -3,6 +3,11 @@
  *
  * WhamTunnel 只依赖本接口，不依赖任何具体 agent 实现（sim/zcode 等）。
  * 结构类型自带（不引用 src/sim 具体类型），使 sim 在 S03 前即可无改动挪入框架。
+ *
+ * 语义责任边界（AUD-011 决定）：桥接收并透传 codex 远程控制的全部协议语义；
+ * **语义怎么解释由实现本接口的每个 agent 自行决定**——权限模型、动作审批、
+ * 路径/网络/用量限制是 agent 的责任，桥不代为设卡。sim 的边界示例见 README
+ * 「语义与信任边界」。
  */
 import type { EventEmitter } from "node:events";
 
