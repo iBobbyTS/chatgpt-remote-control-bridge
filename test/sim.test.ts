@@ -3358,6 +3358,10 @@ test("回环：resume 补发 tokenUsage 快照（上下文行数据源），响�
       10_000,
       "turn/completed 未收到",
     );
+    const liveUsage = loop.mock.receivedNotifications.find((n) => n.method === "thread/tokenUsage/updated")!
+      .params as { tokenUsage: { total: { totalTokens: number }; modelContextWindow: number } };
+    assert.ok(liveUsage.tokenUsage.total.totalTokens > 0, "新会话基线 0，首轮后已占用 = 本轮消息字符数（>0）");
+    assert.equal(liveUsage.tokenUsage.modelContextWindow, 258000);
 
     loop.mock.receivedEnvelopeLog.length = 0;
     loop.mock.receivedNotifications.length = 0;
@@ -3386,8 +3390,8 @@ test("回环：resume 补发 tokenUsage 快照（上下文行数据源），响�
     };
     assert.equal(replay.threadId, threadId);
     assert.equal(replay.turnId, turn.result.turn.id, "补发应归属最近一个完成的 turn");
-    assert.equal(replay.tokenUsage.total.totalTokens, 1234);
-    assert.equal(replay.tokenUsage.modelContextWindow, 258400);
+    assert.equal(replay.tokenUsage.total.totalTokens, liveUsage.tokenUsage.total.totalTokens, "补发应携带最近快照值");
+    assert.equal(replay.tokenUsage.modelContextWindow, 258000);
     // tokenUsage 补发先于 goal 快照（thread_processor.rs:4166-4190 顺序）
     const goalIdx = loop.mock.receivedNotifications.findIndex((n) => n.method === "thread/goal/cleared");
     if (goalIdx >= 0) {
@@ -3396,6 +3400,73 @@ test("回环：resume 补发 tokenUsage 快照（上下文行数据源），响�
         "tokenUsage 补发应先于 goal 快照",
       );
     }
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：上下文占用 = 会话消息 char 数（新会话 0 基线，上限 257999，compact 后 200）", async () => {
+  const loop = await startLoop({ compactWaitMs: 60 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/ctxchars" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const lastUsage = () => {
+      const notifs = loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated");
+      return notifs[notifs.length - 1]!.params as {
+        tokenUsage: {
+          total: { totalTokens: number; inputTokens: number; outputTokens: number };
+          last: { totalTokens: number; inputTokens: number; outputTokens: number };
+        };
+      };
+    };
+    const lastCompletedAgentChars = () => {
+      const completions = loop.mock.receivedNotifications.filter((n) => n.method === "turn/completed");
+      const items = (completions[completions.length - 1]!.params as { turn: { items: Array<{ type: string; text?: string }> } }).turn.items;
+      return (items.find((i) => i.type === "agentMessage")?.text ?? "").length;
+    };
+
+    // 第 1 轮：新会话基线 0，已占用 = 本轮 user + agent 消息字符数
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "占用探测" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+    const u1 = lastUsage();
+    const agent1 = lastCompletedAgentChars();
+    assert.equal(u1.tokenUsage.total.totalTokens, "占用探测".length + agent1, "新会话首轮已占用 = user+agent 消息字符数");
+    assert.equal(u1.tokenUsage.total.inputTokens, "占用探测".length);
+    assert.equal(u1.tokenUsage.total.outputTokens, agent1);
+    assert.equal(u1.tokenUsage.last.totalTokens, "占用探测".length + agent1);
+
+    // compact：上下文重置为 200 基线
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("thread/compact/start", { threadId });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "compact turn 未完成",
+    );
+    assert.equal(lastUsage().tokenUsage.total.totalTokens, 200, "compact 后已占用应重置为 200 基线");
+
+    // 第 2 轮：在 200 基线上继续累加
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "再占用" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+    const agent3 = lastCompletedAgentChars();
+    assert.equal(
+      lastUsage().tokenUsage.total.totalTokens,
+      200 + "再占用".length + agent3,
+      "compact 后占用 = 200 基线 + 新消息字符",
+    );
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();

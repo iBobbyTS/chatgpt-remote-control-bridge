@@ -623,3 +623,17 @@ resume 响应 → tokenUsage 重放 → goal 快照 → idle lifecycle），sim 
 
 测试：rateLimits 双窗形状 + turn 后滚动更新顺序、resume 补发时序（响应先行 +
 归属最近完成 turn + 先于 goal 快照）共 2 项，全量 187/187。
+
+### 追记：上下文占用改为会话 char 计（2026-09-27）
+
+用户定义模拟规则：窗口总大小 258000；已占用 = 当前会话内消息字符数（上限
+257999）；新会话基线 0；compact 后自带 200 基线。实现：`ThreadState` 增
+`contextUserChars`/`contextAgentChars`/`contextBaseline`（均持久化，旧档缺省 0）；
+finishSimTurn 里 compact turn 重置三者（0/0/200，本轮内容不计），其余 turn 按本轮
+userMessage（content[].text 之和）与 agentMessage（text）字符累加；
+`contextUsageSnapshot`：total.totalTokens = min(基线+用户+agent, 257999)，input =
+基线+用户侧、output = agent 侧（相加恒等于 totalTokens），last = 本轮新增字符；
+`MODEL_CONTEXT_WINDOW` 258400 → 258000。goal 计量（GOAL_TURN_TOKENS 1234/轮）是
+thread/goal/updated 的独立轨道，不受影响。测试：resume 补发断言改为与实况快照一致
+（窗口 258000）+ 新增 char 计/compact 基线测试（首轮 = user+agent 字符、compact 后
+=200、再一轮 = 200+新字符），全量 188/188。

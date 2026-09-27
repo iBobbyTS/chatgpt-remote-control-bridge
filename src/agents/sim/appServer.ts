@@ -194,18 +194,26 @@ interface ThreadState {
    * turn ... filling the status line」——缺补发则 App 重连后上下文行显示不可用）。
    */
   tokenUsage: { turnId: string; usage: SimTokenUsage } | null;
+  /**
+   * 上下文占用（char 计，持久化）：已占用 = 会话内 userMessage/agentMessage 字符
+   * 数，上限 257999（窗口 258000 减 1）。新会话基线 0；compact 后重置为 200 基线
+   * （压缩摘要占位），此后按新消息字符继续累加。
+   */
+  contextUserChars: number;
+  contextAgentChars: number;
+  /** 上下文占用基线：新会话 0；compact 重置后 200。 */
+  contextBaseline: number;
 }
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null, contextUserChars: 0, contextAgentChars: 0, contextBaseline: 0 };
 }
 
-/** 模拟一轮 turn 的用量（静态合理值；last/total 同值，窗口上限取 MODEL_CONTEXT_WINDOW）。 */
-function simTokenUsage(): SimTokenUsage {
-  const oneTurn = { totalTokens: 1234, inputTokens: 1180, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 54, reasoningOutputTokens: 0 };
-  return { total: { ...oneTurn }, last: { ...oneTurn }, modelContextWindow: MODEL_CONTEXT_WINDOW };
-}
+/** 已占用 token 上限：窗口 258000 减 1。 */
+const CONTEXT_CHARS_MAX = 257_999;
+/** compact 后的上下文占用基线（压缩摘要占位）。 */
+const CONTEXT_BASELINE_AFTER_COMPACT = 200;
 
 type AnyParams = Record<string, any>;
 
@@ -345,6 +353,9 @@ export class SimApp extends EventEmitter implements AgentApp {
         items: ItemEntry[];
         goal?: SimGoal | null;
         tokenUsage?: { turnId: string; usage: SimTokenUsage } | null;
+        contextUserChars?: number;
+        contextAgentChars?: number;
+        contextBaseline?: number;
       }>;
       for (const entry of parsed) {
         if (entry?.thread?.id) {
@@ -361,6 +372,9 @@ export class SimApp extends EventEmitter implements AgentApp {
           const state = makeThreadState(entry.thread, entry.items ?? []);
           state.goal = entry.goal ?? null;
           state.tokenUsage = entry.tokenUsage ?? null;
+          state.contextUserChars = entry.contextUserChars ?? 0;
+          state.contextAgentChars = entry.contextAgentChars ?? 0;
+          state.contextBaseline = entry.contextBaseline ?? 0;
           this.threads.set(entry.thread.id, state);
         }
       }
@@ -370,7 +384,7 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /** 落盘快照：非 ephemeral 线程（persistState 与 reset 显式写共用同一形状）。 */
-  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[]; goal: SimGoal | null; tokenUsage: { turnId: string; usage: SimTokenUsage } | null }> {
+  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[]; goal: SimGoal | null; tokenUsage: { turnId: string; usage: SimTokenUsage } | null; contextUserChars: number; contextAgentChars: number; contextBaseline: number }> {
     return [...this.threads.values()]
       .filter((t) => !t.thread.ephemeral)
       .map((t) => ({
@@ -378,6 +392,9 @@ export class SimApp extends EventEmitter implements AgentApp {
         items: t.items,
         goal: t.goal,
         tokenUsage: t.tokenUsage,
+        contextUserChars: t.contextUserChars,
+        contextAgentChars: t.contextAgentChars,
+        contextBaseline: t.contextBaseline,
       }));
   }
 
@@ -1283,6 +1300,22 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.schedule(sim, () => emitDelta(0), this.opts.deltaIntervalMs);
   }
 
+  /**
+   * 上下文占用快照（v2/thread.rs:1895-1901 ThreadTokenUsage）：total=会话累计
+   * 占用（基线 + 用户/agent 消息 char 数，上限 257999；input=基线+用户侧字符，
+   * output=agent 侧字符，二者之和恒等于 totalTokens），last=本轮新增字符。
+   * 窗口上限取 MODEL_CONTEXT_WINDOW（258000）。
+   */
+  private contextUsageSnapshot(state: ThreadState, turnUserChars: number, turnAgentChars: number): SimTokenUsage {
+    const totalTokens = Math.min(state.contextBaseline + state.contextUserChars + state.contextAgentChars, CONTEXT_CHARS_MAX);
+    const inputTokens = Math.min(state.contextBaseline + state.contextUserChars, totalTokens);
+    return {
+      total: { totalTokens, inputTokens, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: totalTokens - inputTokens, reasoningOutputTokens: 0 },
+      last: { totalTokens: turnUserChars + turnAgentChars, inputTokens: turnUserChars, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: turnAgentChars, reasoningOutputTokens: 0 },
+      modelContextWindow: MODEL_CONTEXT_WINDOW,
+    };
+  }
+
   private finishSimTurn(state: ThreadState, status: "completed" | "interrupted" | "failed"): void {
     const sim = state.sim;
     if (!sim || sim.ended) return;
@@ -1319,8 +1352,28 @@ export class SimApp extends EventEmitter implements AgentApp {
         goal: state.goal,
       }, state.thread.id));
     }
+    // 上下文占用：compact 重置为 200 基线（压缩摘要占位，本轮内容不再累加）；
+    // 其余 turn 按本轮 userMessage/agentMessage 字符累加（新会话基线 0）。
+    let turnUserChars = 0;
+    let turnAgentChars = 0;
+    if (sim.kind === "compact") {
+      state.contextUserChars = 0;
+      state.contextAgentChars = 0;
+      state.contextBaseline = CONTEXT_BASELINE_AFTER_COMPACT;
+    } else {
+      for (const item of sim.turn.items) {
+        if (item.type === "userMessage") {
+          const chars = item.content.reduce((sum, c) => sum + c.text.length, 0);
+          state.contextUserChars += chars;
+          turnUserChars += chars;
+        } else if (item.type === "agentMessage") {
+          state.contextAgentChars += item.text.length;
+          turnAgentChars += item.text.length;
+        }
+      }
+    }
     // tokenUsage 快照：先记录到线程状态（resume 补发用，跨重启持久化），再广播。
-    const usage = simTokenUsage();
+    const usage = this.contextUsageSnapshot(state, turnUserChars, turnAgentChars);
     state.tokenUsage = { turnId: sim.turn.id, usage };
     this.emit("event", this.notification("thread/tokenUsage/updated", {
       threadId: state.thread.id,

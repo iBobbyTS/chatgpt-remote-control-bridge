@@ -172,7 +172,8 @@ export interface ItemEntry {
 
 export const CLI_VERSION = "0.157.0";
 export const DEFAULT_MODEL = "gpt-6-luna";
-export const MODEL_CONTEXT_WINDOW = 258_400;
+/** 上下文窗口总大小（tokenUsage.modelContextWindow）；已占用上限为其减 1（257999）。 */
+export const MODEL_CONTEXT_WINDOW = 258_000;
 
 /** 默认协作模式（mode default，settings.model 取线程模型，reasoning_effort medium）。 */
 export function defaultCollaborationMode(model: string): CollaborationMode {
