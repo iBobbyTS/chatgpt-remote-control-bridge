@@ -165,6 +165,13 @@ interface ThreadState {
    * （标 complete）。每次 goalSet 结果为 active 时归零（阶段重开）。
    */
   goalPhaseIndex: number;
+  /**
+   * 用户中止标记（内存态，不持久化）：turn/interrupt 后置位，下一个 turn 开跑时
+   * 清除。对齐 codex AgentStatus::Interrupted——中止后 thread/queue/add 的
+   * wake_if_loaded 跳过（排队消息不自动开跑，queue/service.rs:476-483），而
+   * goal 续跑不看 cause 照常进行（goal/extension.rs on_thread_idle 无 cause 检查）。
+   */
+  interrupted: boolean;
   /** compact 刚完成标记（内存态，不持久化）；下一个普通 turn 回复首行提示后清除。 */
   justCompacted: boolean;
   /** 后台终端（不持久化）：thread/shellCommand 完成后登记。 */
@@ -173,7 +180,7 @@ interface ThreadState {
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, justCompacted: false, backgroundTerminals: [] };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [] };
 }
 
 type AnyParams = Record<string, any>;
@@ -202,7 +209,7 @@ const HELP_TEXT = [
   'test queue：服务器会返回3次消息，中间使用模拟命令"wait 15 seconds"（不依赖shell），可以测试queue排队消息的效果。',
   "",
   "模拟功能（对齐 codex）：",
-  "goal 启用后自动续跑共4个goal turn（每个=1次模拟wait+1条输出；第2个turn的wait为30秒、其余10秒）：前3个后标记blocked，再次启动第4个后标记complete",
+  "goal 启用后自动续跑共4个goal turn（每个=1次模拟wait+1条输出；第2个turn的wait为30秒、其余10秒）：前3个后标记blocked，再次启动第4个后标记complete；turn运行中发消息会steer插入当前turn，停止/中止只结束当前turn、goal仍自动续跑，中止后排队消息不会自动开跑",
   "compact 约 5 秒完成且下一条回复标记",
   "Plan 模式回复带前缀",
   "shell 命令生成模拟命令条目",
@@ -887,6 +894,12 @@ export class SimApp extends EventEmitter implements AgentApp {
     const state = this.threadState(p);
     if (state.sim && !state.sim.ended) {
       this.finishSimTurn(state, "interrupted");
+      // 中止后线程空闲，on_thread_idle 以 Interrupted cause 触发（core/tasks/
+      // lifecycle.rs:58-83）：queue 扩展跳过（排队消息不自动开跑，queue/service.rs
+      // :551），goal 扩展不检查 cause 照常续跑（goal/extension.rs:180-193）。
+      // 故此处只续跑 goal，不 consumeQueue。
+      state.interrupted = true;
+      this.continueGoalIfIdle(state);
     }
     return {};
   }
@@ -902,6 +915,13 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.queue.push(queued);
     this.persistState();
     this.emitSoon("thread/queue/changed", { threadId: state.thread.id }, state.thread.id);
+    // 空闲线程入队即唤醒开跑（queue/service.rs enqueue → wake_if_loaded → idle
+    // lifecycle → dispatch_if_idle，一次一条）：线程忙时由当前 turn 收尾链的
+    // consumeQueue 消费；用户刚中止（Interrupted）时 wake 跳过，排队消息挂起
+    // 等待下一次 turn（queue/service.rs:476-483）。
+    if (!state.sim && !state.interrupted) {
+      this.consumeQueue(state);
+    }
     return { queuedSubmission: { id: queued.id, input, clientUserMessageId: queued.clientUserMessageId } };
   }
 
@@ -933,6 +953,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     turn.items = [];
     const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null };
     state.sim = sim;
+    state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
     // 标题生成 turn 的 preview 用提取的标题（手机以该 turn 的 JSON 输出更新任务标题）
@@ -1509,17 +1530,23 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   /**
    * goal 续跑检查（runtime.rs continue_if_idle / extension.rs on_thread_idle）：
-   * 线程空闲（无活动 turn、无排队消息）且 goal 仍为 active 时自动开跑一轮
-   * goal turn。codex 中该循环由 LLM 调 update_goal(complete|paused|blocked)
-   * 终止（tool.rs handle_update）；sim 无模型，goal turn 结束即标记 complete，
-   * 一次激活至多续跑一轮，循环有界。
+   * 线程空闲且 goal 仍为 active 时自动开跑一轮 goal turn。codex 的 continue_if_idle
+   * 不检查 app-server 消息队列、也不区分 idle cause（用户中止后照跑）——队列优先
+   * 由 hook 注册顺序保证（extensions.rs queue 先注册，Completed 空闲时队列先抢到
+   * idle；sim 中对应 consumeQueue 先 shift 队列，队列空才走到这里）。等待窗口的
+   * 回调重查仍保留队列检查：窗口内若队列非空（如 queue/add 唤醒在途），让位给
+   * 队列开跑，本轮 goal 续跑由队列消息的收尾链再触发。sim 无模型，goal turn 按
+   * 模拟脚本写终态（blocked/complete），循环有界。
    */
   private continueGoalIfIdle(state: ThreadState): void {
-    if (this.closed || state.sim || state.queue.length > 0) return;
+    if (this.closed || state.sim) return;
     if (!state.goal || state.goal.status !== "active") return;
     this.schedule(null, () => {
-      // 回调内重查：等待窗口内可能出现新 turn / 排队消息 / goal 被清除或暂停
-      if (this.closed || state.sim || state.queue.length > 0) return;
+      // 回调内重查：等待窗口内可能出现新 turn / 排队消息 / goal 被清除或暂停。
+      // 队列让位仅限非中止态：用户中止后 queue 扩展本身被跳过（Interrupted
+      // cause），goal 续跑不因队列非空而搁置，否则线程将无推进者。
+      if (this.closed || state.sim) return;
+      if (!state.interrupted && state.queue.length > 0) return;
       if (!state.goal || state.goal.status !== "active") return;
       this.beginGoalTurn(state);
     }, this.opts.stepDelayMs);
@@ -1563,6 +1590,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const round = (state.goalTurnCount += 1);
     const waitSeconds = round === 2 ? 30 : 10;
     state.sim = sim;
+    state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
     this.schedule(sim, () => {
@@ -1619,6 +1647,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     turn.items = [];
     const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "compact", goalEndStatus: null };
     state.sim = sim;
+    state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
 
@@ -1787,6 +1816,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     turn.items = [];
     const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null };
     state.sim = sim;
+    state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
     return sim;

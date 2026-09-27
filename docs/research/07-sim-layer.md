@@ -566,3 +566,32 @@ wait 按 turnId 区分），全量 182/182。
 时 3702（3 turn），complete 时 4936（4 turn）。steer/stop 只终止当前 goal turn，
 goal 仍 active 时继续续跑（对齐 codex：turn 停 ≠ goal 停）。测试重写为
 waitForGoalTurn 辅助 + 4 turn 链式断言，全量 182/182。
+
+### 追记：goal/queue 运行时用户插入消息的对齐复核（2026-09-26）
+
+用户问「codex 怎么处理 goal 运行时用户插入的消息」，对照源码复核后发现压缩前
+的 2c7893a 已实现活动期 turn/start 转 steer（turn_processor.rs start_or_steer_turn
+的 Steered 分支：注入当前 turn、返回同一 turn id）；本轮补齐的是其余三个真实差距：
+
+1. **turn/interrupt 后 goal 照常续跑**：codex 中止后 on_thread_idle 以 Interrupted
+   cause 触发（core/tasks/lifecycle.rs:58-83）——queue 扩展跳过（queue/service.rs
+   :551 cause 检查），goal 扩展不检查 cause 照常 continue_if_idle（goal/extension.rs
+   :180-193）。sim 原先 turnInterrupt 只 finishSimTurn，goal 链停摆；现补
+   `state.interrupted` 内存标志（AgentStatus::Interrupted 对应物，任一 turn 开跑
+   清除）+ 中止后调 continueGoalIfIdle。
+2. **空闲线程 queue/add 立即唤醒**：codex enqueue → wake_if_loaded → idle lifecycle
+   → dispatch_if_idle 一次一条开跑（queue/service.rs:278/472-483）；用户刚中止时
+   wake 检查 AgentStatus::Interrupted 跳过。sim 原先空闲入队会挂到下一个 turn 结束；
+   现入队后 `!state.sim && !state.interrupted` 即 consumeQueue。
+3. **continueGoalIfIdle 不再看队列**：codex continue_if_idle 本身不检查 app-server
+   队列（runtime.rs:425-523）；「队列优先」是 hook 注册顺序在 Completed 空闲上的
+   竞赛结果（extensions.rs:71 queue 先于 :76 goal）。sim 把队列检查从外层守卫移到
+   调度回调重查（且中止态下不因队列非空搁置 goal，否则线程无推进者），正常完成
+   路径仍由 consumeQueue 先 shift 队列保证队列优先。
+
+排队消息在 goal 链中的位置（T2 断言）：中止窗口入队 → 中止后 goal 续跑 g2 →
+g2 完成（Completed idle）→ 队列先跑排队 turn（作为普通用户 turn 计量 +1234，
+goal 保持 active）→ 队列空 → goal 续跑 g3 → blocked。测试：queue/delete 改为
+turn 运行窗口内验证（空闲入队现在会立即开跑）、新增 goal turn 内 turn/start 转
+steer（同一 turn、userMessage 挂 goal turn、steer 回复在前 goal 消息在后、每 turn
+计量不变、无新 turn）、中止后续跑 + 队列时序、空闲入队唤醒共 4 项，全量 185/185。
