@@ -850,6 +850,44 @@ export class MockWhamServer {
     });
   }
 
+  /**
+   * 以模拟手机身份**分块**下发一个 JSON-RPC 请求（复现大消息
+   * client_message_chunk 路径）。每段对各自字节区间独立 base64（对齐 codex
+   * segment.rs decode_slice）；splitAt 为第一段字节边界——用非 3 倍数边界
+   * 复现段尾 padding（拼接 base64 字符串后整体解码会在此截断）。
+   */
+  rpcChunked(method: string, params: unknown, splitAt?: number, timeoutMs = 30_000): Promise<JsonRpcMessage> {
+    const id = this.nextRpcId++;
+    const message: JsonRpcMessage = { jsonrpc: "2.0", id, method, params };
+    const raw = Buffer.from(JSON.stringify(message), "utf8");
+    const boundary = Math.min(Math.max(splitAt ?? Math.floor(raw.length / 2), 1), raw.length - 1);
+    const parts = [raw.subarray(0, boundary), raw.subarray(boundary)];
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(String(id));
+        reject(new Error(`rpc(chunked) ${method} 超时`));
+      }, timeoutMs);
+      this.pending.set(String(id), {
+        method,
+        resolve: (msg) => resolve(msg),
+        timer,
+      });
+      parts.forEach((part, i) => {
+        this.sendClientEnvelope({
+          type: "client_message_chunk",
+          client_id: this.mobileClientId,
+          stream_id: this.mobileStreamId,
+          seq_id: 10_000 + id,
+          segment_id: i,
+          segment_count: parts.length,
+          message_size_bytes: raw.length,
+          message_chunk_base64: part.toString("base64"),
+        });
+      });
+      this.log(`→ codex ${method} (chunked id=${id})`);
+    });
+  }
+
   /** 以模拟手机身份发送一个 ping 帧（codex 应答 pong）。 */
   sendPing(streamId = this.mobileStreamId): void {
     this.sendClientEnvelope({

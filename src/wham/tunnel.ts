@@ -653,7 +653,13 @@ export class WhamTunnel extends EventEmitter {
     }
   }
 
-  /** 分片重组（手机大消息会走 client_message_chunk，base64 分段）。 */
+  /**
+   * 分片重组（手机大消息会走 client_message_chunk）。对齐 codex segment.rs
+   * observe()：每段 base64 **独立解码**后按字节拼接——段边界非 3 字节倍数时段尾
+   * 带 padding，先拼 base64 字符串再一次解码会在首个 padding 处截断（真机
+   * 2026-09-27T05:40Z：204657B 文件两段上传只解出 102329B，JSON 截断即此因）；
+   * 拼接后按 message_size_bytes 校验总长，再从字节流解析 JSON。
+   */
   private handleChunk(envelope: ClientEnvelope): void {
     const key = `${envelope.client_id}/${envelope.stream_id ?? ""}`;
     let segments = this.chunkReassembler.get(key);
@@ -668,9 +674,12 @@ export class WhamTunnel extends EventEmitter {
       .sort(([a], [b]) => a - b)
       .map(([, seg]) => seg.message_chunk_base64 ?? "");
     try {
-      const message = JSON.parse(
-        Buffer.from(ordered.join(""), "base64").toString("utf8"),
-      ) as JsonRpcMessage;
+      const raw = Buffer.concat(ordered.map((seg) => Buffer.from(seg, "base64")));
+      const declared = envelope.message_size_bytes;
+      if (typeof declared === "number" && declared > 0 && raw.length !== declared) {
+        throw new Error(`size mismatch: decoded ${raw.length} bytes, declared ${declared}`);
+      }
+      const message = JSON.parse(raw.toString("utf8")) as JsonRpcMessage;
       void this.dispatchMessage(
         {
           ...envelope,

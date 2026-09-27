@@ -532,6 +532,25 @@ test("回环：fs/writeFile 附件落盘 files/ + 图片 exiftool 回执 + 其�
   }
 });
 
+test("回环：client_message_chunk 逐段独立 base64 重组（段边界 padding 不截断）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    // 分块边界 17 字节（17%3=2 → 第一段 base64 带 padding）：拼 base64 字符串后
+    // 整体解码会在 padding 处截断（真机 2026-09-27T05:40Z 204KB 上传失败根因，
+    // 只解出 102329/204657 字节），逐段独立解码后按字节拼接应成功
+    const resp = (await loop.mock.rpcChunked("fs/writeFile", {
+      path: "/tmp/codex-remote-attachments/01chunk0000-0000-7000-8000-000000000000/AAA/small.png",
+      dataBase64: Buffer.from("x".repeat(50)).toString("base64"),
+    }, 17)) as { result: Record<string, unknown>; error?: unknown };
+    assert.deepEqual(resp.result, {});
+    assert.equal(resp.error, undefined);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("turn/start 派发期间不得发射 turn 通知（响应先行的应用层契约）", async () => {
   const dir = await tempDir("order-app");
   const app = new SimApp({ codexHome: dir, stepDelayMs: 10, deltaIntervalMs: 2, deltaChars: 64 });
