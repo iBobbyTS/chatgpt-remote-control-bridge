@@ -18,7 +18,8 @@ import { makeTestJwt } from "../src/auth/jwt.ts";
 import { writeAuthStore, type AuthDotJson } from "../src/auth/store.ts";
 import { MockWhamServer } from "../src/wham/mockServer.ts";
 import { WhamTunnel } from "../src/wham/tunnel.ts";
-import { SimApp } from "../src/agents/sim/appServer.ts";
+import { SimApp, isValidBase64 } from "../src/agents/sim/appServer.ts";
+import { randomBytes } from "node:crypto";
 import { simInit, simReset, simStatePath, simStoreInitialized } from "../src/agents/sim/store.ts";
 
 const cleanupDirs: string[] = [];
@@ -545,10 +546,32 @@ test("回环：client_message_chunk 逐段独立 base64 重组（段边界 paddi
     }, 17)) as { result: Record<string, unknown>; error?: unknown };
     assert.deepEqual(resp.result, {});
     assert.equal(resp.error, undefined);
+
+    // 8MB 文件量级（真机 2026-09-27T05:58Z 11.4MB 分块上传曾因 base64 校验正则
+    // 爆栈报 sim internal error）：1MB base64 经分块通道应正常落盘应答
+    const big = Buffer.from(randomBytes(750_000)).toString("base64");
+    const bigResp = (await loop.mock.rpcChunked("fs/writeFile", {
+      path: "/tmp/codex-remote-attachments/01chunk0000-0000-7000-8000-000000000000/AAA/big.bin",
+      dataBase64: big,
+    })) as { result: Record<string, unknown>; error?: { code: number; message: string } };
+    assert.deepEqual(bigResp.result, {});
+    assert.equal(bigResp.error, undefined);
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
   }
+});
+
+test("isValidBase64：11MB 级字符串线性校验不爆栈（正则曾 Maximum call stack）", () => {
+  // 对齐真机失败量级：8MB 文件 ≈ 11.4MB base64
+  assert.equal(isValidBase64("A".repeat(11_459_876)), true);
+  assert.equal(isValidBase64(Buffer.from("hello attachment").toString("base64")), true);
+  assert.equal(isValidBase64(""), false);
+  assert.equal(isValidBase64("!!!"), false);
+  assert.equal(isValidBase64("AAA"), false); // 长度非 4 倍数
+  assert.equal(isValidBase64("AA=="), true);
+  assert.equal(isValidBase64("A==="), false); // 超过 2 个 padding
+  assert.equal(isValidBase64("AAAA" + "!"), false);
 });
 
 test("turn/start 派发期间不得发射 turn 通知（响应先行的应用层契约）", async () => {

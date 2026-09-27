@@ -363,6 +363,30 @@ const EXIFTOOL_CANDIDATES = [
   "/usr/local/bin/exiftool",
 ].filter((v): v is string => typeof v === "string" && v.length > 0);
 
+/**
+ * 校验标准 base64（长度 4 倍数、至多 2 个结尾 =、字符集 [A-Za-z0-9+/]）。
+ * 线性扫描而非正则——分组量词正则（如 (?:…{4})*）在 V8 中按次递归回溯，
+ * 8MB 文件的 ~11MB base64 会直接 Maximum call stack size exceeded
+ * （真机 2026-09-27T05:58Z 复现），charCodeAt 循环为 O(n) 常数栈。
+ */
+export function isValidBase64(s: string): boolean {
+  if (s.length === 0 || s.length % 4 !== 0) return false;
+  let end = s.length;
+  if (s[end - 1] === "=") end -= 1;
+  if (s[end - 1] === "=") end -= 1;
+  if (s.length - end > 2) return false;
+  for (let i = 0; i < end; i++) {
+    const c = s.charCodeAt(i);
+    if (
+      !(c >= 65 && c <= 90) && !(c >= 97 && c <= 122) &&
+      !(c >= 48 && c <= 57) && c !== 43 && c !== 47
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
 /** 执行 exiftool 取全量元数据文本；失败（缺二进制/无法识别）返回 null。 */
 async function runExiftool(file: string): Promise<string | null> {
   for (const bin of EXIFTOOL_CANDIDATES) {
@@ -2727,10 +2751,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       throw new SimMethodError(-32602, "fs/writeFile requires an absolute path");
     }
     const data = p.dataBase64;
-    if (
-      typeof data !== "string" ||
-      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
-    ) {
+    if (typeof data !== "string" || !isValidBase64(data)) {
       throw new SimMethodError(-32600, "fs/writeFile requires valid base64 dataBase64: Invalid byte");
     }
     const bytes = Buffer.from(data, "base64");
