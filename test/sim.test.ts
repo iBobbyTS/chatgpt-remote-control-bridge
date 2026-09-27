@@ -328,6 +328,112 @@ test("回环：model/list 三模型目录 + 新线程默认模型/思考强度�
   }
 });
 
+test("回环：工作模式（approval/sandbox）接收 → 回复标注 + 回显", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+
+    // thread/start 带 Full Access（never + danger-full-access 模式名字符串）→ 归一化进上下文
+    const started = (await loop.mock.rpc("thread/start", {
+      cwd: "/tmp-sim/approval",
+      approvalPolicy: "never",
+      approvalsReviewer: "user",
+      sandbox: "danger-full-access",
+    })) as {
+      result: {
+        approvalPolicy: string;
+        approvalsReviewer: string;
+        sandbox: { type: string };
+        thread: { id: string };
+      };
+    };
+    assert.equal(started.result.approvalPolicy, "never");
+    assert.equal(started.result.approvalsReviewer, "user");
+    assert.equal(started.result.sandbox.type, "dangerFullAccess");
+    const threadId = started.result.thread.id;
+
+    // 首条回复标注 Full Access
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "模式一" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/completed")),
+      5000,
+      "turn1 未完成",
+    );
+    const reply1 = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.ok(
+      String(reply1.params.item.text).includes("Full Access"),
+      `回复应含 Full Access：${String(reply1.params.item.text).split("\n")[0]}`,
+    );
+
+    // settings/update 切 Approve for me（on-request + auto-review + workspaceWrite）：回显实值
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("thread/settings/update", {
+      threadId,
+      approvalPolicy: "on-request",
+      approvalsReviewer: "auto-review",
+      sandboxPolicy: { type: "workspaceWrite" },
+    });
+    const settingsUpdated = findNotif(loop, "thread/settings/updated")!;
+    assert.equal(settingsUpdated.params.threadSettings.approvalPolicy, "on-request");
+    assert.equal(settingsUpdated.params.threadSettings.approvalsReviewer, "auto-review");
+    assert.equal(settingsUpdated.params.threadSettings.sandboxPolicy.type, "workspaceWrite");
+
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "模式二" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/completed")),
+      5000,
+      "turn2 未完成",
+    );
+    const reply2 = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.ok(
+      String(reply2.params.item.text).includes("Approve for me"),
+      `回复应含 Approve for me：${String(reply2.params.item.text).split("\n")[0]}`,
+    );
+
+    // turn/start 覆盖 read-only → Custom（粘性：resume 也回显 readOnly）
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "模式三" }],
+      approvalPolicy: "on-request",
+      sandboxPolicy: { type: "readOnly" },
+    });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/completed")),
+      5000,
+      "turn3 未完成",
+    );
+    const reply3 = findNotif(
+      loop,
+      "item/completed",
+      (p) => p.item.type === "agentMessage",
+    )!;
+    assert.ok(
+      String(reply3.params.item.text).includes("Custom"),
+      `回复应含 Custom：${String(reply3.params.item.text).split("\n")[0]}`,
+    );
+
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId })) as {
+      result: { approvalPolicy: string; sandbox: { type: string } };
+    };
+    assert.equal(resumed.result.approvalPolicy, "on-request");
+    assert.equal(resumed.result.sandbox.type, "readOnly");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("turn/start 派发期间不得发射 turn 通知（响应先行的应用层契约）", async () => {
   const dir = await tempDir("order-app");
   const app = new SimApp({ codexHome: dir, stepDelayMs: 10, deltaIntervalMs: 2, deltaChars: 64 });
@@ -3927,8 +4033,9 @@ test("直连：活动 turn 冻结 ephemeral 卸载——turn 结束后才开始�
     assert.ok(mid.result, "活动 turn 期间不得卸载");
 
     // turn 完成（is_active 翻 false）→ 计时启动 → 超时卸载
+    // （轮询上限 200×30ms：回复含工作模式行后流式时长增加，原 100 次贴上限偶超时）
     let completed = false;
-    for (let i = 0; i < 100 && !completed; i++) {
+    for (let i = 0; i < 200 && !completed; i++) {
       const turns = (await app.handleRequest(key, 100 + i, "thread/turns/list", { threadId })) as {
         result?: { data: Array<{ id: string; status: string }> };
       };

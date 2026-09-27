@@ -155,6 +155,12 @@ export interface ThreadRecord {
   reasoningEffort: string;
   /** 生效协作模式（thread/settings/update 或 turn/start 写入；resume 返回实值）。 */
   collaborationMode: CollaborationMode;
+  /** 生效审批策略（AskForApproval wire 值；thread/start、thread/settings/update、turn/start 写入）。 */
+  approvalPolicy: string;
+  /** 生效审批审阅人（ApprovalsReviewer wire 值：user | auto-review）。 */
+  approvalsReviewer: string;
+  /** 生效沙箱策略（归一化 SandboxPolicy；thread/start.sandbox 模式名会被归一化）。 */
+  sandboxPolicy: SandboxPolicyRecord;
   createdAt: number;
   updatedAt: number;
   recencyAt: number;
@@ -211,6 +217,56 @@ export function defaultCollaborationMode(model: string): CollaborationMode {
     mode: "default",
     settings: { model, reasoning_effort: defaultReasoningEffortFor(model), developer_instructions: null },
   };
+}
+
+/** 归一化沙箱策略；type 为 readOnly | workspaceWrite | dangerFullAccess。 */
+export interface SandboxPolicyRecord {
+  type: string;
+  writableRoots?: string[];
+  networkAccess?: boolean;
+  excludeTmpdirEnvVar?: boolean;
+  excludeSlashTmp?: boolean;
+}
+
+/** 把 wire 沙箱值归一化：模式名字符串（thread/start.sandbox）或对象（sandboxPolicy）→ 统一对象；形状不符返回 null。 */
+export function normalizeSandboxPolicy(value: unknown): SandboxPolicyRecord | null {
+  if (typeof value === "string") {
+    const types: Record<string, string> = {
+      "read-only": "readOnly",
+      "workspace-write": "workspaceWrite",
+      "danger-full-access": "dangerFullAccess",
+    };
+    const type = types[value];
+    return type ? { type } : null;
+  }
+  if (
+    value != null &&
+    typeof value === "object" &&
+    typeof (value as { type?: unknown }).type === "string"
+  ) {
+    return value as SandboxPolicyRecord;
+  }
+  return null;
+}
+
+/**
+ * 手机端 4 个工作模式的展示名，对齐 codex TUI 预设标签（permissions_menu.rs:
+ * 195-198 + approval-presets）："auto" 预设（workspace-write + on-request）按审阅人
+ * 分 Ask for approval（user）/ Approve for me（auto-review）；danger-full-access +
+ * never 为 Full Access；其余（read-only、自定义可写根、granular 等）归 Custom。
+ */
+export function approvalModeLabel(
+  approvalPolicy: string,
+  approvalsReviewer: string,
+  sandboxPolicy: SandboxPolicyRecord,
+): string {
+  if (sandboxPolicy.type === "workspaceWrite" && approvalPolicy === "on-request") {
+    return approvalsReviewer === "auto-review" ? "Approve for me" : "Ask for approval";
+  }
+  if (sandboxPolicy.type === "dangerFullAccess" && approvalPolicy === "never") {
+    return "Full Access";
+  }
+  return "Custom";
 }
 
 // ------------------------------------------------------------- 固定目录数据
@@ -367,6 +423,9 @@ export function makeThread(args: {
     model: DEFAULT_MODEL,
     reasoningEffort: defaultReasoningEffortFor(DEFAULT_MODEL),
     collaborationMode: defaultCollaborationMode(DEFAULT_MODEL),
+    approvalPolicy: "on-request",
+    approvalsReviewer: "user",
+    sandboxPolicy: { type: "workspaceWrite" },
     createdAt: args.createdAt ?? now,
     updatedAt: args.createdAt ?? now,
     recencyAt: args.createdAt ?? now,

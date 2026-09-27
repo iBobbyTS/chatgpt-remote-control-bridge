@@ -12,11 +12,13 @@ import { homedir, release } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 import {
+  approvalModeLabel,
   CLI_VERSION,
   COLLABORATION_MODES,
   DEFAULT_MODEL,
   MODELS,
   MODEL_CONTEXT_WINDOW,
+  normalizeSandboxPolicy,
   PLUGINS,
   SECTIONS,
   SKILLS,
@@ -398,6 +400,9 @@ export class SimApp extends EventEmitter implements AgentApp {
           if (!entry.thread.collaborationMode) {
             entry.thread.collaborationMode = defaultCollaborationMode(entry.thread.model ?? DEFAULT_MODEL);
           }
+          entry.thread.approvalPolicy ??= "on-request";
+          entry.thread.approvalsReviewer ??= "user";
+          entry.thread.sandboxPolicy ??= { type: "workspaceWrite" };
           entry.thread.forkedFromId ??= null;
           entry.thread.projectId ??= null;
           entry.thread.gitInfo ??= null;
@@ -830,6 +835,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     // ephemeral:true = 手机端的「起名线程」：仅内存、不落盘、不进列表
     thread.ephemeral = p.ephemeral === true;
     if (p.model) thread.model = p.model;
+    this.applyApprovalMode(thread, p);
     this.threads.set(thread.id, makeThreadState(thread, []));
     if (!thread.ephemeral) {
       this.persistState();
@@ -854,18 +860,24 @@ export class SimApp extends EventEmitter implements AgentApp {
       cwd: thread.cwd,
       runtimeWorkspaceRoots: [thread.cwd],
       instructionSources: [],
-      approvalPolicy: "on-request",
-      approvalsReviewer: "user",
-      sandbox: {
-        type: "workspaceWrite",
-        writableRoots: [],
-        networkAccess: false,
-        excludeTmpdirEnvVar: false,
-        excludeSlashTmp: false,
-      },
+      approvalPolicy: thread.approvalPolicy,
+      approvalsReviewer: thread.approvalsReviewer,
+      sandbox: this.sandboxWireOf(thread),
       activePermissionProfile: null,
       reasoningEffort: thread.reasoningEffort,
       multiAgentMode: "explicitRequestOnly",
+    };
+  }
+
+  /** SandboxPolicy 完整 wire 形状（threadContext.sandbox 与 settings/updated 共用；可选字段缺省补 false/空）。 */
+  private sandboxWireOf(thread: ThreadRecord): Record<string, unknown> {
+    const sb = thread.sandboxPolicy;
+    return {
+      type: sb.type,
+      writableRoots: sb.writableRoots ?? [],
+      networkAccess: sb.networkAccess ?? false,
+      excludeTmpdirEnvVar: sb.excludeTmpdirEnvVar ?? false,
+      excludeSlashTmp: sb.excludeSlashTmp ?? false,
     };
   }
 
@@ -972,6 +984,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (p.effort) state.thread.reasoningEffort = p.effort;
     if (p.cwd) state.thread.cwd = p.cwd;
     this.applyCollaborationMode(state, p);
+    this.applyApprovalMode(state.thread, p);
     this.persistState();
     this.emitSoon(
       "thread/settings/updated",
@@ -980,15 +993,9 @@ export class SimApp extends EventEmitter implements AgentApp {
         threadSettings: {
           disabledPluginIds: [],
           cwd: state.thread.cwd,
-          approvalPolicy: "on-request",
-          approvalsReviewer: "user",
-          sandboxPolicy: {
-            type: "workspaceWrite",
-            writableRoots: [],
-            networkAccess: false,
-            excludeTmpdirEnvVar: false,
-            excludeSlashTmp: false,
-          },
+          approvalPolicy: state.thread.approvalPolicy,
+          approvalsReviewer: state.thread.approvalsReviewer,
+          sandboxPolicy: this.sandboxWireOf(state.thread),
           activePermissionProfile: null,
           model: state.thread.model,
           // ThreadSettings.collaboration_mode 非 optional（v2/thread.rs:304-335）
@@ -1027,7 +1034,7 @@ export class SimApp extends EventEmitter implements AgentApp {
             : typeof settings.reasoning_effort === "string"
               ? settings.reasoning_effort
               : current.reasoning_effort,
-        developer_instructions:
+          developer_instructions:
           settings.developer_instructions === null
             ? null
             : typeof settings.developer_instructions === "string"
@@ -1035,6 +1042,19 @@ export class SimApp extends EventEmitter implements AgentApp {
               : current.developer_instructions,
       },
     };
+  }
+
+  /**
+   * 解析并落线程审批/沙箱策略（thread/start、thread/settings/update、turn/start
+   * 共用）。与 collaborationMode 同为粘性覆盖（"for this turn and subsequent
+   * turns"）：字段缺省（undefined/null）→ 不变。thread/start 的 sandbox 为模式名
+   * 字符串，turn/start 与 settings/update 的 sandboxPolicy 为对象，两者都收。
+   */
+  private applyApprovalMode(thread: ThreadRecord, p: AnyParams): void {
+    if (typeof p.approvalPolicy === "string") thread.approvalPolicy = p.approvalPolicy;
+    if (typeof p.approvalsReviewer === "string") thread.approvalsReviewer = p.approvalsReviewer;
+    const sandbox = normalizeSandboxPolicy(p.sandboxPolicy ?? p.sandbox);
+    if (sandbox) thread.sandboxPolicy = sandbox;
   }
 
   // ------------------------------------------------------------- turn 模拟
@@ -1052,6 +1072,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       throw new SimMethodError(-32603, "failed to submit turn input: ActiveTurnNotSteerable { turn_kind: Compact }");
     }
     this.applyCollaborationMode(state, p);
+    this.applyApprovalMode(state.thread, p);
     if (state.sim && !state.sim.ended) {
       // 活动期 turn/start 转 steer：对齐 codex start_or_steer_turn
       // （turn_processor.rs:651-684，TurnInputSubmission::Steered）——输入注入当前
@@ -1574,6 +1595,8 @@ export class SimApp extends EventEmitter implements AgentApp {
       `- 线程：${thread.id}`,
       `- 工作目录：${thread.cwd}`,
       `- 模型：${thread.model}（模拟）`,
+      `- 工作模式：${approvalModeLabel(thread.approvalPolicy, thread.approvalsReviewer, thread.sandboxPolicy)}` +
+        `（approval=${thread.approvalPolicy} · sandbox=${thread.sandboxPolicy.type} · reviewer=${thread.approvalsReviewer}）`,
       "",
       "用于验证手机 → wham 后端 → 桥 → 手机的完整数据链路。",
     ].join("\n");
@@ -2201,6 +2224,9 @@ export class SimApp extends EventEmitter implements AgentApp {
       mode: source.thread.collaborationMode.mode,
       settings: { ...source.thread.collaborationMode.settings },
     };
+    fork.approvalPolicy = source.thread.approvalPolicy;
+    fork.approvalsReviewer = source.thread.approvalsReviewer;
+    fork.sandboxPolicy = { ...source.thread.sandboxPolicy };
     fork.projectId = source.thread.projectId;
     fork.forkedFromId = source.thread.id;
     fork.ephemeral = p.ephemeral === true;
