@@ -102,7 +102,7 @@ reset/logout 在 daemon 运行时经 IPC 由 daemon 执行：停自动刷新 →
 
 ```
 ~/.cgrcb/
-  config.json                 守护进程配置（各 agent 开关）
+  config.json                 守护进程配置（各 agent 开关；logFrames=true 开启 wham 帧日志，默认关）
   home/auth.json              上游登录凭证
   instances/<agent>/          每实例目录：
       installation_id         上游身份（enroll/refresh/REST/WSS 同源）
@@ -110,10 +110,14 @@ reset/logout 在 daemon 运行时经 IPC 由 daemon 执行：停自动刷新 →
       enrollment.json         server_id/environment_id/token
       pairing.json            配对 pending
       lifecycle.json          {everEnrolled}
+      frames.jsonl            wham 双向帧日志（仅 logFrames=true 时写；64MB 单代轮转，0600）
   daemon.sock                 本地 IPC socket
   daemon.sock.lock            单实例互斥锁（勿手写/勿删）
-  logs/                       launchd stdout/stderr 日志
+  logs/                       launchd stdout/stderr 日志（daemon 启动时超限截断 64MB）
 ```
+
+> 帧日志含完整会话内容，增速快（真机实测 ~200MB/天），故默认关闭；需要真机排障时在
+> `config.json` 加 `"logFrames": true` 后 `cgrcb restart`。
 
 ## 故障排查
 

@@ -34,6 +34,12 @@ export interface AgentConfig {
 export interface CgrcbConfig {
   version: number;
   agents: Record<string, AgentConfig>;
+  /**
+   * wham 双向帧日志（instances/<agent>/frames.jsonl，64MB 单代轮转）开关。
+   * 默认关（AUD-002：帧日志含完整会话内容，仅真机排障需要时打开）；
+   * 修改后 `cgrcb restart` 生效。daemon 构造参数显式注入的 jsonlPath 优先于本开关。
+   */
+  logFrames?: boolean;
   /** 宽松向前兼容：未知顶层字段原样保留。 */
   [key: string]: unknown;
 }

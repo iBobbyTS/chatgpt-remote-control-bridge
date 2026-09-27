@@ -9,7 +9,7 @@
  * 全部临时目录落 .agent-work/tmp/（CGRCB_HOME 指向临时目录），wham 用 MockWhamServer。
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { test, after } from "node:test";
 import { getAgent, registerAgent, resetAgents } from "../src/agents/registry.ts";
@@ -368,5 +368,65 @@ test("S03 BLOCKER2 IPC agent-reset：state.json 落盘失败 → 返回失败而
   } finally {
     await daemon.shutdown();
     await mock.stop();
+  }
+});
+
+// ------------------------------------------------------------ AUD-002 帧日志开关
+
+test("AUD-002 帧日志开关：默认关不写 frames.jsonl；config logFrames=true 开启", async () => {
+  async function bootWithFramesConfig(
+    slug: string,
+    logFrames: boolean | undefined,
+  ): Promise<{ framePath: string; online: Promise<void>; daemon: CgrcbDaemon; mock: MockWhamServer; socketPath: string }> {
+    const mock = await startMock();
+    const home = await tempDir(slug);
+    const paths = cgrcbPaths(home);
+    await writeAuthStore(paths.codexHome, fakeAuth());
+    if (logFrames !== undefined) {
+      await writeConfig(paths.configPath, { version: 1, agents: {}, logFrames });
+    }
+    const daemon = makeDaemon(home, mock);
+    await daemon.start();
+    const enable = await requestIpc(paths.socketPath, "enable", { agent: "sim" });
+    assert.equal(enable.ok, true, JSON.stringify(enable));
+    const online = waitFor(
+      async () => (await ipcAgentStatus(paths.socketPath, "sim")).online,
+      5000,
+      "sim online",
+    );
+    return { framePath: join(paths.instancesDir, "sim", "frames.jsonl"), online, daemon, mock, socketPath: paths.socketPath };
+  }
+
+  // 默认（无 logFrames 字段）：不写帧日志
+  const off = await bootWithFramesConfig("simd-frames-off", undefined);
+  try {
+    await off.online;
+    await off.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    assert.equal(
+      await stat(off.framePath).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      "默认关：实例目录不得出现 frames.jsonl",
+    );
+  } finally {
+    await off.daemon.shutdown();
+    await off.mock.stop();
+  }
+
+  // config logFrames=true：写帧日志
+  const on = await bootWithFramesConfig("simd-frames-on", true);
+  try {
+    await on.online;
+    await on.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    await waitFor(
+      () => stat(on.framePath).then(() => true, () => false),
+      5000,
+      "开启后应写 frames.jsonl",
+    );
+  } finally {
+    await on.daemon.shutdown();
+    await on.mock.stop();
   }
 });

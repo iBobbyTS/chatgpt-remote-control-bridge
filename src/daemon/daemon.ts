@@ -521,8 +521,11 @@ export class CgrcbDaemon {
       name,
       appServerVersion: this.opts.appServerVersion,
       installationDir: dir,
-      // 帧级日志默认落实例目录（真机问题定位依赖双向帧记录；可用 opts.jsonlPath 覆盖）
-      jsonlPath: this.opts.jsonlPath ?? join(dir, "frames.jsonl"),
+      // 帧级日志：显式注入优先（测试/调试）；否则 config.json logFrames=true 才写实例目录
+      // （AUD-002：帧日志含完整会话内容且增速快，默认关，真机排障时打开）
+      jsonlPath:
+        this.opts.jsonlPath ??
+        (this.config.logFrames === true ? join(dir, "frames.jsonl") : undefined),
       log: (line) => this.logLine(`[${inst.id}] ${line}`),
       reconnectDelayMs: this.opts.reconnectDelayMs,
       pingIntervalMs: this.opts.pingIntervalMs,
