@@ -76,6 +76,7 @@ async function startLoop(
     deltaChars?: number;
     compactWaitMs?: number;
     shellWaitMs?: number;
+    threadUnloadDelayMs?: number;
   } = {},
 ): Promise<Loop> {
   const authHome = await tempDir("home");
@@ -2846,7 +2847,7 @@ test("S03-F branch：metadata/update 双层语义、错误文案、fork 截断�
 
     // fork 截至第一轮
     const fork = (await loop.mock.rpc("thread/fork", { threadId, lastTurnId: t1.result.turn.id })) as {
-      result: { thread: { id: string; turns: unknown[]; forkedFromId: string } } & Record<string, unknown>;
+      result: { thread: { id: string; turns: unknown[]; forkedFromId: string; preview: string } } & Record<string, unknown>;
     };
     assert.notEqual(fork.result.thread.id, threadId);
     assert.equal(fork.result.thread.forkedFromId, threadId);
@@ -2870,6 +2871,20 @@ test("S03-F branch：metadata/update 双层语义、错误文案、fork 截断�
         "thread",
       ],
       "ForkResponse 顶层 14 键",
+    );
+    // preview = 截断后继承历史的首条用户消息（thread_processor.rs:6219
+    // preview_from_rollout_items；非 ephemeral 分支 :5115-5123）
+    assert.equal(fork.result.thread.preview, "第一轮");
+    // lastTurnId 截断把快照所属 turn（第二轮）截掉 → 不补发 restored usage
+    // （codex 从 fork 自己的截断历史恢复；sim 宁缺毋滥不回溯，见 threadFork 注释）
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(
+      !loop.mock.receivedNotifications.some(
+        (n) =>
+          n.method === "thread/tokenUsage/updated" &&
+          (n.params as { threadId: string }).threadId === fork.result.thread.id,
+      ),
+      "截断掉快照所属 turn 的 fork 不得补发 restored usage",
     );
     // fork 历史段：以**过滤后继承的 items** 为准——lastTurnId 截断后只剩
     // 「第一轮」的用户消息（「第二轮」不在段内，模拟回复不含）
@@ -2899,10 +2914,43 @@ test("S03-F branch：metadata/update 双层语义、错误文案、fork 截断�
     assert.equal(badTurn.error?.message, "unknown turn id: unknown-turn");
 
     // ephemeral fork 不进列表
+    loop.mock.receivedEnvelopeLog.length = 0; // 只考察 fork 后的信封顺序
     const eph = (await loop.mock.rpc("thread/fork", { threadId, ephemeral: true })) as {
-      result: { thread: { id: string; ephemeral: boolean } };
+      id: number | string;
+      result: { thread: { id: string; ephemeral: boolean; preview: string } };
     };
     assert.equal(eph.result.thread.ephemeral, true);
+    // 全量 fork（无 excludeTurns/lastTurnId）→ 响应先行 + restored usage 补发 +
+    // thread/started 广播，三者信封顺序对齐 thread_processor.rs:5355-5376
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) =>
+            n.method === "thread/started" &&
+            (n.params as { thread: { id: string } }).thread.id === eph.result.thread.id,
+        ),
+      2000,
+      "eph fork 的 thread/started 未收到",
+    );
+    const ephLog = loop.mock.receivedEnvelopeLog;
+    const ephRespIdx = ephLog.findIndex(
+      (e) => e.kind === "response" && String(e.id) === String(eph.id),
+    );
+    const ephUsageIdx = ephLog.findIndex(
+      (e) => e.kind === "notification" && e.method === "thread/tokenUsage/updated",
+    );
+    const ephStartedIdx = ephLog.findIndex(
+      (e) => e.kind === "notification" && e.method === "thread/started",
+    );
+    assert.ok(ephRespIdx >= 0, "fork 响应应在时序日志中");
+    assert.ok(ephUsageIdx > ephRespIdx, "restored usage 补发必须晚于 fork 响应");
+    assert.ok(ephStartedIdx > ephUsageIdx, "thread/started 应晚于 restored usage 补发");
+    const ephUsage = loop.mock.receivedNotifications.find(
+      (n) =>
+        n.method === "thread/tokenUsage/updated" &&
+        (n.params as { threadId: string }).threadId === eph.result.thread.id,
+    )!.params as { turnId: string };
+    assert.equal(ephUsage.turnId, t2.result.turn.id, "补发应归属源线程最后完成的 turn");
     const list = (await loop.mock.rpc("thread/list", {})) as { result: { data: Array<{ id: string }> } };
     assert.ok(!list.result.data.some((t) => t.id === eph.result.thread.id), "ephemeral fork 不应进列表");
   } finally {
@@ -3558,6 +3606,24 @@ test("回环：side conversation——ephemeral fork 走标准回复；inject_it
     // inject_items：App 实发形状（role:user message + input_text content）；
     // 响应 {}，且不产生任何通知（codex 纯历史写入，无 server notification）
     await new Promise((resolve) => setTimeout(resolve, 150)); // 等 fork 的 thread/started 浮面
+    // excludeTurns=true 是 cheap fork 路径：跳过 restored usage 重放
+    // （thread_processor.rs:5360-5367），只有 thread/started 广播
+    assert.ok(
+      !loop.mock.receivedNotifications.some(
+        (n) =>
+          n.method === "thread/tokenUsage/updated" &&
+          (n.params as { threadId: string }).threadId === sideId,
+      ),
+      "excludeTurns（side chat）fork 不补发 restored usage",
+    );
+    assert.ok(
+      loop.mock.receivedNotifications.some(
+        (n) =>
+          n.method === "thread/started" &&
+          (n.params as { thread: { id: string } }).thread.id === sideId,
+      ),
+      "side chat fork 应广播 thread/started",
+    );
     loop.mock.receivedNotifications.length = 0;
     const boundary =
       "Side conversation boundary.\n\nEverything before this boundary is inherited history from the parent thread.";

@@ -2229,9 +2229,14 @@ export class SimApp extends EventEmitter implements AgentApp {
     forkState.contextUserChars = source.contextUserChars;
     forkState.contextAgentChars = source.contextAgentChars;
     forkState.contextBaseline = source.contextBaseline;
-    forkState.tokenUsage = source.tokenUsage
-      ? { turnId: source.tokenUsage.turnId, usage: source.tokenUsage.usage }
-      : null;
+    // tokenUsage 快照随 rollout 复制，但 lastTurnId 截断把快照所属 turn 截掉时
+    // 置 null：codex 从 fork 自己的截断历史恢复 restored usage（restored_token_
+    // usage_turn_id 回退到最后完成 turn），sim 无逐轮历史可回溯，宁缺毋滥——
+    // 不补发指向不存在 turn 的快照。
+    forkState.tokenUsage =
+      source.tokenUsage && turnIds.has(source.tokenUsage.turnId)
+        ? { turnId: source.tokenUsage.turnId, usage: source.tokenUsage.usage }
+        : null;
     // fork 继承历史里的全部用户消息（不含模拟回复）→ 第一条回复附加的历史段；
     // 以**过滤后的 items** 为准（lastTurnId 截断后剩什么就报什么），side chat
     // 的边界注入发生在 fork 之后、不在快照内。
@@ -2241,11 +2246,41 @@ export class SimApp extends EventEmitter implements AgentApp {
       .map((item) => item.content.map((c) => String(c.text ?? "")).join("").trim())
       .filter((t) => t.length > 0);
     forkState.historyPrelude = historyTexts.length > 0 ? historyTexts.join("、") : null;
+    // preview（thread_processor.rs:5115-5123 + preview_from_rollout_items:6219）：
+    // 非持久 fork 的 preview = 继承历史首条用户消息全文（sim 消息为纯文本，无需
+    // strip 前缀）；ephemeral fork 无 lastTurnId/beforeTurnId 时 = 源 preview
+    // （side conversation 语义），带截断时同取截断历史首条用户消息。
+    if (fork.ephemeral && p.lastTurnId == null && p.beforeTurnId == null) {
+      fork.preview = source.thread.preview;
+    } else {
+      const firstUser = items.find((e) => isUserMessageItem(e.item))?.item;
+      fork.preview = firstUser && isUserMessageItem(firstUser)
+        ? firstUser.content.map((c) => String(c.text ?? "")).join("")
+        : "";
+    }
     this.threads.set(fork.id, forkState);
     if (!fork.ephemeral) {
       this.persistState();
     }
-    this.emitSoon("thread/started", { thread: this.serializeThread(fork, []) });
+    // 响应先行（thread_processor.rs:5355-5376）：fork RESP → restored tokenUsage
+    // （"the new thread is usable as soon as the response arrives, so restored
+    // usage must follow immediately"；include_turns 即非 excludeTurns 才重放——
+    // "excludeTurns is the cheap fork path, so skip restored usage replay"）→
+    // thread/started 广播（thread_started_notification：turns 清空只带元数据）。
+    // 用宏任务而非 emitSoon 微任务：微任务可能先于 dispatchMessage 写响应
+    // （与 threadResume/goalSet 的响应先行陷阱同款，见 threadResume 注释）。
+    // usage 重放为广播近似：codex 定向发往 fork 发起连接（token_usage_replay.rs
+    // :35-56 连接作用域），sim 的 replayTokenUsage 与 resume 路径一致走广播。
+    const excludeTurns = p.excludeTurns === true;
+    this.schedule(null, () => {
+      if (this.closed) return;
+      const current = this.threads.get(fork.id);
+      if (!current) return;
+      if (!excludeTurns && current.tokenUsage) {
+        this.replayTokenUsage(current.thread.id);
+      }
+      this.emit("event", this.notification("thread/started", { thread: this.serializeThread(current.thread, []) }));
+    }, 0);
     // threadContext 固定以 turns:[] 序列化（thread/start 用）；fork 需带回截断历史，
     // 故覆盖 thread 为实值，保持 ForkResponse 其余 13 键形状不变。excludeTurns=true
     // 时只回元数据不填充 turns（v2/thread.rs:608-612，客户端随即用 turns/items
