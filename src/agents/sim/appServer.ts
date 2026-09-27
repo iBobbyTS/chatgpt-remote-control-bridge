@@ -223,11 +223,18 @@ interface ThreadState {
   idleNoSubscribersSince: number | null;
   idleInactiveSince: number | null;
   unloadTimer: NodeJS.Timeout | null;
+  /**
+   * fork 继承的用户历史摘要（内存态，不持久化；sim 本地扩展，非 codex 对齐）：
+   * threadFork 时从实际继承的历史收集全部用户消息文本（不含模拟回复）按序
+   * join("、")。fork / side conversation 后**第一条普通回复**末尾附加
+   * 「此前的历史消息：…」段，用后即清；help / 起名兜底等机器读回复不消费。
+   */
+  historyPrelude: string | null;
 }
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null, contextUserChars: 0, contextAgentChars: 0, contextBaseline: 0, idleNoSubscribersSince: null, idleInactiveSince: null, unloadTimer: null };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null, contextUserChars: 0, contextAgentChars: 0, contextBaseline: 0, idleNoSubscribersSince: null, idleInactiveSince: null, unloadTimer: null, historyPrelude: null };
 }
 
 /** 已占用 token 上限：窗口 258000 减 1。 */
@@ -1597,6 +1604,8 @@ export class SimApp extends EventEmitter implements AgentApp {
    * - 技能：输入含 `$名` 且名 ∈ SKILLS → 一行「已加载技能 $名（模拟）。」。
    * help 与起名兜底回复保持原样（不叠加钩子，既有断言不受影响）；side
    * conversation 等普通 ephemeral 对话照常叠加。
+   * - fork 历史段：fork / side chat 继承过用户历史时，**第一条**普通回复末尾
+   *   附加「此前的历史消息：A、B」（sim 本地扩展），用后即清。
    */
   private composeReply(state: ThreadState, userText: string): string {
     const base = this.buildReply(userText, state.thread);
@@ -1613,7 +1622,12 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     const skillLine = this.skillLineFor(userText);
     if (skillLine) lines.push(skillLine);
-    return lines.length > 0 ? `${lines.join("\n")}\n${base}` : base;
+    let reply = lines.length > 0 ? `${lines.join("\n")}\n${base}` : base;
+    if (state.historyPrelude !== null) {
+      reply += `\n\n此前的历史消息：${state.historyPrelude}`;
+      state.historyPrelude = null;
+    }
+    return reply;
   }
 
   /** $技能名 钩子：命中 data.ts 现有技能列表则确认加载。 */
@@ -2218,6 +2232,15 @@ export class SimApp extends EventEmitter implements AgentApp {
     forkState.tokenUsage = source.tokenUsage
       ? { turnId: source.tokenUsage.turnId, usage: source.tokenUsage.usage }
       : null;
+    // fork 继承历史里的全部用户消息（不含模拟回复）→ 第一条回复附加的历史段；
+    // 以**过滤后的 items** 为准（lastTurnId 截断后剩什么就报什么），side chat
+    // 的边界注入发生在 fork 之后、不在快照内。
+    const historyTexts = items
+      .map((e) => e.item)
+      .filter(isUserMessageItem)
+      .map((item) => item.content.map((c) => String(c.text ?? "")).join("").trim())
+      .filter((t) => t.length > 0);
+    forkState.historyPrelude = historyTexts.length > 0 ? historyTexts.join("、") : null;
     this.threads.set(fork.id, forkState);
     if (!fork.ephemeral) {
       this.persistState();

@@ -2871,6 +2871,27 @@ test("S03-F branch：metadata/update 双层语义、错误文案、fork 截断�
       ],
       "ForkResponse 顶层 14 键",
     );
+    // fork 历史段：以**过滤后继承的 items** 为准——lastTurnId 截断后只剩
+    // 「第一轮」的用户消息（「第二轮」不在段内，模拟回复不含）
+    const f1 = (await loop.mock.rpc("turn/start", {
+      threadId: fork.result.thread.id,
+      input: [{ type: "text", text: "fork 第一问" }],
+    })) as { result: { turn: { id: string } } };
+    await waitFor(
+      () =>
+        loop.mock.receivedNotifications.some(
+          (n) => isNotif(n, "turn/completed") && n.params.turn.id === f1.result.turn.id,
+        ),
+      5000,
+      "fork 首轮未完成",
+    );
+    const forkReply = (
+      loop.mock.receivedNotifications.find(
+        (n) => isNotif(n, "turn/completed") && n.params.turn.id === f1.result.turn.id,
+      )!.params as { turn: { items: Array<{ type: string; text?: string }> } }
+    ).turn.items.find((i) => i.type === "agentMessage")?.text ?? "";
+    assert.match(forkReply, /已收到消息：「fork 第一问」/);
+    assert.match(forkReply, /此前的历史消息：第一轮$/, "历史段=截断后继承的用户消息（不含模拟回复/后续轮）");
     const badTurn = (await loop.mock.rpc("thread/fork", { threadId, lastTurnId: "unknown-turn" })) as {
       error?: { code: number; message: string };
     };
@@ -3574,6 +3595,9 @@ test("回环：side conversation——ephemeral fork 走标准回复；inject_it
     assert.match(sideAgentText, /已收到消息：「side 问题」/, "side chat 回复须含标准首行");
     assert.match(sideAgentText, /bridge 模拟层的固定回复/, "side chat 回复须含完整说明块");
     assert.ok(sideAgentText.length > "side 问题".length, "回复不得被截成用户原文");
+    // fork 历史段：side 首条回复末尾附「此前的历史消息：…」（继承的父线程
+    // 用户消息按序 join「、」，不含模拟回复；边界注入发生在 fork 后、不在段内）
+    assert.match(sideAgentText, /此前的历史消息：父线程消息$/);
     // 上下文 = 继承的父线程占用 + 边界注入 + 本轮消息（fork 复制计数 + inject 即时计入）
     const sideUsage = (
       loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").pop()!
@@ -3584,6 +3608,21 @@ test("回环：side conversation——ephemeral fork 走标准回复；inject_it
       parentUsage + boundary.length + "side 问题".length + sideAgentText.length,
       "side 首轮占用 = 继承 + 注入 + 本轮",
     );
+    // 第二条回复不再附加（用后即清）
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId: sideId, input: [{ type: "text", text: "side 第二问" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "side 第二轮 turn/completed 未收到",
+    );
+    const sideAgentText2 = (
+      loop.mock.receivedNotifications.find((n) => n.method === "turn/completed")!.params as {
+        turn: { items: Array<{ type: string; text?: string }> };
+      }
+    ).turn.items.find((i) => i.type === "agentMessage")?.text ?? "";
+    assert.match(sideAgentText2, /已收到消息：「side 第二问」/);
+    assert.ok(!sideAgentText2.includes("此前的历史消息"), "历史段只附加 fork 后第一条回复");
 
     // name/set（真机给持久线程起名）：响应 {} + thread/name/updated（trim 归一化），thread/list 生效
     loop.mock.receivedNotifications.length = 0;
