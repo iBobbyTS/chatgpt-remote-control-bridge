@@ -595,3 +595,31 @@ goal 保持 active）→ 队列空 → goal 续跑 g3 → blocked。测试：que
 turn 运行窗口内验证（空闲入队现在会立即开跑）、新增 goal turn 内 turn/start 转
 steer（同一 turn、userMessage 挂 goal turn、steer 回复在前 goal 消息在后、每 turn
 计量不变、无新 turn）、中止后续跑 + 队列时序、空闲入队唤醒共 4 项，全量 185/185。
+
+### 追记：status 页「上下文/速率限额」补齐（2026-09-27）
+
+手机实测 status 页显示「上下文：不可用」「速率限制：不可用」并弹「Codex 服务器
+返回了错误【重试】」。帧证据（frames.jsonl 01:08:16）：App 打开 status 页只发一个
+RPC `account/rateLimits/read`，sim 回 -32601 Method not found——错误横幅与速率限
+额不可用同源。上下文行无对应 RPC，数据源是 `thread/tokenUsage/updated` 通知；codex
+在每次 thread/resume 响应之后向重连连接补发最近持久化快照
+（token_usage_replay.rs:35-56；thread_processor.rs:4172-4175 注释明说「client needs
+restored usage before it starts another turn ... filling the status line」，顺序为
+resume 响应 → tokenUsage 重放 → goal 快照 → idle lifecycle），sim 缺补发导致 App
+每 ~30s 重连后上下文行回到不可用。本轮补齐：
+
+1. **account/rateLimits/read**（common.rs:1309 → v2/account.rs:331-345）：静态合理
+   快照。`rateLimits.primary`=5 小时滚动窗（windowDurationMins:300）、`secondary`
+   =7 天周窗（10080）——App 按窗口时长区分 5h/7d 两行；`RateLimitWindow` 只有
+   usedPercent（0-100）/windowDurationMins/resetsAt，**无绝对 token 数**
+   （protocol.rs:2390-2399）。
+2. **thread/resume 补发 tokenUsage**：`ThreadState.tokenUsage`（持久化，跨重启）
+   在 finishSimTurn 记录；resume 的宏任务回调里先于 goal 快照补发。
+3. **account/rateLimits/updated**：turn 收尾在 tokenUsage/updated 之后广播
+   （bespoke_event_handling.rs:1581-1599 handle_token_count_event 顺序），账户作用
+   域、不带 threadId 路由。
+4. **account/usage/read**（v2/account.rs:448-455）：summary 里 lifetimeTokens 汇总
+   各线程累计用量，threadUsage 无计费路由恒 null。
+
+测试：rateLimits 双窗形状 + turn 后滚动更新顺序、resume 补发时序（响应先行 +
+归属最近完成 turn + 先于 goal 快照）共 2 项，全量 187/187。

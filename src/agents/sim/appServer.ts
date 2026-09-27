@@ -140,6 +140,17 @@ interface BackgroundTerminalEntry {
   cwd: string;
 }
 
+/**
+ * thread/tokenUsage/updated 的 tokenUsage 载荷（v2/thread.rs:1895-1901
+ * ThreadTokenUsage）：total=线程累计用量，last=最近一轮用量，modelContextWindow=
+ * 模型上下文窗口上限（手机 status 页「上下文」行的 当前值/窗口上限 即来自这里）。
+ */
+interface SimTokenUsage {
+  total: { totalTokens: number; inputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+  last: { totalTokens: number; inputTokens: number; cachedInputTokens: number; cacheWriteInputTokens: number; outputTokens: number; reasoningOutputTokens: number };
+  modelContextWindow: number;
+}
+
 interface ThreadState {
   thread: ThreadRecord;
   items: ItemEntry[];
@@ -176,11 +187,24 @@ interface ThreadState {
   justCompacted: boolean;
   /** 后台终端（不持久化）：thread/shellCommand 完成后登记。 */
   backgroundTerminals: BackgroundTerminalEntry[];
+  /**
+   * 最近一次 thread/tokenUsage/updated 快照（持久化）：turn 收尾时记录，resume
+   * 时向重连客户端补发（token_usage_replay.rs:35-56 连接作用域重放；thread_
+   * processor.rs:4172-4175「client needs restored usage before it starts another
+   * turn ... filling the status line」——缺补发则 App 重连后上下文行显示不可用）。
+   */
+  tokenUsage: { turnId: string; usage: SimTokenUsage } | null;
 }
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [] };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null };
+}
+
+/** 模拟一轮 turn 的用量（静态合理值；last/total 同值，窗口上限取 MODEL_CONTEXT_WINDOW）。 */
+function simTokenUsage(): SimTokenUsage {
+  const oneTurn = { totalTokens: 1234, inputTokens: 1180, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 54, reasoningOutputTokens: 0 };
+  return { total: { ...oneTurn }, last: { ...oneTurn }, modelContextWindow: MODEL_CONTEXT_WINDOW };
 }
 
 type AnyParams = Record<string, any>;
@@ -320,6 +344,7 @@ export class SimApp extends EventEmitter implements AgentApp {
         thread: ThreadRecord;
         items: ItemEntry[];
         goal?: SimGoal | null;
+        tokenUsage?: { turnId: string; usage: SimTokenUsage } | null;
       }>;
       for (const entry of parsed) {
         if (entry?.thread?.id) {
@@ -335,6 +360,7 @@ export class SimApp extends EventEmitter implements AgentApp {
           entry.thread.gitInfo ??= null;
           const state = makeThreadState(entry.thread, entry.items ?? []);
           state.goal = entry.goal ?? null;
+          state.tokenUsage = entry.tokenUsage ?? null;
           this.threads.set(entry.thread.id, state);
         }
       }
@@ -344,13 +370,14 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /** 落盘快照：非 ephemeral 线程（persistState 与 reset 显式写共用同一形状）。 */
-  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[]; goal: SimGoal | null }> {
+  private snapshotEntries(): Array<{ thread: ThreadRecord; items: ItemEntry[]; goal: SimGoal | null; tokenUsage: { turnId: string; usage: SimTokenUsage } | null }> {
     return [...this.threads.values()]
       .filter((t) => !t.thread.ephemeral)
       .map((t) => ({
         thread: t.thread,
         items: t.items,
         goal: t.goal,
+        tokenUsage: t.tokenUsage,
       }));
   }
 
@@ -558,6 +585,10 @@ export class SimApp extends EventEmitter implements AgentApp {
         return this.diagnostics();
       case "remoteControl/status/read":
         return this.remoteControlStatusRead();
+      case "account/rateLimits/read":
+        return this.accountRateLimitsRead();
+      case "account/usage/read":
+        return this.accountUsageRead();
       case "memory/status":
         // v2/memory.rs:20-23：{v2ConsolidatedThreads, v2Ready}
         return { v2ConsolidatedThreads: 0, v2Ready: false };
@@ -704,14 +735,24 @@ export class SimApp extends EventEmitter implements AgentApp {
     }
     if (p.model) state.thread.model = p.model;
     this.persistState();
-    // MB5：resume 响应先行，随后用**宏任务**补发 goal 快照（对齐
-    // thread_processor.rs:4181-4187 emit_resume_goal_snapshot）。禁用 emitSoon
-    // 微任务：微任务可能仍先于 dispatchMessage 写响应（appServer.ts:674 注释记录的
-    // 「响应先行陷阱」）。有 goal → thread/goal/updated；无 → thread/goal/cleared。
+    // MB5：resume 响应先行，随后用**宏任务**补发快照（对齐 thread_processor.rs:
+    // 4166-4190 顺序：resume 响应 → tokenUsage 重放 → goal 快照 → idle lifecycle；
+    // token_usage_replay.rs:35-56 连接作用域，「client needs restored usage before
+    // it starts another turn ... filling the status line」——手机 status 页「上下文」
+    // 行依赖这条补发，缺了则重连后显示不可用）。禁用 emitSoon 微任务：微任务可能
+    // 仍先于 dispatchMessage 写响应（appServer.ts:674 注释记录的「响应先行陷阱」）。
     this.schedule(null, () => {
       if (this.closed) return;
       const current = this.threads.get(state.thread.id);
       if (!current) return;
+      if (current.tokenUsage) {
+        this.emit("event", this.notification("thread/tokenUsage/updated", {
+          threadId: current.thread.id,
+          turnId: current.tokenUsage.turnId,
+          tokenUsage: current.tokenUsage.usage,
+        }, current.thread.id));
+      }
+      // 有 goal → thread/goal/updated；无 → thread/goal/cleared。
       if (current.goal) {
         this.emit("event", this.notification("thread/goal/updated", {
           threadId: current.thread.id,
@@ -1278,29 +1319,20 @@ export class SimApp extends EventEmitter implements AgentApp {
         goal: state.goal,
       }, state.thread.id));
     }
+    // tokenUsage 快照：先记录到线程状态（resume 补发用，跨重启持久化），再广播。
+    const usage = simTokenUsage();
+    state.tokenUsage = { turnId: sim.turn.id, usage };
     this.emit("event", this.notification("thread/tokenUsage/updated", {
       threadId: state.thread.id,
       turnId: sim.turn.id,
-      tokenUsage: {
-        total: {
-          totalTokens: 1234,
-          inputTokens: 1180,
-          cachedInputTokens: 0,
-          cacheWriteInputTokens: 0,
-          outputTokens: 54,
-          reasoningOutputTokens: 0,
-        },
-        last: {
-          totalTokens: 1234,
-          inputTokens: 1180,
-          cachedInputTokens: 0,
-          cacheWriteInputTokens: 0,
-          outputTokens: 54,
-          reasoningOutputTokens: 0,
-        },
-        modelContextWindow: MODEL_CONTEXT_WINDOW,
-      },
+      tokenUsage: usage,
     }, state.thread.id));
+    // 紧随 tokenUsage 的账户级限额滚动更新（bespoke_event_handling.rs:1581-1599
+    // handle_token_count_event：ThreadTokenUsageUpdated 之后 AccountRateLimitsUpdated）。
+    // 账户作用域广播，不带 threadId 路由。
+    this.emit("event", this.notification("account/rateLimits/updated", {
+      rateLimits: this.rateLimitSnapshot(),
+    }));
     this.emit("event", this.notification("turn/completed", {
       threadId: state.thread.id,
       // 真实 turn/completed 只带 agentMessage 摘要项；带 userMessage 会导致手机端重复渲染用户消息
@@ -2007,6 +2039,68 @@ export class SimApp extends EventEmitter implements AgentApp {
       };
     }
     return { status: "disabled", serverName: "", installationId: "", environmentId: null };
+  }
+
+  /**
+   * 速率限额快照（v2/account.rs:664-677 RateLimitSnapshot）：primary=5 小时滚动
+   * 窗（windowDurationMins:300），secondary=7 天周窗（10080）——App 按窗口时长
+   * 区分 5h/7d 两行。usedPercent 为 0-100 百分比；RateLimitWindow 无绝对 token
+   * 数（protocol.rs:2390-2399）。静态合理值，供 RPC 读取与 turn 后滚动更新共用。
+   */
+  private rateLimitSnapshot(): Record<string, unknown> {
+    const now = Math.floor(Date.now() / 1000);
+    return {
+      limitId: "codex",
+      limitName: "Codex",
+      normalModelSlug: null,
+      primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: now + 3600 },
+      secondary: { usedPercent: 34, windowDurationMins: 10080, resetsAt: now + 2 * 86400 },
+      credits: { hasCredits: false, unlimited: false, balance: null },
+      individualLimit: null,
+      spendControlReached: null,
+      planType: this.opts.accountInfo?.planType ?? null,
+      rateLimitReachedType: null,
+    };
+  }
+
+  /**
+   * account/rateLimits/read（common.rs:1309-1313 → v2/account.rs:331-345）：手机
+   * status 页「剩余速率限额」数据源；此前未实现返回 -32601，App 显示「速率限制：
+   * 不可用」并弹「Codex 服务器返回了错误」横幅。
+   */
+  private accountRateLimitsRead(): unknown {
+    return {
+      ordinaryUsageAllowed: true,
+      rateLimits: this.rateLimitSnapshot(),
+      rateLimitsByLimitId: null,
+      rateLimitResetCredits: null,
+      accountId: null,
+      rateLimitUpsell: null,
+    };
+  }
+
+  /**
+   * account/usage/read（common.rs:1321-1324 → v2/account.rs:448-455）：账户用量
+   * 摘要。lifetimeTokens 汇总各线程已记录的累计用量，其余为静态合理值；
+   * threadUsage 仅在按 threadId 请求且计费路由可用时返回（v2/account.rs:452-454），
+   * sim 无计费路由恒为 null。
+   */
+  private accountUsageRead(): unknown {
+    const lifetimeTokens = [...this.threads.values()].reduce(
+      (sum, t) => sum + (t.tokenUsage?.usage.total.totalTokens ?? 0),
+      0,
+    );
+    return {
+      summary: {
+        lifetimeTokens,
+        peakDailyTokens: 45678,
+        longestRunningTurnSec: 900,
+        currentStreakDays: 3,
+        longestStreakDays: 12,
+      },
+      dailyUsageBuckets: null,
+      threadUsage: null,
+    };
   }
 
   /** skills/config/write（v2/plugin.rs:933-950；catalog_processor.rs:699-700）。 */

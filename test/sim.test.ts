@@ -3286,3 +3286,118 @@ test("回环：command/exec codex-workspace-write 任务目录脚本（1.2026.25
     await loop.mock.stop();
   }
 });
+
+test("回环：account/rateLimits/read 返回 5h/7d 双窗快照；turn 后滚动 account/rateLimits/updated", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const limits = (await loop.mock.rpc("account/rateLimits/read", {})) as {
+      result: {
+        ordinaryUsageAllowed: boolean;
+        rateLimits: {
+          primary: { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null };
+          secondary: { usedPercent: number; windowDurationMins: number | null; resetsAt: number | null };
+        };
+      };
+    };
+    assert.equal(limits.result.ordinaryUsageAllowed, true, "ordinaryUsageAllowed 应为 true");
+    const { primary, secondary } = limits.result.rateLimits;
+    assert.equal(primary.windowDurationMins, 300, "primary 应为 5 小时滚动窗（300 分钟）");
+    assert.equal(secondary.windowDurationMins, 10080, "secondary 应为 7 天周窗（10080 分钟）");
+    for (const w of [primary, secondary]) {
+      assert.ok(w.usedPercent >= 0 && w.usedPercent <= 100, "usedPercent 应为 0-100 百分比");
+      assert.ok(typeof w.resetsAt === "number", "resetsAt 应为 Unix 秒时间戳");
+    }
+    const usage = (await loop.mock.rpc("account/usage/read", {})) as {
+      result: { summary: { lifetimeTokens: number } };
+    };
+    assert.ok(Number.isFinite(usage.result.summary.lifetimeTokens), "lifetimeTokens 应为数值");
+
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/rate" })) as {
+      result: { thread: { id: string } };
+    };
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", {
+      threadId: started.result.thread.id,
+      input: [{ type: "text", text: "限额探测" }],
+    });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+    // handle_token_count_event（bespoke_event_handling.rs:1581-1599）顺序：tokenUsage
+    // 之后紧跟账户级滚动更新
+    const tokenIdx = loop.mock.receivedNotifications.findIndex((n) => n.method === "thread/tokenUsage/updated");
+    const rollIdx = loop.mock.receivedNotifications.findIndex((n) => n.method === "account/rateLimits/updated");
+    assert.ok(tokenIdx >= 0, "turn 结束应广播 thread/tokenUsage/updated");
+    assert.ok(rollIdx > tokenIdx, "account/rateLimits/updated 应晚于 tokenUsage/updated");
+    const rolled = loop.mock.receivedNotifications.find((n) => n.method === "account/rateLimits/updated")!
+      .params as { rateLimits: { secondary: { windowDurationMins: number | null } } };
+    assert.equal(rolled.rateLimits.secondary.windowDurationMins, 10080, "滚动更新应同为 7 天周窗形状");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：resume 补发 tokenUsage 快照（上下文行数据源），响应先行且先于 goal 快照", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/ctx" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const turn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "上下文探测" }],
+    })) as { result: { turn: { id: string } } };
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+
+    loop.mock.receivedEnvelopeLog.length = 0;
+    loop.mock.receivedNotifications.length = 0;
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId })) as { id: number | string; result: unknown };
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "thread/tokenUsage/updated"),
+      2000,
+      "resume 未补发 thread/tokenUsage/updated",
+    );
+    // 响应信封先于补发通知（thread_processor.rs:4172-4175：发送在响应之后以保持
+    // JSON-RPC 请求序，同时赶在下个 turn 生命周期前填充状态行）
+    const log = loop.mock.receivedEnvelopeLog;
+    const responseIndex = log.findIndex(
+      (e) => e.kind === "response" && String(e.id) === String(resumed.id),
+    );
+    const notifIndex = log.findIndex(
+      (e) => e.kind === "notification" && e.method === "thread/tokenUsage/updated",
+    );
+    assert.ok(responseIndex >= 0, "thread/resume 响应应在时序日志中");
+    assert.ok(notifIndex > responseIndex, "tokenUsage 补发必须晚于 resume 响应上线");
+    const replay = loop.mock.receivedNotifications.find((n) => n.method === "thread/tokenUsage/updated")!
+      .params as {
+      threadId: string;
+      turnId: string;
+      tokenUsage: { total: { totalTokens: number }; modelContextWindow: number };
+    };
+    assert.equal(replay.threadId, threadId);
+    assert.equal(replay.turnId, turn.result.turn.id, "补发应归属最近一个完成的 turn");
+    assert.equal(replay.tokenUsage.total.totalTokens, 1234);
+    assert.equal(replay.tokenUsage.modelContextWindow, 258400);
+    // tokenUsage 补发先于 goal 快照（thread_processor.rs:4166-4190 顺序）
+    const goalIdx = loop.mock.receivedNotifications.findIndex((n) => n.method === "thread/goal/cleared");
+    if (goalIdx >= 0) {
+      assert.ok(
+        goalIdx > loop.mock.receivedNotifications.findIndex((n) => n.method === "thread/tokenUsage/updated"),
+        "tokenUsage 补发应先于 goal 快照",
+      );
+    }
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
