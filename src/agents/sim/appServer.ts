@@ -14,6 +14,10 @@ import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import {
+  ATTACHMENTS_DIR_PREFIX,
+  resolveContainedSavePath,
+} from "../files.ts";
+import {
   approvalModeLabel,
   CLI_VERSION,
   COLLABORATION_MODES,
@@ -352,14 +356,6 @@ function titleForPrompt(prompt: string, maxLength: number): string {
 
 // ---------------------------------------------------------------- 附件上传
 
-/**
- * 手机附件上传目录约定（iOS App 侧命名，codex 源码无此常量）：
- * `/tmp/codex-remote-attachments/<threadId>/<uuid>/<原始文件名>`；先
- * fs/createDirectory 再 fs/writeFile，随后 turn/start 以 UserInput
- * `localImage`/`localAudio`（v2/turn.rs:440-448）引用该路径。
- */
-const ATTACHMENTS_DIR_PREFIX = "/tmp/codex-remote-attachments/";
-
 /** 按扩展名判定图片（决定是否执行 exiftool）。 */
 const IMAGE_EXTENSIONS = new Set([
   "jpg", "jpeg", "jfif", "png", "heic", "heif", "avif", "webp", "gif", "tif", "tiff", "bmp", "jxl", "svg",
@@ -575,7 +571,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.saveQueue = this.saveQueue
       .then(async () => {
         const tmp = `${statePath}.tmp`;
-        await writeFile(tmp, JSON.stringify(snapshot), "utf8");
+        await writeFile(tmp, JSON.stringify(snapshot), { mode: 0o600 });
         await rename(tmp, statePath);
       })
       .catch((err) => {
@@ -606,7 +602,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       rejectDone = reject;
     });
     const task = this.saveQueue.then(async () => {
-      await writeFile(tmp, serialized, "utf8");
+      await writeFile(tmp, serialized, { mode: 0o600 });
       await rename(tmp, statePath);
     });
     // 链尾吞错（与 persistState 一致）：失败只 reject one-shot done，不让 saveQueue 断裂
@@ -2745,14 +2741,11 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   /**
    * fs/writeFile 虚拟路径 → files/ 内落盘路径。附件目录保留
-   * `<threadId>/<uuid>/<文件名>` 结构；其余绝对路径镜像收进 files/mirror/，
-   * 确保所有写入都落在 files/ 之下。
+   * `<threadId>/<uuid>/<文件名>` 结构；其余绝对路径镜像收进 files/mirror/。
+   * 段校验（拒绝 `..` 等）在共享助手内（src/agents/files.ts，后续 serving-agent 复用）。
    */
   private savedPathFor(virtualPath: string): string {
-    if (virtualPath.startsWith(ATTACHMENTS_DIR_PREFIX)) {
-      return join(this.filesDir, virtualPath.slice(ATTACHMENTS_DIR_PREFIX.length));
-    }
-    return join(this.filesDir, "mirror", virtualPath.replace(/^\//, "").replace(/\//g, "__"));
+    return resolveContainedSavePath(this.filesDir, virtualPath);
   }
 
   /**
@@ -2770,7 +2763,12 @@ export class SimApp extends EventEmitter implements AgentApp {
       throw new SimMethodError(-32600, "fs/writeFile requires valid base64 dataBase64: Invalid byte");
     }
     const bytes = Buffer.from(data, "base64");
-    const savedPath = this.savedPathFor(path);
+    let savedPath: string;
+    try {
+      savedPath = this.savedPathFor(path);
+    } catch (err) {
+      throw new SimMethodError(-32602, `fs/writeFile: ${err instanceof Error ? err.message : String(err)}`);
+    }
     try {
       await mkdir(dirname(savedPath), { recursive: true });
       await writeFile(savedPath, bytes);

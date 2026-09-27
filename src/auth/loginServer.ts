@@ -40,8 +40,19 @@ export interface RunningLoginServer {
 
 const RESPONSE_HEADERS = { "Content-Type": "text/html; charset=utf-8" };
 
+/** 转义 HTML 实体（回调页会回显 provider 返回的 error/error_description 查询参数）。 */
+function escapeHtml(text: string): string {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
 function htmlPage(title: string, body: string): string {
-  return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body style="font-family:system-ui;padding:40px"><h2>${title}</h2>${body}</body></html>`;
+  const safeTitle = escapeHtml(title);
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${safeTitle}</title></head><body style="font-family:system-ui;padding:40px"><h2>${safeTitle}</h2>${body}</body></html>`;
 }
 
 function sendResponse(
@@ -139,7 +150,7 @@ export async function startLoginServer(
         400,
         htmlPage(
           "Sign-in could not be completed",
-          `<p>${error}: ${description}</p>`,
+          `<p>${escapeHtml(error)}: ${escapeHtml(description)}</p>`,
         ),
       );
       if (!settled) {

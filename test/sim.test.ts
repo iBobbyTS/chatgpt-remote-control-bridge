@@ -4270,3 +4270,69 @@ test("直连：活动 turn 冻结 ephemeral 卸载——turn 结束后才开始�
     app.close();
   }
 });
+
+test("安全：fs/writeFile 路径穿越被拒（AUD-001 回归）", async () => {
+  const filesRoot = await tempDir("files");
+  const loop = await startLoop({ filesDir: filesRoot });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const escapeTarget = join(filesRoot, "../../cgrcb-audit-escape.txt");
+    for (const path of [
+      "/tmp/codex-remote-attachments/../../cgrcb-audit-escape.txt",
+      "/tmp/codex-remote-attachments/tid/../uuid/../../cgrcb-audit-escape.txt",
+      "/tmp/codex-remote-attachments/.",
+      "/tmp/codex-remote-attachments/",
+      "/..",
+    ]) {
+      const resp = (await loop.mock.rpc("fs/writeFile", { path, dataBase64: "QUJD" })) as {
+        error?: { code: number };
+      };
+      assert.equal(resp.error?.code, -32602, `穿越路径应报参数错误：${path}`);
+    }
+    assert.equal(
+      await stat(escapeTarget).then(
+        () => true,
+        () => false,
+      ),
+      false,
+      "穿越目标文件不得被创建",
+    );
+    // 正常上传不受收容校验影响
+    const ok = (await loop.mock.rpc("fs/writeFile", {
+      path: "/tmp/codex-remote-attachments/tid/uuid/ok.txt",
+      dataBase64: "QUJD",
+    })) as { result: Record<string, unknown>; error?: unknown };
+    assert.deepEqual(ok.result, {});
+    assert.equal(await readFile(join(filesRoot, "tid/uuid/ok.txt"), "utf8"), "ABC");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("安全：分片消息声明超限被丢弃，隧道存活（AUD-007 回归）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    loop.mock.sendClientEnvelope({
+      type: "client_message_chunk",
+      client_id: loop.mock.mobileClientId,
+      stream_id: loop.mock.mobileStreamId,
+      segment_id: 0,
+      segment_count: 1,
+      message_size_bytes: 64 * 1024 * 1024 + 1,
+      message_chunk_base64: "eA==",
+    });
+    await waitFor(
+      () => loop.tunnel.warnings.some((w) => w.includes("超上限")),
+      5000,
+      "超限分片应产生 WARN",
+    );
+    // 丢弃超限消息后通道仍可用
+    const ok = (await loop.mock.rpc("thread/list", {})) as { result?: unknown; error?: unknown };
+    assert.equal(ok.error, undefined);
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});

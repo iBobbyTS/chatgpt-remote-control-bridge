@@ -41,7 +41,8 @@
  * 不产生 unhandledRejection。
  */
 import { EventEmitter } from "node:events";
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { hostname, release } from "node:os";
 import { dirname, join } from "node:path";
 import { WebSocket } from "ws";
@@ -52,6 +53,7 @@ import {
   WhamClient,
   websocketUrlFor,
 } from "./client.ts";
+import { DEFAULT_LOG_CAP_BYTES, rotateLogIfLarge } from "./logfile.ts";
 import {
   REMOTE_CONTROL_PROTOCOL_VERSION,
   WS_HEADERS,
@@ -74,6 +76,8 @@ export interface WhamTunnelOptions {
   /** 实例目录（installation_id / enrollment.json）；默认 authManager.codexHome。 */
   installationDir?: string;
   jsonlPath?: string;
+  /** 帧日志轮转上限；超限 rename 为 `<jsonlPath>.1`（单代保留）。默认 64MB。 */
+  frameLogRotateBytes?: number;
   log?: (line: string) => void;
   /** WS 断开重连延迟；0 = 不重连（测试用）。默认 2000ms。 */
   reconnectDelayMs?: number;
@@ -118,6 +122,17 @@ const OUTBOUND_PENDING_CAPACITY = 256;
 const STREAM_IDLE_TIMEOUT_MS = 10 * 60_000;
 /** 全局背压时有积压流的加速回收阈值（自设止损：真机死/僵尸流饿死活跃流的截断根因）。 */
 const BACKPRESSURE_IDLE_TIMEOUT_MS = 60_000;
+/** 帧日志每写入 N 帧做一次超限轮转 + 权限收敛（appendFile 每次 open，rename 轮转安全）。 */
+const FRAME_LOG_MAINTAIN_EVERY = 256;
+/**
+ * 单条分片消息上限（GP-001：远程字节流必须有界）。声明值（message_size_bytes）与
+ * 累计接收 base64 字符数双重设限，防声明型/分段型内存膨胀；超限丢弃该消息（整流重组态）。
+ */
+const MAX_CHUNKED_MESSAGE_BYTES = 64 * 1024 * 1024;
+/** 单条消息最大分片数（重组表上限，防 segment_count 型膨胀）。 */
+const MAX_CHUNK_SEGMENT_COUNT = 4096;
+/** 累计 WARN 上限（A-NIT1 同款）：恶意帧可持续触发 WARN（如超限分片），不得无界驻留内存。 */
+const MAX_TUNNEL_WARNINGS = 200;
 
 /**
  * pending 队列元素：server_message 载荷或 pong。两者走同一有界可靠层（对齐 codex
@@ -178,8 +193,11 @@ export class WhamTunnel extends EventEmitter {
   private readonly agentLabel: string;
   private readonly onFault?: (err: unknown, context: string) => void;
   private readonly jsonlPath?: string;
+  private readonly frameLogRotateBytes: number;
   private readonly streams = new Map<string, StreamState>();
   private readonly chunkReassembler = new Map<string, Map<number, ClientEnvelope>>();
+  /** 各流分片累计接收的 base64 字符数（重组期内存上限判据，GP-001）。 */
+  private readonly chunkBytes = new Map<string, number>();
   /** 全局已发未 ack 缓冲计数（= 各流 buffer 长度之和，背压判据）。 */
   private bufferedUsed = 0;
   /**
@@ -205,6 +223,8 @@ export class WhamTunnel extends EventEmitter {
   private stopPromise: Promise<void> | null = null;
   private lastPongAt = 0;
   private jsonlQueue: Promise<void> = Promise.resolve();
+  /** 帧日志累计写入数（周期轮转/权限维护的节流计数）。 */
+  private frameLogWrites = 0;
 
   constructor(opts: WhamTunnelOptions) {
     super();
@@ -224,6 +244,7 @@ export class WhamTunnel extends EventEmitter {
     this.agentLabel = opts.agentLabel ?? "bridge";
     this.onFault = opts.onFault;
     this.jsonlPath = opts.jsonlPath;
+    this.frameLogRotateBytes = opts.frameLogRotateBytes ?? DEFAULT_LOG_CAP_BYTES;
     this.app.on("event", (event: AgentNotification) => this.fanOut(event));
   }
 
@@ -307,7 +328,9 @@ export class WhamTunnel extends EventEmitter {
   private async persistEnrollment(enrollment: Enrollment): Promise<void> {
     const path = this.enrollmentPath();
     await mkdir(dirname(path), { recursive: true });
-    await writeFile(path, `${JSON.stringify(enrollment, null, 2)}\n`, { mode: 0o600 });
+    const tmp = `${path}.tmp-${process.pid}-${randomBytes(4).toString("hex")}`;
+    await writeFile(tmp, `${JSON.stringify(enrollment, null, 2)}\n`, { mode: 0o600 });
+    await rename(tmp, path);
   }
 
   /** 并发去重：ping 定时器 / 重连 / start 共用一次续期。 */
@@ -529,7 +552,7 @@ export class WhamTunnel extends EventEmitter {
   private reapStream(key: string, state: StreamState, reason: string): void {
     this.bufferedUsed -= state.buffer.length;
     this.streams.delete(key);
-    this.chunkReassembler.delete(key);
+    this.dropChunkReassembly(key);
     this.app.forgetClient({ clientId: state.clientId, streamId: state.streamId });
     const via = reason.startsWith("背压") ? this.warn.bind(this) : this.log.bind(this);
     via(
@@ -567,6 +590,7 @@ export class WhamTunnel extends EventEmitter {
     // 出站可靠层随 stop 一并清空：缓冲与 pending 全清，迟到出站帧被 stopped 拦截
     this.streams.clear();
     this.chunkReassembler.clear();
+    this.chunkBytes.clear();
     this.bufferedUsed = 0;
     this.drainCursor = 0;
     const inFlight = this.renewalInFlight;
@@ -646,7 +670,7 @@ export class WhamTunnel extends EventEmitter {
         const removed = this.streams.get(key);
         if (removed) this.bufferedUsed -= removed.buffer.length;
         this.streams.delete(key);
-        this.chunkReassembler.delete(key);
+        this.dropChunkReassembly(key);
         this.app.forgetClient({ clientId: envelope.client_id, streamId: envelope.stream_id ?? "" });
         return;
       }
@@ -662,20 +686,45 @@ export class WhamTunnel extends EventEmitter {
    */
   private handleChunk(envelope: ClientEnvelope): void {
     const key = `${envelope.client_id}/${envelope.stream_id ?? ""}`;
+    const declared = envelope.message_size_bytes;
+    if (typeof declared === "number" && declared > MAX_CHUNKED_MESSAGE_BYTES) {
+      this.dropChunkReassembly(key);
+      this.warn(
+        `分片消息声明 ${declared}B 超上限 ${MAX_CHUNKED_MESSAGE_BYTES}B，丢弃（${key}）`,
+      );
+      return;
+    }
+    if ((envelope.segment_count ?? 1) > MAX_CHUNK_SEGMENT_COUNT) {
+      this.dropChunkReassembly(key);
+      this.warn(`分片数 ${envelope.segment_count} 超上限 ${MAX_CHUNK_SEGMENT_COUNT}，丢弃（${key}）`);
+      return;
+    }
     let segments = this.chunkReassembler.get(key);
     if (!segments) {
       segments = new Map();
       this.chunkReassembler.set(key, segments);
     }
+    const chunkChars = envelope.message_chunk_base64?.length ?? 0;
+    const accumulated = (this.chunkBytes.get(key) ?? 0) + chunkChars;
+    if (accumulated > MAX_CHUNKED_MESSAGE_BYTES * 2) {
+      this.dropChunkReassembly(key);
+      this.warn(
+        `分片消息累计 ${accumulated}B(base64) 超上限，丢弃（${key}；声明 ${declared ?? "?"}B）`,
+      );
+      return;
+    }
+    this.chunkBytes.set(key, accumulated);
     segments.set(envelope.segment_id ?? 0, envelope);
     if (segments.size < (envelope.segment_count ?? 1)) return;
-    this.chunkReassembler.delete(key);
+    this.dropChunkReassembly(key);
     const ordered = [...segments.entries()]
       .sort(([a], [b]) => a - b)
       .map(([, seg]) => seg.message_chunk_base64 ?? "");
     try {
       const raw = Buffer.concat(ordered.map((seg) => Buffer.from(seg, "base64")));
-      const declared = envelope.message_size_bytes;
+      if (raw.length > MAX_CHUNKED_MESSAGE_BYTES) {
+        throw new Error(`decoded ${raw.length}B exceeds cap ${MAX_CHUNKED_MESSAGE_BYTES}B`);
+      }
       if (typeof declared === "number" && declared > 0 && raw.length !== declared) {
         throw new Error(`size mismatch: decoded ${raw.length} bytes, declared ${declared}`);
       }
@@ -691,6 +740,12 @@ export class WhamTunnel extends EventEmitter {
     } catch (err) {
       this.log(`! 分片重组失败: ${errorMessage(err)}`);
     }
+  }
+
+  /** 清除某流的分片重组态（重组完成/失败/超限/流回收共用）。 */
+  private dropChunkReassembly(key: string): void {
+    this.chunkReassembler.delete(key);
+    this.chunkBytes.delete(key);
   }
 
   private async dispatchMessage(envelope: ClientEnvelope, message: JsonRpcMessage): Promise<void> {
@@ -997,6 +1052,9 @@ export class WhamTunnel extends EventEmitter {
 
   private warn(line: string): void {
     this.warnings.push(line);
+    if (this.warnings.length > MAX_TUNNEL_WARNINGS) {
+      this.warnings.splice(0, this.warnings.length - MAX_TUNNEL_WARNINGS);
+    }
     this.log(`WARN ${line}`);
     this.safeEmit("warn", line);
   }
@@ -1034,11 +1092,20 @@ export class WhamTunnel extends EventEmitter {
 
   private logFrame(dir: string, frame: unknown): void {
     if (!this.jsonlPath) return;
+    const path = this.jsonlPath;
     const record = JSON.stringify({ at: new Date().toISOString(), dir, frame });
     this.jsonlQueue = this.jsonlQueue
       .then(async () => {
-        await mkdir(dirname(this.jsonlPath!), { recursive: true });
-        await appendFile(this.jsonlPath!, `${record}\n`);
+        this.frameLogWrites += 1;
+        // 周期维护（首帧即跑一次）：超限轮转 + 收敛历史 0644 权限；失败不阻断写入
+        if (this.frameLogWrites % FRAME_LOG_MAINTAIN_EVERY === 1) {
+          await rotateLogIfLarge(path, {
+            capBytes: this.frameLogRotateBytes,
+            mode: 0o600,
+          }).catch(() => undefined);
+        }
+        await mkdir(dirname(path), { recursive: true });
+        await appendFile(path, `${record}\n`, { mode: 0o600 });
       })
       .catch(() => undefined);
   }

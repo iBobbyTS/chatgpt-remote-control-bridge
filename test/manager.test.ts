@@ -305,3 +305,26 @@ test("loginServer：oauth error 回调 → reject 并带错误信息", async () 
     await rejection?.catch(() => {});
   }
 });
+
+test("loginServer：error/error_description 转义回显，无反射注入（AUD-004 回归）", async () => {
+  const server = await startLoginServer({ port: 0, state: "s", timeoutMs: 3000 });
+  let rejection: Promise<void> | undefined;
+  try {
+    rejection = assert.rejects(server.waitForCallback, /oauth callback error/);
+    const payload = `<script>alert(1)</script>`;
+    const description = `<img src=x onerror=alert(2)>`;
+    const resp = await fetch(
+      `http://127.0.0.1:${server.port}/auth/callback` +
+        `?error=${encodeURIComponent(payload)}&error_description=${encodeURIComponent(description)}`,
+    );
+    assert.equal(resp.status, 400);
+    const body = await resp.text();
+    assert.ok(body.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), "error 应被转义回显");
+    assert.ok(!body.includes("<script>"), "页面不得包含原始 <script>");
+    assert.ok(body.includes("&lt;img"), "description 应被转义回显");
+    await rejection;
+  } finally {
+    await server.close();
+    await rejection?.catch(() => {});
+  }
+});

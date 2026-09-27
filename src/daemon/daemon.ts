@@ -48,6 +48,8 @@ import {
   resolveCgrcbHome,
   type CgrcbPaths,
 } from "./paths.ts";
+import { stderrLogPath, stdoutLogPath } from "./launchd.ts";
+import { truncateLogIfLarge } from "../wham/logfile.ts";
 import {
   IpcServer,
   type AgentInstanceStatus,
@@ -204,6 +206,13 @@ export class CgrcbDaemon {
     if (this.stopRequested) return this.abandonStart("stop requested");
     await mkdir(this.paths.instancesDir, { recursive: true });
     await mkdir(this.paths.logsDir, { recursive: true });
+    // launchd 持有 stdout/stderr fd（O_APPEND），超限原地截断防无界增长（AUD-010）
+    for (const logPath of [stdoutLogPath(this.paths.root), stderrLogPath(this.paths.root)]) {
+      const outcome = await truncateLogIfLarge(logPath).catch(() => "absent" as const);
+      if (outcome === "truncated") {
+        this.logLine(`启动时日志超限已截断: ${logPath}`);
+      }
+    }
     if (this.stopRequested) return this.abandonStart("stop requested");
     this.config = await readConfig(this.paths.configPath);
     if (this.stopRequested) return this.abandonStart("stop requested");
