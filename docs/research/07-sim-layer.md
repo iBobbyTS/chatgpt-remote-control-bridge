@@ -764,3 +764,35 @@ core/src/config/mod.rs:3902-3903，默认 60s、键 thread_unload_delay_secs）�
 测试新增 3 条：回环（有订阅不卸 / 退订超时卸 / 非 ephemeral 永不卸）、直连
 （半程重订阅重置 deadline / forgetClient 触发计时）、直连（活动 turn 冻结，
 turn 结束后才计时）。sim 55/55，全量 193/193。
+
+### 追记：side chat「秒过期」体感——App 侧将 ephemeral 会话绑定到连接；服务器侧与 codex 逐帧一致（2026-09-27）
+
+**现象**（真机，线程 01a0e0e7-f5ef）：side chat 内连发 "Hi"（03:28:16-18.6 完成）
+与 "Hi2"（03:28:22.5-25.085 完成），**回复结束后约 1-2 秒**手机即显示会话过期；
+上一轮（01a0e0de）亦报告「约半分钟过期」。
+
+**帧级定性：App 侧行为，非服务器过期**。时间线：Hi2 turn/completed 03:28:25.085
+→ 手机 presence 连接 03:28:25.698 轮换关闭（+0.6s）→ 新连接重建状态，App 在此
+瞬间将 side chat 判为过期——**全程零服务器往返**（整个窗口对 f5ef 的 resume
+尝试为 0、错误响应为 0）。服务器实际在 03:29:25.7（最后事件 +60.0s）才卸载，
+期间任何 resume 都会成功，App 没有来。即：**App 把 ephemeral side chat 的生命
+周期绑定在自己的连接上，重连即判死，不向服务器求证**。
+
+**codex 对齐状况——服务器侧全部验证一致**：
+
+1. 60 秒默认：core/src/config/mod.rs:3902-3903 `unwrap_or(60)`；config_toml.rs
+   文档注释明写 "Defaults to 60"；thread-manager-sample 同为 60。用户可经
+   config.toml `thread_unload_delay_secs` 覆盖（测试见 0/1800）。
+2. 续期语义（max(无订阅起点, 无活动起点)+60s）：两轮实测验证——f5ef 连接关闭
+   (+0.6s) 晚于 turn 结束 → 锚定连接关闭，03:29:25.7 卸载恰为 +60.0s；a449
+   连接在 turn 运行中关闭（03:27:55.8）而 turn 03:27:58.1 才结束 → 正确锚定
+   更晚的 turn 结束，03:28:58.1 卸载。
+3. 关键点：**App 的重连/再水化/「不恢复 ephemeral」代码路径对真实 codex 跑的是
+   同一套**（协议面相同）——真实 codex 后端下同样会在重连后 1-2 秒显示过期，
+   服务器同样白等 60 秒。故此体感不是桥/sim 的缺陷，也不是 parity 缺口；
+   系 App 对 ephemeral 会话的设计（或缺陷），归属 OpenAI。
+
+**未采取的偏离选项**（记录在案，按对齐原则不动）：sim 无视 fork 的
+`ephemeral:true` → side chat 成为普通持久线程，进 thread/list，每次重连 App 会
+像主线程一样 resume 它（现会话 01a0e0b2-d1d0 即被每周期 resume 续命）。代价：
+偏离 codex、side chat 永久留在会话列表。
