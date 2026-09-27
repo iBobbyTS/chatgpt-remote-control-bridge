@@ -652,3 +652,25 @@ thread/goal/updated 的独立轨道，不受影响。测试：resume 补发断�
 read 与 remoteControl/status/read，均已实现）。回归测试断言 initialize 后不出现
 这两条通知；全量 189/189（wham T9 在全量并行时偶发超时，单独重跑通过，与本次改
 动无关）。
+
+### 追记：status 页每 30s 短闪「不可用」——resume 补发二次重申 + attach 重放（2026-09-27）
+
+account/updated 修复后新会话实测：上下文正确显示为主，但每 ~30s（精确对齐手机
+presence 重连周期，帧内 INIT :26.3/:56.3 → 用户见闪动 :27/:57）短闪一次「不可
+用」。逐帧对比「干净」周期（旧线程 bd6f，02:09）与「闪动」周期（新线程 c051，
+02:14）：服务端字节级等价（initialize 响应 → ~14×thread/list → goal/get →
+resume 响应 → tokenUsage 补发（196/258000，数值正确）→ goal/cleared → 列表收
+尾），无任何清空源。结论：闪动发生在 App 重建窗口内——重连后 App 再水化
+（turns/items 合并，实测持续 ~0.7-1.3s）期间/尾声可能覆盖补发已恢复的用量显示。
+另：重启边界（presence token 轮换后的首个周期）App 只 initialize 不 resume，
+补发整周期缺席（02:03:33 实测）。服务器侧可做的两个幂等缓解（同负载重申，无新
+通知种类；刻意偏离 codex 单次补发）：
+
+1. **resume 后二次重申**：原 +0 补发外，在 TOKEN_USAGE_REASSERT_MS=1500ms（越过
+   再水化窗口）重发同一快照（快照为空/线程消失时静默跳过）。
+2. **initialize attach 重放**：重放最近活跃线程（recencyAt 最大且有快照）的
+   tokenUsage——补齐重启边界 App 跳过 resume 的整周期空窗。响应先行由宏任务
+   schedule 保证。
+
+测试：resume 补发测试加二次重申断言；新增 attach 重放测试（不 resume 只
+initialize 也能收到快照）；全量 190/190。

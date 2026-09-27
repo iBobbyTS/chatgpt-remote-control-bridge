@@ -3419,6 +3419,48 @@ test("回环：resume 补发 tokenUsage 快照（上下文行数据源），响�
         "tokenUsage 补发应先于 goal 快照",
       );
     }
+    // 二次重申（TOKEN_USAGE_REASSERT_MS）：越过客户端再水化窗口后重发同一快照，
+    // 防 App 重建尾声覆盖第一次补发（status 页每 30s 短闪「不可用」的实测缓解）
+    await waitFor(
+      () => loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").length >= 2,
+      4000,
+      "resume 后未收到二次重申",
+    );
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：initialize attach 重放最近活跃线程的 tokenUsage 快照（重启边界 App 跳过 resume 的补齐）", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/attach" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const turn = (await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "attach 探测" }],
+    })) as { result: { turn: { id: string } } };
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "turn/completed 未收到",
+    );
+    // 模拟环境重启边界：App 重连只 initialize、不 resume
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "thread/tokenUsage/updated"),
+      2000,
+      "initialize 后应重放最近活跃线程快照",
+    );
+    const replay = loop.mock.receivedNotifications.find((n) => n.method === "thread/tokenUsage/updated")!
+      .params as { threadId: string; turnId: string };
+    assert.equal(replay.threadId, threadId);
+    assert.equal(replay.turnId, turn.result.turn.id, "attach 重放应归属最近完成的 turn");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
