@@ -28,6 +28,7 @@ export const simAgentModule: AgentModule = {
     return new SimApp({
       codexHome: ctx.authManager.codexHome,
       statePath: join(ctx.instanceDir, SIM_STATE_FILENAME),
+      filesDir: ctx.filesDir,
       getServerInfo: () => ctx.identity(),
       log: ctx.log,
     });

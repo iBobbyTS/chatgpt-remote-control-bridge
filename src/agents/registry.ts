@@ -26,6 +26,8 @@ export interface AgentInstanceContext {
   instanceDir: string;
   /** 共享登录态管理器（指向 <CGRCB_HOME>/home）。 */
   authManager: BridgeAuthManager;
+  /** 附件上传落盘根目录（<CGRCB_HOME>/files）。 */
+  filesDir: string;
   /** 实例身份（晚绑定到隧道；未 enroll 前 null）。 */
   identity: () => AgentIdentity | null;
   /** 实例日志（daemon 加实例前缀后输出）。 */

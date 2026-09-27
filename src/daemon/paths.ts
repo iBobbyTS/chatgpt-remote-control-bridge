@@ -5,6 +5,7 @@
  *
  *   <root>/config.json         守护进程配置（{version, agents}）
  *   <root>/home/               共享 codex-home 形状目录（auth.json；BridgeAuthManager 指向它）
+ *   <root>/files/              手机附件上传落盘（fs/writeFile：<threadId>/<uuid>/<文件名>，其余路径镜像于 mirror/）
  *   <root>/instances/<agent>/  每实例目录：
  *       installation_id        上游身份（enroll body/refresh/REST/WSS 握手同源）
  *       state.json             agent 自有状态（sim 会话库，S03）
@@ -24,6 +25,7 @@ export { ENROLLMENT_FILENAME };
 export const DEFAULT_HOME_DIRNAME = ".cgrcb";
 export const CONFIG_FILENAME = "config.json";
 export const CODEX_HOME_DIRNAME = "home";
+export const FILES_DIRNAME = "files";
 export const INSTANCES_DIRNAME = "instances";
 export const SOCKET_FILENAME = "daemon.sock";
 export const LOGS_DIRNAME = "logs";
@@ -61,6 +63,8 @@ export interface CgrcbPaths {
   configPath: string;
   /** 共享 codex-home（BridgeAuthManager.codexHome）。 */
   codexHome: string;
+  /** 附件上传落盘根目录（fs/writeFile）。 */
+  filesDir: string;
   instancesDir: string;
   socketPath: string;
   logsDir: string;
@@ -71,6 +75,7 @@ export function cgrcbPaths(root: string): CgrcbPaths {
     root,
     configPath: join(root, CONFIG_FILENAME),
     codexHome: join(root, CODEX_HOME_DIRNAME),
+    filesDir: join(root, FILES_DIRNAME),
     instancesDir: join(root, INSTANCES_DIRNAME),
     socketPath: join(root, SOCKET_FILENAME),
     logsDir: join(root, LOGS_DIRNAME),

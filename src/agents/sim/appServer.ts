@@ -6,10 +6,12 @@
  * .agent-work/tmp/sim-layer/catalog*.json）。
  */
 import { EventEmitter } from "node:events";
+import { execFile } from "node:child_process";
 import { readFileSync, realpathSync } from "node:fs";
-import { readdir, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir, release } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import {
   approvalModeLabel,
@@ -110,6 +112,11 @@ export interface SimAppOptions {
    * 同一批线程，否则会话列表点击报错、历史丢失。不传则仅内存态（测试用）。
    */
   statePath?: string;
+  /**
+   * fs/writeFile 上传落盘根目录（<CGRCB_HOME>/files）。不传则取 codexHome
+   * 同级的 files/（daemon 布局天然成立；测试的临时 codexHome 同理）。
+   */
+  filesDir?: string;
   log?: (line: string) => void;
 }
 
@@ -129,6 +136,11 @@ interface SimTurnRuntime {
    */
   steerStopRequested: boolean;
   ended: boolean;
+  /**
+   * turn/start 的原始 input 数组（未归一化）：供附件回执提取 localImage/
+   * localAudio 引用项；consumeQueue 续跑等路径缺省（上传回执走线程 catch-all）。
+   */
+  rawInput?: unknown[];
   /**
    * turn 种类（S03）：normal=普通/shell 轻量 turn；compact=thread/compact/start
    * 创建的压缩 turn；goal=goal 续跑 turn（thread/goal/set active 后自动开跑，
@@ -323,12 +335,92 @@ function titleForPrompt(prompt: string, maxLength: number): string {
   return title.length > maxLength ? title.slice(0, maxLength) : title;
 }
 
+// ---------------------------------------------------------------- 附件上传
+
+/**
+ * 手机附件上传目录约定（iOS App 侧命名，codex 源码无此常量）：
+ * `/tmp/codex-remote-attachments/<threadId>/<uuid>/<原始文件名>`；先
+ * fs/createDirectory 再 fs/writeFile，随后 turn/start 以 UserInput
+ * `localImage`/`localAudio`（v2/turn.rs:440-448）引用该路径。
+ */
+const ATTACHMENTS_DIR_PREFIX = "/tmp/codex-remote-attachments/";
+
+/** 按扩展名判定图片（决定是否执行 exiftool）。 */
+const IMAGE_EXTENSIONS = new Set([
+  "jpg", "jpeg", "jfif", "png", "heic", "heif", "avif", "webp", "gif", "tif", "tiff", "bmp", "jxl", "svg",
+]);
+function isImagePath(path: string): boolean {
+  const m = /\.([a-z0-9]+)$/i.exec(path);
+  return m != null && IMAGE_EXTENSIONS.has(m[1]!.toLowerCase());
+}
+
+const execFileP = promisify(execFile);
+/** daemon 环境 PATH 可能缺 /opt/homebrew/bin，exiftool 逐候选回退。 */
+const EXIFTOOL_CANDIDATES = [
+  process.env.EXIFTOOL_PATH,
+  "exiftool",
+  "/opt/homebrew/bin/exiftool",
+  "/usr/local/bin/exiftool",
+].filter((v): v is string => typeof v === "string" && v.length > 0);
+
+/** 执行 exiftool 取全量元数据文本；失败（缺二进制/无法识别）返回 null。 */
+async function runExiftool(file: string): Promise<string | null> {
+  for (const bin of EXIFTOOL_CANDIDATES) {
+    try {
+      const { stdout } = await execFileP(bin, [file], { timeout: 10_000, maxBuffer: 2 * 1024 * 1024 });
+      const text = stdout.trim();
+      if (text) return text;
+    } catch {
+      // 试下一个候选路径
+    }
+  }
+  return null;
+}
+
+/** fs/writeFile 上传记录：虚拟路径（手机可见）→ files/ 内落盘信息（进程内映射）。 */
+interface UploadedFileRecord {
+  virtualPath: string;
+  savedPath: string;
+  /** 从附件路径解析出的线程 ID（非附件目录上传为 null）。 */
+  threadId: string | null;
+  sizeBytes: number;
+  /** 图片上传时预跑的 exiftool 全量输出；非图片 / 失败为 null。 */
+  exiftool: string | null;
+  /** 是否已在某条回复中回执过（每文件只回执一次）。 */
+  echoed: boolean;
+}
+
+/** 回复中回执的附件条目。 */
+type AttachmentEcho =
+  | { kind: "image"; path: string; sizeBytes: number; exiftool: string | null }
+  | { kind: "file"; path: string; sizeBytes: number }
+  | { kind: "missing"; path: string };
+
+/** 附件回执渲染：图片附 exiftool 全量输出，其他文件给保存路径。 */
+function renderAttachment(a: AttachmentEcho): string {
+  if (a.kind === "missing") {
+    return `- 附件未找到：${a.path}`;
+  }
+  const size = `${(a.sizeBytes / 1024).toFixed(1)} KB`;
+  if (a.kind === "image") {
+    return (
+      `- 图片已保存：${a.path}（${size}）\nexiftool 完整信息：\n` +
+      (a.exiftool ?? "（exiftool 执行失败或不可用）")
+    );
+  }
+  return `- 文件已保存：${a.path}（${size}）`;
+}
+
 export class SimApp extends EventEmitter implements AgentApp {
   private readonly clients = new Map<string, SimClientState>();
   private readonly threads = new Map<string, ThreadState>();
   /** 虚拟目录覆盖层：绝对路径 → 存在的目录（模拟 mkdir，不落盘）。 */
   private readonly overlayDirs = new Set<string>();
   private readonly overlayChildren = new Map<string, Set<string>>();
+  /** fs/writeFile 上传记录：手机可见虚拟路径 → files/ 内落盘信息。 */
+  private readonly overlayFiles = new Map<string, UploadedFileRecord>();
+  /** 上传落盘根目录（<CGRCB_HOME>/files）。 */
+  private readonly filesDir: string;
   private readonly opts: Required<
     Pick<
       SimAppOptions,
@@ -355,6 +447,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       shellWaitMs: 2_000,
       ...opts,
     };
+    this.filesDir = this.opts.filesDir ?? join(dirname(this.opts.codexHome), "files");
     if (this.opts.statePath) {
       this.loadStateSync(this.opts.statePath);
     }
@@ -761,6 +854,10 @@ export class SimApp extends EventEmitter implements AgentApp {
       case "fs/createDirectory":
         this.overlayMkdir(p.path);
         return {};
+      case "fs/writeFile":
+        return this.fsWriteFile(p);
+      case "fs/readFile":
+        return this.fsReadFile(p);
       case "process/spawn":
         return this.processSpawn(p);
       case "command/exec":
@@ -1080,7 +1177,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       this.pushSteerInput(state.sim, input.map((c) => c.text).join(""), clientUserMessageId);
       return { turn: { ...this.serializeTurn(state.sim.turn), items: [], itemsView: "notLoaded" as const } };
     }
-    const sim = this.beginSimTurn(state, input, clientUserMessageId, titleSchemaOf(p));
+    const sim = this.beginSimTurn(state, input, clientUserMessageId, titleSchemaOf(p), Array.isArray(p.input) ? p.input : []);
     // 真实 turn/start 响应：items 空、itemsView notLoaded
     return { turn: { ...this.serializeTurn(sim.turn), items: [], itemsView: "notLoaded" as const } };
   }
@@ -1162,11 +1259,12 @@ export class SimApp extends EventEmitter implements AgentApp {
     input: TextContent[],
     clientUserMessageId: string | null,
     titleMaxLength: number | null = null,
+    rawInput: unknown[] = [],
   ): SimTurnRuntime {
     const userText = input.map((c) => c.text).join("");
     const turn = makeTurn("inProgress");
     turn.items = [];
-    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null };
+    const sim: SimTurnRuntime = { turn, timers: new Set(), steerInputs: [], steerStopRequested: false, ended: false, kind: "normal", goalEndStatus: null, rawInput };
     state.sim = sim;
     state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
@@ -1216,7 +1314,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       // agentMessage：流式模拟回复；特殊指令 test steer / test queue 走
       // 「3 条消息 + 2 次模拟等待」脚本，help 在 buildReply 内返回帮助文本；
       // 标题生成 turn（outputSchema{title}）按契约回 JSON
-      this.schedule(sim, () => {
+      this.schedule(sim, async () => {
         const finishTurn = () => {
           this.processSteers(state, sim, () => {
             if (planMode) this.emitPlanNotifications(state, sim);
@@ -1235,7 +1333,9 @@ export class SimApp extends EventEmitter implements AgentApp {
           this.runScriptedTurn(state, sim, special, finishTurn);
           return;
         }
-        const reply = this.composeReply(state, userText);
+        // 附件回执（exiftool 可能在此异步执行）：标题/特殊指令分支不掺入
+        const attachments = await this.collectAttachments(state, sim);
+        const reply = this.composeReply(state, userText, attachments);
         this.streamAgentMessage(state, sim, reply, finishTurn);
       }, this.opts.stepDelayMs);
     }, 0);
@@ -1630,7 +1730,11 @@ export class SimApp extends EventEmitter implements AgentApp {
    * - fork 历史段：fork / side chat 继承过用户历史时，**第一条**普通回复末尾
    *   附加「此前的历史消息：A、B」（sim 本地扩展），用后即清。
    */
-  private composeReply(state: ThreadState, userText: string): string {
+  private composeReply(
+    state: ThreadState,
+    userText: string,
+    attachments: AttachmentEcho[] = [],
+  ): string {
     const base = this.buildReply(userText, state.thread);
     if (specialCommandOf(userText) === "help" || this.namingTitleReplyOf(userText, state.thread) !== null) {
       return base;
@@ -1646,6 +1750,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     const skillLine = this.skillLineFor(userText);
     if (skillLine) lines.push(skillLine);
     let reply = lines.length > 0 ? `${lines.join("\n")}\n${base}` : base;
+    if (attachments.length > 0) {
+      reply += `\n\n附件处理：\n${attachments.map((a) => renderAttachment(a)).join("\n")}`;
+    }
     if (state.historyPrelude !== null) {
       reply += `\n\n此前的历史消息：${state.historyPrelude}`;
       state.historyPrelude = null;
@@ -2527,6 +2634,14 @@ export class SimApp extends EventEmitter implements AgentApp {
     for (const child of this.overlayChildren.get(path) ?? []) {
       names.set(child, this.overlayDirs.has(join(path, child)));
     }
+    for (const virtual of this.overlayFiles.keys()) {
+      if (dirname(virtual) === path) {
+        names.set(basename(virtual), false);
+      }
+    }
+    if (!exists) {
+      exists = [...this.overlayFiles.keys()].some((v) => v.startsWith(`${path}/`));
+    }
     if (!exists) {
       throw new SimMethodError(-32000, `readDirectory: ${path}: no such file or directory`);
     }
@@ -2552,6 +2667,17 @@ export class SimApp extends EventEmitter implements AgentApp {
         modifiedAtMs: Math.round(s.mtimeMs),
       };
     } catch {
+      const uploaded = this.overlayFiles.get(path);
+      if (uploaded) {
+        const s = await stat(uploaded.savedPath).catch(() => null);
+        return {
+          isDirectory: false,
+          isFile: true,
+          isSymlink: false,
+          createdAtMs: Math.round(s?.birthtimeMs ?? 0),
+          modifiedAtMs: Math.round(s?.mtimeMs ?? 0),
+        };
+      }
       if (this.overlayDirs.has(path)) {
         const now = Date.now();
         return { isDirectory: true, isFile: false, isSymlink: false, createdAtMs: now, modifiedAtMs: now };
@@ -2576,6 +2702,123 @@ export class SimApp extends EventEmitter implements AgentApp {
       }
       prev = current;
     }
+  }
+
+  /**
+   * fs/writeFile 虚拟路径 → files/ 内落盘路径。附件目录保留
+   * `<threadId>/<uuid>/<文件名>` 结构；其余绝对路径镜像收进 files/mirror/，
+   * 确保所有写入都落在 files/ 之下。
+   */
+  private savedPathFor(virtualPath: string): string {
+    if (virtualPath.startsWith(ATTACHMENTS_DIR_PREFIX)) {
+      return join(this.filesDir, virtualPath.slice(ATTACHMENTS_DIR_PREFIX.length));
+    }
+    return join(this.filesDir, "mirror", virtualPath.replace(/^\//, "").replace(/\//g, "__"));
+  }
+
+  /**
+   * fs/writeFile（v2/fs.rs:29-40）：{path, dataBase64} → 落盘返回 {}。错误对齐
+   * codex fs_processor.write_file：坏 base64 → -32600，IO 失败 → -32603。
+   * 图片（按扩展名）同步跑 exiftool 缓存全量输出，供下一条回复回执。
+   */
+  private async fsWriteFile(p: AnyParams): Promise<unknown> {
+    const path = typeof p.path === "string" ? p.path : "";
+    if (!path.startsWith("/")) {
+      throw new SimMethodError(-32602, "fs/writeFile requires an absolute path");
+    }
+    const data = p.dataBase64;
+    if (
+      typeof data !== "string" ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data)
+    ) {
+      throw new SimMethodError(-32600, "fs/writeFile requires valid base64 dataBase64: Invalid byte");
+    }
+    const bytes = Buffer.from(data, "base64");
+    const savedPath = this.savedPathFor(path);
+    try {
+      await mkdir(dirname(savedPath), { recursive: true });
+      await writeFile(savedPath, bytes);
+    } catch (err) {
+      throw new SimMethodError(-32603, `fs/writeFile: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    const record: UploadedFileRecord = {
+      virtualPath: path,
+      savedPath,
+      threadId: path.startsWith(ATTACHMENTS_DIR_PREFIX)
+        ? path.slice(ATTACHMENTS_DIR_PREFIX.length).split("/")[0] || null
+        : null,
+      sizeBytes: bytes.length,
+      exiftool: null,
+      echoed: false,
+    };
+    if (isImagePath(path)) {
+      record.exiftool = await runExiftool(savedPath);
+    }
+    this.overlayFiles.set(path, record);
+    this.opts.log?.(`附件已保存：${path} → ${savedPath}（${bytes.length} B${record.exiftool != null ? "，exiftool ✓" : ""}）`);
+    return {};
+  }
+
+  /**
+   * fs/readFile（v2/fs.rs:11-23）：仅回读 sim 自己落盘的上传文件——手机流程
+   * 只回读附件；不开放任意主机路径读取。
+   */
+  private async fsReadFile(p: AnyParams): Promise<unknown> {
+    const path = typeof p.path === "string" ? p.path : "";
+    const record = this.overlayFiles.get(path);
+    if (!record) {
+      throw new SimMethodError(-32000, `readFile: ${path}: no such file or directory`);
+    }
+    const data = await readFile(record.savedPath);
+    return { dataBase64: data.toString("base64") };
+  }
+
+  /**
+   * 收集本 turn 回复要回执的附件：
+   * ① 本线程未回显的上传（附件路径含 threadId——上传与发送之间无引用也保证有回执）；
+   * ② 输入项 localImage/localAudio（v2/turn.rs:440-448）显式引用的路径：已上传
+   *    则对账落盘文件；未上传但真实存在则按主机文件处理（codex LocalImage 语义
+   *    即读取该路径）；不存在报「未找到」。
+   */
+  private async collectAttachments(state: ThreadState, sim: SimTurnRuntime): Promise<AttachmentEcho[]> {
+    const echoes: AttachmentEcho[] = [];
+    const seen = new Set<string>();
+    for (const record of this.overlayFiles.values()) {
+      if (record.threadId === state.thread.id && !record.echoed) {
+        record.echoed = true;
+        seen.add(record.virtualPath);
+        echoes.push(this.echoOfRecord(record));
+      }
+    }
+    for (const item of sim.rawInput ?? []) {
+      if (!item || typeof item !== "object") continue;
+      const e = item as { type?: unknown; path?: unknown };
+      if (e.type !== "localImage" && e.type !== "localAudio") continue;
+      if (typeof e.path !== "string" || seen.has(e.path)) continue;
+      const record = this.overlayFiles.get(e.path);
+      if (record) {
+        record.echoed = true;
+        seen.add(record.virtualPath);
+        echoes.push(this.echoOfRecord(record));
+        continue;
+      }
+      seen.add(e.path);
+      const s = await stat(e.path).catch(() => null);
+      if (s?.isFile() !== true) {
+        echoes.push({ kind: "missing", path: e.path });
+      } else if (isImagePath(e.path)) {
+        echoes.push({ kind: "image", path: e.path, sizeBytes: s.size, exiftool: await runExiftool(e.path) });
+      } else {
+        echoes.push({ kind: "file", path: e.path, sizeBytes: s.size });
+      }
+    }
+    return echoes;
+  }
+
+  private echoOfRecord(record: UploadedFileRecord): AttachmentEcho {
+    return isImagePath(record.virtualPath)
+      ? { kind: "image", path: record.savedPath, sizeBytes: record.sizeBytes, exiftool: record.exiftool }
+      : { kind: "file", path: record.savedPath, sizeBytes: record.sizeBytes };
   }
 
   // -------------------------------------------------------------- 进程模拟

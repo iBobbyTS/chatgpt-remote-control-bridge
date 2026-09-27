@@ -413,6 +413,7 @@ export class CgrcbDaemon {
     return {
       instanceDir: instanceDirFor(this.paths.root, id),
       authManager: this.authManager!,
+      filesDir: this.paths.filesDir,
       identity: () => this.instances.get(id)?.tunnel?.identity() ?? null,
       log: (line) => this.logLine(`[${id}] ${line}`),
     };

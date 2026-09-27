@@ -9,7 +9,7 @@
  */
 import assert from "node:assert/strict";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { test, after } from "node:test";
@@ -77,6 +77,7 @@ async function startLoop(
     compactWaitMs?: number;
     shellWaitMs?: number;
     threadUnloadDelayMs?: number;
+    filesDir?: string;
   } = {},
 ): Promise<Loop> {
   const authHome = await tempDir("home");
@@ -428,6 +429,103 @@ test("回环：工作模式（approval/sandbox）接收 → 回复标注 + 回�
     };
     assert.equal(resumed.result.approvalPolicy, "on-request");
     assert.equal(resumed.result.sandbox.type, "readOnly");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+// 1×1 JPEG（415 B，exiftool 可读出 File Type : JPEG）
+const TINY_JPEG_BASE64 =
+  "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==";
+
+test("回环：fs/writeFile 附件落盘 files/ + 图片 exiftool 回执 + 其他文件路径回执", async () => {
+  const filesRoot = await tempDir("files");
+  const loop = await startLoop({ filesDir: filesRoot });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/files" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+    const uploadUuid = "11111111-2222-3333-4444-555555555555";
+    const virtualDir = `/tmp/codex-remote-attachments/${threadId}/${uploadUuid}`;
+
+    // 手机上传流程：fs/createDirectory → fs/writeFile（成功响应为空对象）
+    const created = (await loop.mock.rpc("fs/createDirectory", { recursive: true, path: virtualDir })) as {
+      result: Record<string, unknown>;
+    };
+    assert.deepEqual(created.result, {});
+    const written = (await loop.mock.rpc("fs/writeFile", {
+      path: `${virtualDir}/1-照片.jpg`,
+      dataBase64: TINY_JPEG_BASE64,
+    })) as { result: Record<string, unknown> };
+    assert.deepEqual(written.result, {});
+
+    // 落盘位置：files/<threadId>/<uuid>/<文件名>（中文文件名原样保留）
+    const savedPath = join(filesRoot, threadId, uploadUuid, "1-照片.jpg");
+    const saved = await stat(savedPath);
+    assert.equal(saved.isFile(), true);
+    assert.equal(saved.size, Buffer.from(TINY_JPEG_BASE64, "base64").length);
+
+    // fs/getMetadata 对虚拟路径回已上传文件元数据
+    const meta = (await loop.mock.rpc("fs/getMetadata", { path: `${virtualDir}/1-照片.jpg` })) as {
+      result: { isFile: boolean; isDirectory: boolean };
+    };
+    assert.equal(meta.result.isFile, true);
+    assert.equal(meta.result.isDirectory, false);
+
+    // turn/start 以 localImage 引用 → 回复含保存路径 + exiftool 全量信息
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", {
+      threadId,
+      input: [
+        { type: "text", text: "看看这张图" },
+        { type: "localImage", path: `${virtualDir}/1-照片.jpg` },
+      ],
+    });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/completed")),
+      8000,
+      "图片 turn 未完成",
+    );
+    const reply1 = findNotif(loop, "item/completed", (p) => p.item.type === "agentMessage")!;
+    const text1 = String(reply1.params.item.text);
+    assert.ok(text1.includes(savedPath), `回复应含图片保存路径：${text1.split("\n")[0]}`);
+    assert.ok(text1.includes("File Type"), `回复应含 exiftool 输出：${text1.split("\n")[0]}`);
+
+    // 其他文件（纯文本 turn，catch-all：按上传目录 threadId 回执）→ 只给保存路径
+    await loop.mock.rpc("fs/writeFile", {
+      path: `${virtualDir}/notes.txt`,
+      dataBase64: Buffer.from("hello attachment").toString("base64"),
+    });
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("turn/start", { threadId, input: [{ type: "text", text: "再来一个文件" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => isNotif(n, "turn/completed")),
+      8000,
+      "文件 turn 未完成",
+    );
+    const reply2 = findNotif(loop, "item/completed", (p) => p.item.type === "agentMessage")!;
+    const text2 = String(reply2.params.item.text);
+    assert.ok(
+      text2.includes(join(filesRoot, threadId, uploadUuid, "notes.txt")),
+      `回复应含文件保存路径：${text2.split("\n")[0]}`,
+    );
+    assert.ok(!text2.includes("exiftool 完整信息"), "非图片不走 exiftool");
+
+    // fs/readFile 回读已上传虚拟文件
+    const back = (await loop.mock.rpc("fs/readFile", { path: `${virtualDir}/notes.txt` })) as {
+      result: { dataBase64: string };
+    };
+    assert.equal(Buffer.from(back.result.dataBase64, "base64").toString("utf8"), "hello attachment");
+
+    // 坏 base64 → -32600（对齐 codex fs_processor.write_file）
+    const bad = (await loop.mock.rpc("fs/writeFile", {
+      path: `${virtualDir}/bad.bin`,
+      dataBase64: "!!!",
+    })) as { error?: { code: number; message: string } };
+    assert.equal(bad.error?.code, -32600);
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
