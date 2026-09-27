@@ -1434,13 +1434,9 @@ export class SimApp extends EventEmitter implements AgentApp {
     if (specialCommandOf(userText) === "help") {
       return HELP_TEXT;
     }
-    if (thread.ephemeral) {
-      // 手机起名线程：输入是"…User prompt:\n<用户首条消息>"，回复须是 ≤36 字符单行标题
-      const m = userText.match(/User prompt:\s*([\s\S]+)$/);
-      const prompt = (m ? m[1]! : userText).trim();
-      const firstLine = prompt.split("\n").map((s) => s.trim()).filter(Boolean)[0] ?? "";
-      const title = firstLine.replace(/["`*#]/g, "").trim().slice(0, 36);
-      return title.length > 0 ? title : "模拟任务";
+    const namingTitle = this.namingTitleReplyOf(userText, thread);
+    if (namingTitle !== null) {
+      return namingTitle;
     }
     return [
       `已收到消息：「${userText}」。`,
@@ -1455,15 +1451,34 @@ export class SimApp extends EventEmitter implements AgentApp {
   }
 
   /**
+   * 起名兜底：ephemeral 线程上带 "User prompt:\n<首条消息>" marker 的输入 →
+   * ≤36 字符单行标题；其余（side conversation 等真实 ephemeral 对话）返回
+   * null 走标准回复。真机帧证据：起名 turn 12/12 带 outputSchema{title}+
+   * turnTrigger=remote_ios（走 titleSchemaOf 的 JSON 分支，到不了这里）；
+   * ephemeral 且无 marker 的输入历史上只出现在 side chat（2026-09-27 帧证：
+   * 回复被截成原文 36 字符即此兜底误伤）。旧「无 marker 时用整段文本当标题」
+   * 的回退据此删除。
+   */
+  private namingTitleReplyOf(userText: string, thread: ThreadRecord): string | null {
+    if (!thread.ephemeral) return null;
+    const m = userText.match(/User prompt:\s*([\s\S]+)$/);
+    if (!m) return null;
+    const firstLine = m[1]!.trim().split("\n").map((s) => s.trim()).filter(Boolean)[0] ?? "";
+    const title = firstLine.replace(/["`*#]/g, "").trim().slice(0, 36);
+    return title.length > 0 ? title : "模拟任务";
+  }
+
+  /**
    * 组装普通 turn 的 agentMessage 文本：在 buildReply 正文前按序叠加模拟钩子行。
    * - justCompacted：compact 后**下一条**普通 turn 的首行「刚刚经历过compact」，用后即清；
    * - Plan 模式：线程 collaborationMode.mode==="plan" 时前缀「【Plan 模式（模拟）】」；
    * - 技能：输入含 `$名` 且名 ∈ SKILLS → 一行「已加载技能 $名（模拟）。」。
-   * help 与 ephemeral 起名回复保持原样（不叠加钩子，既有断言不受影响）。
+   * help 与起名兜底回复保持原样（不叠加钩子，既有断言不受影响）；side
+   * conversation 等普通 ephemeral 对话照常叠加。
    */
   private composeReply(state: ThreadState, userText: string): string {
     const base = this.buildReply(userText, state.thread);
-    if (specialCommandOf(userText) === "help" || state.thread.ephemeral) {
+    if (specialCommandOf(userText) === "help" || this.namingTitleReplyOf(userText, state.thread) !== null) {
       return base;
     }
     const lines: string[] = [];

@@ -716,3 +716,25 @@ content）→ 后续 `thread/name/set`。两条 RPC sim 均未实现 → -32601 
 SimItem 联合加宽后字面量比较不再收窄，新增 isUserMessageItem/isAgentMessageItem
 谓词集中收窄（finishSimTurn 计数等 3 处改用）。新增回环测试覆盖 side chat 全流
 程与三组非法入参；sim 52/52，全量 190/190。
+
+### 追记：side chat 回复被截成用户原文——ephemeral 起名兜底误伤（2026-09-27）
+
+inject_items/name/set 修复后真机复测：side chat 里发 "Hi"/"Side?"，agentMessage
+恰好只回原文。帧证据（02:40:54/02:41:02）：`item/completed agentMessage
+text="Hi"`——sim 自己生成的文本。根因：side chat 的 fork 带
+`ephemeral:true`（App 侧轻会话语义），而 buildReply 存在一版早期的「ephemeral
+即起名线程」兜底（21c54eb，早于 outputSchema 精确判定 6fdc38a）：输入匹配不到
+`"User prompt:\n<msg>"` marker 时回退**用整段输入首行截 36 字符当标题**——裸
+用户消息正好落进该回退。
+
+帧证据裁决回退可安全删除：全量扫描 frames.jsonl，含 "User prompt:" 的起名
+turn 12/12 均带 `outputSchema{title}` + `turnTrigger=remote_ios`（走
+titleSchemaOf 的 JSON 分支，到不了该兜底）；ephemeral 且无 marker 的输入历史
+上只出现在 side chat。
+
+修复：兜底收敛为 `namingTitleReplyOf`——ephemeral **且** 输入带 "User prompt:"
+marker 才返回标题，否则 null 走标准完整回复；composeReply 的 ephemeral 钩子
+豁免同步改为同一判定（side chat 照常叠加 Plan/技能钩子行）。测试：side chat
+用例改为真机 fork 形状（ephemeral+excludeTurns）并补回复全文断言（正是缺这条
+断言放走了本 bug）；name/set 部分挪到持久线程（真机即如此）并断言 ephemeral
+side chat 不进 thread/list。S9 起名（带 marker）不受影响。全量 190/190。

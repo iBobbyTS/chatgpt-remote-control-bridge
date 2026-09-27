@@ -3492,7 +3492,7 @@ test("回环：上下文占用 = 会话消息 char 数（新会话 0 基线，�
   }
 });
 
-test("回环：side conversation——fork(excludeTurns) 响应不带 turns；inject_items 注入边界（计入历史与上下文）；name/set 更新并广播", async () => {
+test("回环：side conversation——ephemeral fork 走标准回复；inject_items 注入边界（计入历史与上下文）；name/set 更新并广播", async () => {
   const loop = await startLoop();
   try {
     await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
@@ -3513,14 +3513,20 @@ test("回环：side conversation——fork(excludeTurns) 响应不带 turns；in
     ).tokenUsage.total.totalTokens;
     assert.ok(parentUsage > 0, "父线程先产生非零占用");
 
-    // fork excludeTurns：响应只带元数据（turns 空），线程本体仍继承全部历史
+    // fork 真机形状：ephemeral + excludeTurns（响应只带元数据，turns 空），
+    // 线程本体仍继承全部历史
     await new Promise((resolve) => setTimeout(resolve, 150)); // 等 emitSoon 浮面
     loop.mock.receivedNotifications.length = 0;
-    const fork = (await loop.mock.rpc("thread/fork", { threadId: parentId, excludeTurns: true })) as {
-      result: { thread: { id: string; forkedFromId: string | null; turns: unknown[] } };
+    const fork = (await loop.mock.rpc("thread/fork", {
+      threadId: parentId,
+      ephemeral: true,
+      excludeTurns: true,
+    })) as {
+      result: { thread: { id: string; ephemeral: boolean; forkedFromId: string | null; turns: unknown[] } };
     };
     const sideId = fork.result.thread.id;
     assert.notEqual(sideId, parentId);
+    assert.equal(fork.result.thread.ephemeral, true);
     assert.equal(fork.result.thread.forkedFromId, parentId);
     assert.equal(fork.result.thread.turns.length, 0, "excludeTurns=true 响应不填充 turns");
     const forkTurns = (await loop.mock.rpc("thread/turns/list", { threadId: sideId })) as {
@@ -3550,7 +3556,8 @@ test("回环：side conversation——fork(excludeTurns) 响应不带 turns；in
     );
     assert.ok(injected, "注入的边界消息应出现在 items/list");
 
-    // side 首轮上下文 = 继承的父线程占用 + 边界注入 + 本轮消息（fork 复制计数 + inject 即时计入）
+    // side 首轮：ephemeral 线程上的裸用户输入必须走**标准完整回复**——曾因
+    // ephemeral 起名兜底误伤被截成 ≤36 字符标题（2026-09-27 真机 "Hi"→"Hi"）
     loop.mock.receivedNotifications.length = 0;
     await loop.mock.rpc("turn/start", { threadId: sideId, input: [{ type: "text", text: "side 问题" }] });
     await waitFor(
@@ -3558,25 +3565,29 @@ test("回环：side conversation——fork(excludeTurns) 响应不带 turns；in
       10_000,
       "side turn/completed 未收到",
     );
-    const sideUsage = (
-      loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").pop()!
-        .params as { tokenUsage: { total: { totalTokens: number } } }
-    ).tokenUsage.total.totalTokens;
     const sideAgentItem = (
       loop.mock.receivedNotifications.find((n) => n.method === "turn/completed")!.params as {
         turn: { items: Array<{ type: string; text?: string }> };
       }
     ).turn.items.find((i) => i.type === "agentMessage");
-    const sideAgentChars = (sideAgentItem?.text ?? "").length;
+    const sideAgentText = sideAgentItem?.text ?? "";
+    assert.match(sideAgentText, /已收到消息：「side 问题」/, "side chat 回复须含标准首行");
+    assert.match(sideAgentText, /bridge 模拟层的固定回复/, "side chat 回复须含完整说明块");
+    assert.ok(sideAgentText.length > "side 问题".length, "回复不得被截成用户原文");
+    // 上下文 = 继承的父线程占用 + 边界注入 + 本轮消息（fork 复制计数 + inject 即时计入）
+    const sideUsage = (
+      loop.mock.receivedNotifications.filter((n) => n.method === "thread/tokenUsage/updated").pop()!
+        .params as { tokenUsage: { total: { totalTokens: number } } }
+    ).tokenUsage.total.totalTokens;
     assert.equal(
       sideUsage,
-      parentUsage + boundary.length + "side 问题".length + sideAgentChars,
+      parentUsage + boundary.length + "side 问题".length + sideAgentText.length,
       "side 首轮占用 = 继承 + 注入 + 本轮",
     );
 
-    // name/set：响应 {} + thread/name/updated（trim 归一化），thread/list 生效
+    // name/set（真机给持久线程起名）：响应 {} + thread/name/updated（trim 归一化），thread/list 生效
     loop.mock.receivedNotifications.length = 0;
-    const named = (await loop.mock.rpc("thread/name/set", { threadId: sideId, name: "  hi  " })) as {
+    const named = (await loop.mock.rpc("thread/name/set", { threadId: parentId, name: "  hi  " })) as {
       result: unknown;
     };
     assert.deepEqual(named.result, {});
@@ -3588,12 +3599,13 @@ test("回环：side conversation——fork(excludeTurns) 响应不带 turns；in
     const nameNotif = loop.mock.receivedNotifications.find(
       (n) => n.method === "thread/name/updated",
     )!.params as { threadId: string; threadName: string };
-    assert.equal(nameNotif.threadId, sideId);
+    assert.equal(nameNotif.threadId, parentId);
     assert.equal(nameNotif.threadName, "hi");
     const list = (await loop.mock.rpc("thread/list", {})) as {
       result: { data: Array<{ id: string; name: string | null }> };
     };
-    assert.equal(list.result.data.find((t) => t.id === sideId)?.name, "hi");
+    assert.equal(list.result.data.find((t) => t.id === parentId)?.name, "hi");
+    assert.ok(!list.result.data.some((t) => t.id === sideId), "ephemeral side chat 不进 thread/list");
 
     // 非法入参：空 items / 坏 item / 空名 → -32600（对齐 codex invalid_request）
     const badItems = (await loop.mock.rpc("thread/inject_items", { threadId: sideId, items: [] })) as {
