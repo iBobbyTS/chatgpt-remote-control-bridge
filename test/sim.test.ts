@@ -266,6 +266,68 @@ test("回环：initialize / thread/list（固定列表）/ thread/start / turn �
   }
 });
 
+test("回环：model/list 三模型目录 + 新线程默认模型/思考强度联动", async () => {
+  const loop = await startLoop();
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const models = (await loop.mock.rpc("model/list", {})) as {
+      result: {
+        data: Array<{
+          id: string;
+          displayName: string;
+          supportedReasoningEfforts: Array<{ reasoningEffort: string }>;
+          defaultReasoningEffort: string;
+          isDefault: boolean;
+        }>;
+        nextCursor: string | null;
+      };
+    };
+    assert.equal(models.result.nextCursor, null);
+    assert.deepEqual(
+      models.result.data.map((m) => m.id),
+      ["deepseek-flash", "glm-5.3", "test-model"],
+    );
+    assert.deepEqual(
+      models.result.data.map((m) => m.displayName),
+      ["DeepSeek V4.1 Flash", "GLM 5.3", "Test Model"],
+    );
+    assert.deepEqual(
+      models.result.data.map((m) => m.supportedReasoningEfforts.map((o) => o.reasoningEffort)),
+      [["low", "high", "max"], ["low", "high", "max"], ["low", "medium", "high", "xhigh", "max"]],
+    );
+    assert.equal(
+      models.result.data.filter((m) => m.isDefault).length,
+      1,
+      "isDefault 唯一",
+    );
+    assert.equal(models.result.data.find((m) => m.isDefault)!.id, "deepseek-flash");
+
+    // 新线程默认模型/档位取自目录（顶层与 thread 元数据一致）
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/models" })) as {
+      result: {
+        model: string;
+        reasoningEffort: string;
+        thread: { id: string; model: string; reasoningEffort: string };
+      };
+    };
+    assert.equal(started.result.model, "deepseek-flash");
+    assert.equal(started.result.reasoningEffort, "high");
+    assert.equal(started.result.thread.model, "deepseek-flash");
+    assert.equal(started.result.thread.reasoningEffort, "high");
+
+    // 协作模式默认档跟随线程模型目录档位（defaultCollaborationMode）
+    const resumed = (await loop.mock.rpc("thread/resume", {
+      threadId: started.result.thread.id,
+    })) as {
+      result: { collaborationMode: { settings: { reasoning_effort: string } } };
+    };
+    assert.equal(resumed.result.collaborationMode.settings.reasoning_effort, "high");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("turn/start 派发期间不得发射 turn 通知（响应先行的应用层契约）", async () => {
   const dir = await tempDir("order-app");
   const app = new SimApp({ codexHome: dir, stepDelayMs: 10, deltaIntervalMs: 2, deltaChars: 64 });

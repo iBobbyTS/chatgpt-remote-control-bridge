@@ -196,30 +196,83 @@ export function isAgentMessageItem(item: SimItem): item is AgentMessageItem {
 }
 
 export const CLI_VERSION = "0.157.0";
-export const DEFAULT_MODEL = "gpt-6-luna";
+export const DEFAULT_MODEL = "deepseek-flash";
 /** 上下文窗口总大小（tokenUsage.modelContextWindow）；已占用上限为其减 1（257999）。 */
 export const MODEL_CONTEXT_WINDOW = 258_000;
 
-/** 默认协作模式（mode default，settings.model 取线程模型，reasoning_effort medium）。 */
+/** 模型目录默认思考强度；未收录模型（如旧线程的 gpt-6-luna）回退 medium。 */
+export function defaultReasoningEffortFor(model: string): string {
+  return MODELS.find((m) => m.model === model)?.defaultReasoningEffort ?? "medium";
+}
+
+/** 默认协作模式（mode default；settings.model 取线程模型，effort 取该模型目录默认档）。 */
 export function defaultCollaborationMode(model: string): CollaborationMode {
   return {
     mode: "default",
-    settings: { model, reasoning_effort: "medium", developer_instructions: null },
+    settings: { model, reasoning_effort: defaultReasoningEffortFor(model), developer_instructions: null },
   };
 }
 
 // ------------------------------------------------------------- 固定目录数据
 
-/** model/list（真实样本的 4 个模型，去掉 upgrade 类字段噪音）。 */
+/** model/list：3 个模拟模型（字段形状取自真实样本，去掉 upgrade 类字段噪音）。 */
 export const MODELS = [
   {
-    id: "gpt-6-luna",
-    model: "gpt-6-luna",
+    id: "deepseek-flash",
+    model: "deepseek-flash",
     upgrade: null,
     upgradeInfo: null,
     availabilityNux: null,
-    displayName: "GPT-6-Luna",
+    displayName: "DeepSeek V4.1 Flash",
     description: "Fast and affordable model for easier tasks.",
+    modelSpecialty: null,
+    hidden: false,
+    supportedReasoningEfforts: ["low", "high", "max"].map((e) => ({
+      reasoningEffort: e,
+      description: "Simulated reasoning effort",
+    })),
+    defaultReasoningEffort: "high",
+    inputModalities: ["text", "image"],
+    supportsPersonality: false,
+    multiAgentVersion: "v2",
+    additionalSpeedTiers: [],
+    serviceTiers: [],
+    defaultServiceTier: null,
+    availableAccessPrograms: { cyber: ["standard"] },
+    isDefault: true,
+  },
+  {
+    id: "glm-5.3",
+    model: "glm-5.3",
+    upgrade: null,
+    upgradeInfo: null,
+    availabilityNux: null,
+    displayName: "GLM 5.3",
+    description: "Balanced model for everyday coding tasks.",
+    modelSpecialty: null,
+    hidden: false,
+    supportedReasoningEfforts: ["low", "high", "max"].map((e) => ({
+      reasoningEffort: e,
+      description: "Simulated reasoning effort",
+    })),
+    defaultReasoningEffort: "high",
+    inputModalities: ["text", "image"],
+    supportsPersonality: false,
+    multiAgentVersion: "v2",
+    additionalSpeedTiers: [],
+    serviceTiers: [],
+    defaultServiceTier: null,
+    availableAccessPrograms: { cyber: ["standard"] },
+    isDefault: false,
+  },
+  {
+    id: "test-model",
+    model: "test-model",
+    upgrade: null,
+    upgradeInfo: null,
+    availabilityNux: null,
+    displayName: "Test Model",
+    description: "Simulated test model with the full effort ladder.",
     modelSpecialty: null,
     hidden: false,
     supportedReasoningEfforts: ["low", "medium", "high", "xhigh", "max"].map((e) => ({
@@ -234,7 +287,7 @@ export const MODELS = [
     serviceTiers: [],
     defaultServiceTier: null,
     availableAccessPrograms: { cyber: ["standard"] },
-    isDefault: true,
+    isDefault: false,
   },
 ] as const;
 
@@ -312,7 +365,7 @@ export function makeThread(args: {
     historyMode: "paginated",
     modelProvider: "openai",
     model: DEFAULT_MODEL,
-    reasoningEffort: "medium",
+    reasoningEffort: defaultReasoningEffortFor(DEFAULT_MODEL),
     collaborationMode: defaultCollaborationMode(DEFAULT_MODEL),
     createdAt: args.createdAt ?? now,
     updatedAt: args.createdAt ?? now,
