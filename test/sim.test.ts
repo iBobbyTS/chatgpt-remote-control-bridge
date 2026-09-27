@@ -3629,3 +3629,152 @@ test("回环：side conversation——ephemeral fork 走标准回复；inject_it
     await loop.mock.stop();
   }
 });
+
+// ------------------------------------------- ephemeral 线程空闲卸载（codex 对齐）
+
+test("回环：ephemeral 线程空闲卸载——有订阅不卸；退订后超时移除；非 ephemeral 永不卸载", async () => {
+  const loop = await startLoop({ threadUnloadDelayMs: 150 });
+  try {
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-sim/unload" })) as {
+      result: { thread: { id: string } };
+    };
+    const parentId = started.result.thread.id;
+    await loop.mock.rpc("turn/start", { threadId: parentId, input: [{ type: "text", text: "打底" }] });
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "turn/completed"),
+      10_000,
+      "父线程 turn/completed 未收到",
+    );
+
+    // side chat：ephemeral fork（创建连接已 attach）
+    const fork = (await loop.mock.rpc("thread/fork", { threadId: parentId, ephemeral: true, excludeTurns: true })) as {
+      result: { thread: { id: string } };
+    };
+    const sideId = fork.result.thread.id;
+
+    // 有订阅：超过 2×delay 仍存活
+    await new Promise((r) => setTimeout(r, 400));
+    const alive = (await loop.mock.rpc("thread/items/list", { threadId: sideId })) as {
+      result?: unknown; error?: { code: number };
+    };
+    assert.ok(alive.result, "有订阅的 ephemeral 线程不得卸载");
+
+    // 退订（唯一订阅者离开）→ 超时卸载：resume/items/list 均 thread not found
+    await loop.mock.rpc("thread/unsubscribe", { threadId: sideId });
+    await new Promise((r) => setTimeout(r, 400));
+    const resumed = (await loop.mock.rpc("thread/resume", { threadId: sideId })) as {
+      result?: unknown; error?: { code: number; message: string };
+    };
+    assert.equal(resumed.error?.code, -32000, "退订超时后 ephemeral 线程应已卸载");
+    assert.match(String(resumed.error?.message), /thread not found/);
+    const items = (await loop.mock.rpc("thread/items/list", { threadId: sideId })) as {
+      result?: unknown; error?: { code: number };
+    };
+    assert.ok(items.error, "卸载后 items/list 也应报 thread not found");
+
+    // 非 ephemeral：同样退订 + 超时，永不卸载（落盘线程 resume 冷加载，驻留等价）
+    await loop.mock.rpc("thread/unsubscribe", { threadId: parentId });
+    await new Promise((r) => setTimeout(r, 400));
+    const parentBack = (await loop.mock.rpc("thread/resume", { threadId: parentId })) as {
+      result?: { thread: { id: string } }; error?: { code: number };
+    };
+    assert.ok(parentBack.result, "非 ephemeral 线程不得被空闲卸载");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("直连：ephemeral 卸载计时——重订阅重置 deadline；连接断开（forgetClient）触发计时", async () => {
+  const dir = await tempDir("unload-direct");
+  const statePath = join(dir, "state.json");
+  const app = new SimApp({ codexHome: dir, statePath, threadUnloadDelayMs: 120, log: () => {} });
+  const key = { clientId: "c1", streamId: "s1" };
+  try {
+    await app.handleRequest(key, 1, "initialize", { clientInfo: { name: "t" } });
+    const started = (await app.handleRequest(key, 2, "thread/start", {
+      cwd: "/tmp-sim/unload2",
+      ephemeral: true,
+    })) as { result: { thread: { id: string } } };
+    const threadId = started.result.thread.id;
+    const exists = async () => {
+      const out = (await app.handleRequest(key, 99, "thread/items/list", { threadId })) as {
+        result?: unknown; error?: { code: number };
+      };
+      return !out.error;
+    };
+
+    // 半程重订阅（resume）→ deadline 重置：越过原始 120ms 界线仍存活
+    await app.handleRequest(key, 3, "thread/unsubscribe", { threadId });
+    await new Promise((r) => setTimeout(r, 60));
+    await app.handleRequest(key, 4, "thread/resume", { threadId });
+    await new Promise((r) => setTimeout(r, 250)); // > 原始 deadline(120)+余量
+    assert.ok(await exists(), "半程重订阅后 deadline 必须重置");
+
+    // 再次退订 → 计时归零重跑 → 超时卸载
+    await app.handleRequest(key, 5, "thread/unsubscribe", { threadId });
+    await new Promise((r) => setTimeout(r, 300));
+    assert.ok(!(await exists()), "退订超时后应卸载");
+
+    // 连接断开（订阅随连接消失）→ 同样触发计时
+    const started2 = (await app.handleRequest(key, 6, "thread/start", {
+      cwd: "/tmp-sim/unload3",
+      ephemeral: true,
+    })) as { result: { thread: { id: string } } };
+    const threadId2 = started2.result.thread.id;
+    app.forgetClient(key);
+    await new Promise((r) => setTimeout(r, 300));
+    const out2 = (await app.handleRequest(key, 7, "thread/items/list", { threadId: threadId2 })) as {
+      result?: unknown; error?: { code: number };
+    };
+    assert.ok(out2.error, "连接断开后 ephemeral 线程应超时卸载");
+  } finally {
+    app.close();
+  }
+});
+
+test("直连：活动 turn 冻结 ephemeral 卸载——turn 结束后才开始计时", async () => {
+  const dir = await tempDir("unload-active");
+  const statePath = join(dir, "state.json");
+  // stepDelayMs 300：turn 从开跑到完成明显长于卸载延迟 120ms
+  const app = new SimApp({ codexHome: dir, statePath, threadUnloadDelayMs: 120, stepDelayMs: 300, log: () => {} });
+  const key = { clientId: "c1", streamId: "s1" };
+  try {
+    await app.handleRequest(key, 1, "initialize", { clientInfo: { name: "t" } });
+    const started = (await app.handleRequest(key, 2, "thread/start", {
+      cwd: "/tmp-sim/unload4",
+      ephemeral: true,
+    })) as { result: { thread: { id: string } } };
+    const threadId = started.result.thread.id;
+    const turn = (await app.handleRequest(key, 3, "turn/start", {
+      threadId,
+      input: [{ type: "text", text: "长 turn" }],
+    })) as { result: { turn: { id: string } } };
+    // turn 进行中退订：活动 turn 冻结卸载（超过 delay 仍存活）
+    await app.handleRequest(key, 4, "thread/unsubscribe", { threadId });
+    await new Promise((r) => setTimeout(r, 200));
+    let mid = (await app.handleRequest(key, 5, "thread/items/list", { threadId })) as {
+      result?: unknown; error?: { code: number };
+    };
+    assert.ok(mid.result, "活动 turn 期间不得卸载");
+
+    // turn 完成（is_active 翻 false）→ 计时启动 → 超时卸载
+    let completed = false;
+    for (let i = 0; i < 100 && !completed; i++) {
+      const turns = (await app.handleRequest(key, 100 + i, "thread/turns/list", { threadId })) as {
+        result?: { data: Array<{ id: string; status: string }> };
+      };
+      completed = turns.result?.data.some((t) => t.id === turn.result.turn.id && t.status === "completed") ?? false;
+      if (!completed) await new Promise((r) => setTimeout(r, 30));
+    }
+    assert.ok(completed, "turn 未完成");
+    await new Promise((r) => setTimeout(r, 300));
+    mid = (await app.handleRequest(key, 300, "thread/items/list", { threadId })) as {
+      result?: unknown; error?: { code: number };
+    };
+    assert.ok(mid.error, "turn 结束 + 退订超时后应卸载");
+  } finally {
+    app.close();
+  }
+});

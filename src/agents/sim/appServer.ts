@@ -55,6 +55,8 @@ export interface SimClientState {
   clientInfo: { name?: string; title?: string; version?: string } | null;
   optOut: Set<string>;
   unsubscribed: Set<string>;
+  /** attach 过的线程（正向订阅跟踪，仅服务空闲卸载判定）。 */
+  attached: Set<string>;
   initialized: boolean;
 }
 
@@ -90,6 +92,12 @@ export interface SimAppOptions {
   commandWaitMs?: number;
   /** compact 模拟耗时。默认 5000ms（测试可调小）。 */
   compactWaitMs?: number;
+  /**
+   * ephemeral 线程空闲卸载延迟（core/src/config/mod.rs:3902-3903 默认 60s，
+   * 配置键 thread_unload_delay_secs）：无订阅且无活动 turn 持续该时长后从
+   * 内存移除。测试可调小。
+   */
+  threadUnloadDelayMs?: number;
   /** thread/shellCommand 模拟耗时。默认 2000ms（测试可调小）。 */
   shellWaitMs?: number;
   /** 服务器信息（remoteControl/status/changed 通知用），由 server 注入。 */
@@ -206,17 +214,31 @@ interface ThreadState {
   contextAgentChars: number;
   /** 上下文占用基线：新会话 0；compact 重置后 200。 */
   contextBaseline: number;
+  /**
+   * ephemeral 空闲卸载（内存态，不持久化；thread_lifecycle.rs UnloadingState）：
+   * 「无订阅」「无活动 turn」各自变 true 的时刻，deadline = max(两者) +
+   * threadUnloadDelayMs；任一翻回 true 即重置。仅 ephemeral 线程参与——落盘
+   * 线程的 codex 卸载对客户端不可见（resume 冷加载回来），sim 直接驻留内存等价。
+   */
+  idleNoSubscribersSince: number | null;
+  idleInactiveSince: number | null;
+  unloadTimer: NodeJS.Timeout | null;
 }
 
 /** 新建 ThreadState 的统一入口（补齐 S03 新增字段，避免各处漏初始化）。 */
 function makeThreadState(thread: ThreadRecord, items: ItemEntry[]): ThreadState {
-  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null, contextUserChars: 0, contextAgentChars: 0, contextBaseline: 0 };
+  return { thread, items, queue: [], sim: null, goal: null, goalRunResume: false, goalTurnCount: 0, goalPhaseIndex: 0, interrupted: false, justCompacted: false, backgroundTerminals: [], tokenUsage: null, contextUserChars: 0, contextAgentChars: 0, contextBaseline: 0, idleNoSubscribersSince: null, idleInactiveSince: null, unloadTimer: null };
 }
 
 /** 已占用 token 上限：窗口 258000 减 1。 */
 const CONTEXT_CHARS_MAX = 257_999;
 /** compact 后的上下文占用基线（压缩摘要占位）。 */
 const CONTEXT_BASELINE_AFTER_COMPACT = 200;
+/**
+ * ephemeral 线程空闲卸载延迟（core/src/config/mod.rs:3902-3903 默认
+ * Duration::from_secs(60)，配置键 thread_unload_delay_secs）。
+ */
+const THREAD_UNLOAD_DELAY_MS = 60_000;
 
 type AnyParams = Record<string, any>;
 
@@ -460,7 +482,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     const id = `${key.clientId}/${key.streamId}`;
     let state = this.clients.get(id);
     if (!state) {
-      state = { clientInfo: null, optOut: new Set(), unsubscribed: new Set(), initialized: false };
+      state = { clientInfo: null, optOut: new Set(), unsubscribed: new Set(), attached: new Set(), initialized: false };
       this.clients.set(id, state);
     }
     return state;
@@ -468,6 +490,89 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   forgetClient(key: SimClientKey): void {
     this.clients.delete(`${key.clientId}/${key.streamId}`);
+    // 连接断开 = 其全部订阅消失（codex connection 关闭即 unsubscribe）：
+    // 重算 ephemeral 线程的「无订阅」计时
+    for (const state of this.threads.values()) {
+      if (state.thread.ephemeral) this.touchThreadIdle(state);
+    }
+  }
+
+  /**
+   * 连接 attach 到线程（正向订阅，只驱动空闲卸载计时；通知投递仍走广播 +
+   * opt-out）。codex 的 attach 点：thread/start（thread_processor.rs:1489-1492
+   * "Register the creating client first"）、thread/fork（"Auto-attach a
+   * conversation listener when forking"）、thread/resume（ensure_conversation_
+   * listener → try_ensure_connection_subscribed）。turn/start **不** attach——
+   * 退订后的连接跑 turn 仍收不到通知（回环测试「thread/resume 重订阅」即此契约）。
+   * attached.add 后同步清 unsubscribed：resume 场景恢复投递（既有语义），
+   * start/fork 的新线程 id 本就不在 opt-out 集合里，无副作用。
+   */
+  private attachThread(client: SimClientState, threadId: string): void {
+    client.attached.add(threadId);
+    client.unsubscribed.delete(threadId);
+    const state = this.threads.get(threadId);
+    if (state) this.touchThreadIdle(state);
+  }
+
+  /** thread/unsubscribe：解除该连接的订阅并重算空闲计时。 */
+  private detachThread(client: SimClientState, threadId: string): void {
+    client.attached.delete(threadId);
+    const state = this.threads.get(threadId);
+    if (state) this.touchThreadIdle(state);
+  }
+
+  /**
+   * ephemeral 线程空闲卸载（thread_lifecycle.rs:55-119 UnloadingState）：
+   * 「无订阅」与「无活动 turn」（含队列非空、中止悬挂）任一不满足 → 清计时；
+   * 两者都为 true 时 deadline = max(各自起始时刻) + threadUnloadDelayMs，
+   * 到点复核后从内存移除。非 ephemeral 线程不参与（落盘线程的 codex 卸载
+   * 对客户端不可见——resume 会冷加载回来，sim 直接驻留内存等价）。
+   */
+  private touchThreadIdle(state: ThreadState): void {
+    if (this.closed || !state.thread.ephemeral) return;
+    const hasSubscribers = [...this.clients.values()].some((c) => c.attached.has(state.thread.id));
+    const active =
+      (state.sim != null && !state.sim.ended) ||
+      state.queue.length > 0 ||
+      state.interrupted;
+    if (hasSubscribers) {
+      state.idleNoSubscribersSince = null;
+    } else if (state.idleNoSubscribersSince == null) {
+      state.idleNoSubscribersSince = Date.now();
+    }
+    if (active) {
+      state.idleInactiveSince = null;
+    } else if (state.idleInactiveSince == null) {
+      state.idleInactiveSince = Date.now();
+    }
+    if (state.unloadTimer) {
+      clearTimeout(state.unloadTimer);
+      this.pendingTimers.delete(state.unloadTimer);
+      state.unloadTimer = null;
+    }
+    if (state.idleNoSubscribersSince == null || state.idleInactiveSince == null) return;
+    const delay = this.opts.threadUnloadDelayMs ?? THREAD_UNLOAD_DELAY_MS;
+    const deadline = Math.max(state.idleNoSubscribersSince, state.idleInactiveSince) + delay;
+    const timer: NodeJS.Timeout = setTimeout(() => {
+      state.unloadTimer = null;
+      this.pendingTimers.delete(timer);
+      if (this.closed || this.threads.get(state.thread.id) !== state) return;
+      // 到点复核（正常路径下任何条件翻转都会经 touch 重排/取消计时）
+      if (
+        [...this.clients.values()].some((c) => c.attached.has(state.thread.id)) ||
+        (state.sim != null && !state.sim.ended) ||
+        state.queue.length > 0 ||
+        state.interrupted
+      ) {
+        this.touchThreadIdle(state);
+        return;
+      }
+      if (state.sim) this.clearTimers(state.sim);
+      this.threads.delete(state.thread.id);
+      this.opts.log?.(`ephemeral 线程空闲卸载: ${state.thread.id}`);
+    }, Math.max(0, deadline - Date.now()));
+    state.unloadTimer = timer;
+    this.pendingTimers.add(timer);
   }
 
   pongStatus(): "active" | "unknown" {
@@ -541,16 +646,25 @@ export class SimApp extends EventEmitter implements AgentApp {
         return this.initialize(client, p);
       case "thread/list":
         return this.threadList(p);
-      case "thread/start":
-        return this.threadStart(p);
-      case "thread/resume":
+      case "thread/start": {
+        // 创建连接随 start attach（codex thread_processor.rs:1487-1492
+        // "Register the creating client first"）
+        const result = this.threadStart(p) as { thread: { id: string } };
+        this.attachThread(client, result.thread.id);
+        return result;
+      }
+      case "thread/resume": {
         // resume 即重新订阅：对齐 codex thread_processor.rs:1018-1043 的 resume
         // 语义（最终走 thread_state.rs:559-581 try_ensure_connection_subscribed），
-        // 否则先 unsubscribe 再 resume 的连接会永久收不到该线程通知
-        client.unsubscribed.delete(p.threadId ?? p.thread_id);
-        return this.threadResume(p);
+        // 否则先 unsubscribe 再 resume 的连接会永久收不到该线程通知。
+        // 成功后才 attach（线程不存在时不得留下幽灵订阅）。
+        const result = this.threadResume(p);
+        this.attachThread(client, String(p.threadId ?? p.thread_id ?? ""));
+        return result;
+      }
       case "thread/unsubscribe":
         client.unsubscribed.add(p.threadId ?? p.thread_id);
+        this.detachThread(client, String(p.threadId ?? p.thread_id ?? ""));
         return { status: "unsubscribed" };
       case "thread/turns/list":
         return this.turnsList(p);
@@ -599,8 +713,12 @@ export class SimApp extends EventEmitter implements AgentApp {
         return this.backgroundTerminalsClean(p);
       case "thread/metadata/update":
         return this.metadataUpdate(p);
-      case "thread/fork":
-        return this.threadFork(p);
+      case "thread/fork": {
+        const result = this.threadFork(p) as { thread: { id: string } };
+        // fork 与 start 同义：创建连接 attach 到新线程
+        this.attachThread(client, result.thread.id);
+        return result;
+      }
       case "thread/name/set":
         return this.threadNameSet(p);
       case "thread/inject_items":
@@ -1025,6 +1143,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
+    this.touchThreadIdle(state); // 活动 turn 开始：冻结 ephemeral 空闲卸载计时
     // 标题生成 turn 的 preview 用提取的标题（手机以该 turn 的 JSON 输出更新任务标题）
     state.thread.preview =
       titleMaxLength != null
@@ -1407,6 +1526,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       },
     }, state.thread.id));
     state.sim = null;
+    this.touchThreadIdle(state); // turn 结束：无订阅场景下重启空闲卸载计时
     this.persistState();
   }
 
@@ -1420,6 +1540,8 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.emit("event", this.notification("thread/queue/changed", { threadId: state.thread.id }, state.thread.id));
     this.schedule(null, () => {
       if (this.closed) return;
+      // 等待窗口内线程可能已被空闲卸载（极小 delay 的测试场景）：不复活孤儿状态
+      if (this.threads.get(state.thread.id) !== state) return;
       // MB3 回调竞态：若等待窗口内已有活动 turn（如 compact/start 接管），不得
       // 覆盖 state.sim——把消息放回队首，交由当前 turn 的收尾链再消费。
       if (state.sim && !state.sim.ended) {
@@ -1657,6 +1779,7 @@ export class SimApp extends EventEmitter implements AgentApp {
       // 队列让位仅限非中止态：用户中止后 queue 扩展本身被跳过（Interrupted
       // cause），goal 续跑不因队列非空而搁置，否则线程将无推进者。
       if (this.closed || state.sim) return;
+      if (this.threads.get(state.thread.id) !== state) return; // 已被空闲卸载
       if (!state.interrupted && state.queue.length > 0) return;
       if (!state.goal || state.goal.status !== "active") return;
       this.beginGoalTurn(state);
@@ -1704,6 +1827,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
+    this.touchThreadIdle(state); // 活动 turn 开始：冻结 ephemeral 空闲卸载计时
     this.schedule(sim, () => {
       this.emit("event", this.notification("thread/status/changed", {
         threadId: state.thread.id,
@@ -1761,6 +1885,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
+    this.touchThreadIdle(state); // 活动 turn 开始：冻结 ephemeral 空闲卸载计时
 
     this.schedule(sim, () => {
       this.emit("event", this.notification("thread/status/changed", {
@@ -1930,6 +2055,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     state.interrupted = false; // 新 turn 开跑即清除中止态（AgentStatus 离开 Interrupted）
     state.thread.turns.push(turn);
     state.thread.status = { type: "active", activeFlags: [] };
+    this.touchThreadIdle(state); // 活动 turn 开始：冻结 ephemeral 空闲卸载计时
     return sim;
   }
 
@@ -2620,6 +2746,7 @@ export class SimApp extends EventEmitter implements AgentApp {
     this.pendingTimers.clear();
     for (const t of this.threads.values()) {
       t.sim?.timers.clear();
+      t.unloadTimer = null; // 本体已随 pendingTimers 清除，去掉悬挂引用
     }
   }
 }

@@ -738,3 +738,29 @@ marker 才返回标题，否则 null 走标准完整回复；composeReply 的 ep
 用例改为真机 fork 形状（ephemeral+excludeTurns）并补回复全文断言（正是缺这条
 断言放走了本 bug）；name/set 部分挪到持久线程（真机即如此）并断言 ephemeral
 side chat 不进 thread/list。S9 起名（带 marker）不受影响。全量 190/190。
+
+### 追记：ephemeral 线程空闲卸载——对齐 codex thread_unload_delay（2026-09-27）
+
+此前 sim 无任何过期机制：ephemeral（side chat）线程只在 daemon 重启时消失，
+平时永驻内存。对齐 codex 语义（thread_lifecycle.rs UnloadingState +
+core/src/config/mod.rs:3902-3903，默认 60s、键 thread_unload_delay_secs）：
+
+- **判定**：「无订阅」与「无活动 turn」（含队列非空、中止悬挂）**都**为 true 起
+  计时，deadline = max(两者起始时刻) + threadUnloadDelayMs（sim 默认 60s，
+  可配）；任一翻回 true 即重置。到点复核后从内存移除。
+- **订阅模型**：sim 通知投递是「广播 + opt-out」，无正向订阅——为此在
+  AgentClientState 增加 `attached` 集合（仅服务卸载判定，投递不变）。attach
+  点对齐 codex：thread/start（thread_processor.rs:1489-1492）、thread/fork
+  （"Auto-attach a conversation listener when forking"）、thread/resume
+  （ensure_conversation_listener）；**turn/start 不 attach**（codex 证据：
+  turn_start_inner 无 ensure 调用；退订后跑 turn 仍收不到通知——既有
+  「thread/resume 重订阅」测试即此契约，本轮一度误加被既有测试拦下）。
+  forgetClient（连接断开）= 该连接全部订阅消失，重算计时。
+- **范围**：仅 ephemeral 线程卸载。非 ephemeral 的 codex 卸载对客户端不可见
+  （resume 冷加载回来），sim 直接驻留内存等价，不实现。落盘快照不含计时字段。
+- **防御**：卸载时 clearTimers(sim)；consumeQueue / continueGoalIfIdle 的
+  schedule 回调加「线程已被卸载」孤儿守卫（极小 delay 的测试竞态）。
+
+测试新增 3 条：回环（有订阅不卸 / 退订超时卸 / 非 ephemeral 永不卸）、直连
+（半程重订阅重置 deadline / forgetClient 触发计时）、直连（活动 turn 冻结，
+turn 结束后才计时）。sim 55/55，全量 193/193。

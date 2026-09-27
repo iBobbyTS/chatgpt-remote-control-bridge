@@ -126,7 +126,7 @@ class StubAgentApp extends EventEmitter {
     const id = `${key.clientId}/${key.streamId}`;
     let state = this.states.get(id);
     if (!state) {
-      state = { clientInfo: null, optOut: new Set(), unsubscribed: new Set(), initialized: false };
+      state = { clientInfo: null, optOut: new Set(), unsubscribed: new Set(), attached: new Set(), initialized: false };
       this.states.set(id, state);
     }
     return state;

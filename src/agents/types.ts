@@ -20,6 +20,10 @@ export interface AgentClientState {
   clientInfo: { name?: string; title?: string; version?: string } | null;
   optOut: Set<string>;
   unsubscribed: Set<string>;
+  /** 该连接 attach 过的线程（thread/start、fork、resume、turn/start）。通知
+   * 投递仍是广播 + opt-out；此集合只服务空闲卸载的「无订阅」判定（对齐
+   * codex thread_state 的正向订阅跟踪）。 */
+  attached: Set<string>;
   initialized: boolean;
 }
 
