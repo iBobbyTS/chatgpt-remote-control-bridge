@@ -3287,6 +3287,25 @@ test("回环：command/exec codex-workspace-write 任务目录脚本（1.2026.25
   }
 });
 
+test("回环：initialize 不推 account/updated 与 remoteControl/status/changed（codex 只随附 ConfigWarning）", async () => {
+  const loop = await startLoop();
+  try {
+    loop.mock.receivedNotifications.length = 0;
+    await loop.mock.rpc("initialize", { clientInfo: { name: "t" } });
+    // 微任务/近即时通知浮出窗口
+    await new Promise((r) => setTimeout(r, 30));
+    const methods = loop.mock.receivedNotifications.map((n) => n.method);
+    assert.ok(
+      !methods.includes("account/updated"),
+      "initialize 不应推 account/updated——手机每 ~30s 重连即收一次「账户变更」会把上下文显示打回不可用（来回跳根因）",
+    );
+    assert.ok(!methods.includes("remoteControl/status/changed"), "initialize 不应推 remoteControl/status/changed（只在真实状态迁移时发）");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
 test("回环：account/rateLimits/read 返回 5h/7d 双窗快照；turn 后滚动 account/rateLimits/updated", async () => {
   const loop = await startLoop();
   try {

@@ -666,19 +666,12 @@ export class SimApp extends EventEmitter implements AgentApp {
     client.initialized = true;
     client.clientInfo = p.clientInfo ?? null;
     client.optOut = new Set(p.capabilities?.optOutNotificationMethods ?? []);
-    this.emitSoon("account/updated", {
-      authMode: this.opts.accountInfo?.authMode ?? "chatgpt",
-      planType: this.opts.accountInfo?.planType ?? null,
-    });
-    const info = this.opts.getServerInfo?.();
-    if (info) {
-      this.emitSoon("remoteControl/status/changed", {
-        status: "connected",
-        serverName: info.serverName,
-        installationId: info.installationId,
-        environmentId: info.environmentId,
-      });
-    }
+    // codex 的 initialize 只随附 ConfigWarning 通知（initialize_processor.rs:232-249），
+    // 不发 account/updated 也不发 remoteControl/status/changed——这两条只应在真实
+    // 状态变化时发（auth 变更 / 隧道连接迁移）。此前每次 initialize 都推（planType
+    // 还是 null），手机每 ~30s 重连即收到一次「账户信息变更」，status 页上下文显示
+    // 被打回「不可用」直到 resume 补发恢复——实测来回跳的根因。按需读取走
+    // account/rateLimits/read 与 remoteControl/status/read。
     return {
       userAgent: this.opts.userAgent ?? `codex_cli_rs/${CLI_VERSION} (Mac OS ${release()}; ${process.arch}) bridge-sim`,
       codexHome: this.opts.codexHome,

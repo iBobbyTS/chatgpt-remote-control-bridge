@@ -637,3 +637,18 @@ userMessage（content[].text 之和）与 agentMessage（text）字符累加；
 thread/goal/updated 的独立轨道，不受影响。测试：resume 补发断言改为与实况快照一致
 （窗口 258000）+ 新增 char 计/compact 基线测试（首轮 = user+agent 字符、compact 后
 =200、再一轮 = 200+新字符），全量 188/188。
+
+### 追记：上下文显示「正确↔不可用」来回跳根因——initialize 停推账户/远控通知（2026-09-27）
+
+补发上线后实测：status 页开着时上下文行在正确值与「不可用」间振荡，正确显示更
+久（~29.5s）、不可用短闪（~0.6s），周期恰为手机 ~30s 的 wham 重连。帧排查：稳态
+窗口内服务端零输出、replay 均正常送达且数值正确（196/258000），排除补发链路；
+每个重连周期 sim 比真实 codex 多发两条 initialize 附带通知——`account/updated`
+（planType 还是 null）与 `remoteControl/status/changed`。codex 的 initialize 处
+理器只随附 ConfigWarning（initialize_processor.rs:232-249），account/updated 仅
+在 auth 变更、remoteControl/status/changed 仅在隧道状态迁移时发。App 每次重连收
+到「账户信息变更」即把上下文显示打回不可用，等 resume 补发恢复——下一周期又清，
+循环振荡。修复：删除 initialize 的两条 emitSoon（按需读取走 account/rateLimits/
+read 与 remoteControl/status/read，均已实现）。回归测试断言 initialize 后不出现
+这两条通知；全量 189/189（wham T9 在全量并行时偶发超时，单独重跑通过，与本次改
+动无关）。
