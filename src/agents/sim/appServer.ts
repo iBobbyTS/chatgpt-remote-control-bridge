@@ -325,14 +325,29 @@ function titleSchemaOf(p: AnyParams): number | null {
   return 36;
 }
 
-/** 从标题生成 prompt 尾部 "User prompt:\n<msg>" 提取标题：单行化、去引号、按 schema 截断。 */
+/** 自动命名模板前缀；命名格式为「自动命名：{用户请求的前5个字符}」。 */
+const AUTO_NAME_PREFIX = "自动命名：";
+
+/** 请求文本前 5 个 Unicode 码点（Array.from 防止拆代理对），去尾随空白。 */
+function firstFiveChars(request: string): string {
+  return Array.from(request).slice(0, 5).join("").trimEnd();
+}
+
+/**
+ * 标题生成 turn 的自动命名：从 prompt 尾部 "User prompt:\n<msg>" 提取用户请求
+ * （单行化、去引号），命名「自动命名：<请求前5码点>」。真机帧证据
+ * （2026-09-27）：手机拿本 turn 的 JSON 输出回填 thread/name/set（title JSON
+ * 完成于 name/set 之前 ~0.5s）——线程名完全由此模板决定，故超长请求不再
+ * 回显整段；末尾按 schema maxLength 码点截断保契约（36 时恒不触发）。
+ */
 function titleForPrompt(prompt: string, maxLength: number): string {
   const marker = "User prompt:";
   const idx = prompt.lastIndexOf(marker);
   const raw = idx >= 0 ? prompt.slice(idx + marker.length) : prompt;
-  let title = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "");
-  if (!title) title = "Task";
-  return title.length > maxLength ? title.slice(0, maxLength) : title;
+  const request = raw.replace(/\s+/g, " ").trim().replace(/^["'“”]+|["'“”]+$/g, "") || "Task";
+  const title = AUTO_NAME_PREFIX + firstFiveChars(request);
+  const cps = Array.from(title);
+  return cps.length > maxLength ? cps.slice(0, maxLength).join("") : title;
 }
 
 // ---------------------------------------------------------------- 附件上传
@@ -1728,20 +1743,20 @@ export class SimApp extends EventEmitter implements AgentApp {
 
   /**
    * 起名兜底：ephemeral 线程上带 "User prompt:\n<首条消息>" marker 的输入 →
-   * ≤36 字符单行标题；其余（side conversation 等真实 ephemeral 对话）返回
-   * null 走标准回复。真机帧证据：起名 turn 12/12 带 outputSchema{title}+
-   * turnTrigger=remote_ios（走 titleSchemaOf 的 JSON 分支，到不了这里）；
-   * ephemeral 且无 marker 的输入历史上只出现在 side chat（2026-09-27 帧证：
-   * 回复被截成原文 36 字符即此兜底误伤）。旧「无 marker 时用整段文本当标题」
-   * 的回退据此删除。
+   * 「自动命名：<前5码点>」（与 titleForPrompt 模板一致）；其余（side
+   * conversation 等真实 ephemeral 对话）返回 null 走标准回复。真机帧证据：
+   * 起名 turn 12/12 带 outputSchema{title}+turnTrigger=remote_ios（走
+   * titleSchemaOf 的 JSON 分支，到不了这里）；ephemeral 且无 marker 的输入
+   * 历史上只出现在 side chat（2026-09-27 帧证：回复被截成原文 36 字符即此
+   * 兜底误伤）。旧「无 marker 时用整段文本当标题」的回退据此删除。
    */
   private namingTitleReplyOf(userText: string, thread: ThreadRecord): string | null {
     if (!thread.ephemeral) return null;
     const m = userText.match(/User prompt:\s*([\s\S]+)$/);
     if (!m) return null;
     const firstLine = m[1]!.trim().split("\n").map((s) => s.trim()).filter(Boolean)[0] ?? "";
-    const title = firstLine.replace(/["`*#]/g, "").trim().slice(0, 36);
-    return title.length > 0 ? title : "模拟任务";
+    const title = firstLine.replace(/["`*#]/g, "").trim();
+    return title.length > 0 ? AUTO_NAME_PREFIX + firstFiveChars(title) : "自动命名：模拟任务";
   }
 
   /**

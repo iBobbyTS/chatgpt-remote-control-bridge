@@ -1235,7 +1235,7 @@ test("回环：ephemeral 起名线程与零 turn 线程不进列表（对齐 cod
     })) as { result: { thread: { id: string; ephemeral: boolean } } };
     assert.equal(titleThread.result.thread.ephemeral, true);
 
-    // 起名 turn：输入含 "User prompt:\n<首条消息>"，回复应为 ≤36 字符短标题
+    // 起名 turn：输入含 "User prompt:\n<首条消息>"，回复为「自动命名：{前5码点}」
     await loop.mock.rpc("turn/start", {
       threadId: titleThread.result.thread.id,
       input: [{
@@ -1263,7 +1263,7 @@ test("回环：ephemeral 起名线程与零 turn 线程不进列表（对齐 cod
     const titleText = String(
       ((titleReply!.params as { item: { text: string } }).item.text ?? "").trim(),
     );
-    assert.equal(titleText, "S9-ephemeral 标题测试");
+    assert.equal(titleText, "自动命名：S9-ep");
     assert.ok(titleText.length <= 36);
 
     // 起名线程即使跑过 turn 也不进列表
@@ -3385,14 +3385,15 @@ test("回环：手机标题生成 turn（turnTrigger=remote_ios + outputSchema{t
       "标题 turn 未完成",
     );
 
-    // agentMessage 文本必须是符合 outputSchema 的 JSON（手机解析失败会冻结 UI）
+    // agentMessage 文本必须是符合 outputSchema 的 JSON（手机解析失败会冻结 UI）；
+    // 标题为「自动命名：{请求前5码点}」——手机拿该 JSON 输出回填 thread/name/set
     const completed = loop.mock.receivedNotifications.find(
       (n) =>
         n.method === "item/completed" &&
         (n.params as { item?: { type?: string } }).item?.type === "agentMessage",
     )!;
     const item = (completed.params as { item: { text: string } }).item;
-    assert.deepEqual(JSON.parse(item.text), { title: "Fix the login bug" });
+    assert.deepEqual(JSON.parse(item.text), { title: "自动命名：Fix t" });
 
     // thread.preview 用提取的标题（手机任务列表 UI 标题）
     const list = (await loop.mock.rpc("thread/list", {})) as {
@@ -3400,14 +3401,14 @@ test("回环：手机标题生成 turn（turnTrigger=remote_ios + outputSchema{t
     };
     const listed = list.result.data.find((t) => t.id === threadId);
     assert.ok(listed, "标题线程应出现在 thread/list");
-    assert.equal(listed!.preview, "Fix the login bug");
+    assert.equal(listed!.preview, "自动命名：Fix t");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
   }
 });
 
-test("回环：标题 turn 超 maxLength 截断、含 test queue 字样不误触发脚本", async () => {
+test("回环：标题 turn 长请求只取前5字符命名、含 test queue 字样不误触发脚本", async () => {
   const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 5 });
   try {
     await loop.mock.rpc("initialize", {
@@ -3452,7 +3453,84 @@ test("回环：标题 turn 超 maxLength 截断、含 test queue 字样不误触
       title: string;
     };
     assert.ok(title.length <= 36, `title 超 schema maxLength: ${title}`);
-    assert.ok(title.startsWith("test queue with an extremely"), `title 应取自 User prompt 之后: ${title}`);
+    // 超长请求不再整段回显：只取前 5 字符（尾随空白去除）
+    assert.equal(title, "自动命名：test");
+  } finally {
+    await loop.tunnel.stop();
+    await loop.mock.stop();
+  }
+});
+
+test("回环：自动命名「自动命名：{请求前5码点}」——CJK/emoji 码点安全 + 手机以标题回填 name/set", async () => {
+  const loop = await startLoop({ stepDelayMs: 5, deltaIntervalMs: 5 });
+  try {
+    await loop.mock.rpc("initialize", {
+      clientInfo: { name: "codex_chatgpt_ios_remote" },
+      capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
+    });
+    const started = (await loop.mock.rpc("thread/start", { cwd: "/tmp-autoname", threadSource: "user" })) as {
+      result: { thread: { id: string } };
+    };
+    const threadId = started.result.thread.id;
+
+    // 真机每条消息都触发一次标题 turn（01a0dffb 帧证：第二条消息亦再次 name/set），
+    // 故逐条断言而非仅首条
+    const cases: Array<[string, string]> = [
+      ["测试这个功能呀", "自动命名：测试这个功"],
+      ["Hi", "自动命名：Hi"],
+      ["🚀🚀🚀🚀🚀🚀 go", "自动命名：🚀🚀🚀🚀🚀"],
+      ['  "quoted title here"  ', "自动命名：quote"],
+    ];
+    for (const [message, expected] of cases) {
+      const prompt = `You are a helpful assistant.\n\nUser prompt:\n${message}`;
+      const turn = (await loop.mock.rpc("turn/start", {
+        threadId,
+        turnTrigger: "remote_ios",
+        outputSchema: {
+          properties: { title: { type: "string", maxLength: 36 } },
+          required: ["title"],
+          type: "object",
+        },
+        input: [{ text: prompt, type: "text" }],
+      })) as { result: { turn: { id: string } } };
+      await waitFor(
+        () =>
+          loop.mock.receivedNotifications.some(
+            (n) =>
+              n.method === "turn/completed" &&
+              (n.params as { turn?: { id?: string } }).turn?.id === turn.result.turn.id,
+          ),
+        5000,
+        "标题 turn 未完成",
+      );
+      const agentMsg = loop.mock.receivedNotifications.find(
+        (n) =>
+          n.method === "item/completed" &&
+          (n.params as { turnId?: string }).turnId === turn.result.turn.id &&
+          (n.params as { item?: { type?: string } }).item?.type === "agentMessage",
+      )!;
+      const { title } = JSON.parse((agentMsg.params as { item: { text: string } }).item.text) as {
+        title: string;
+      };
+      assert.equal(title, expected, `请求 ${JSON.stringify(message)} 命名不符`);
+      assert.ok(Array.from(title).length <= 36, "自动命名超 schema maxLength");
+      loop.mock.receivedNotifications.length = 0;
+    }
+
+    // 手机行为闭环：拿标题 turn 输出调 thread/name/set → 广播 + 列表回显
+    const named = (await loop.mock.rpc("thread/name/set", { threadId, name: "自动命名：测试这个功" })) as {
+      result: unknown;
+    };
+    assert.deepEqual(named.result, {});
+    await waitFor(
+      () => loop.mock.receivedNotifications.some((n) => n.method === "thread/name/updated"),
+      2000,
+      "thread/name/updated 未收到",
+    );
+    const list = (await loop.mock.rpc("thread/list", {})) as {
+      result: { data: Array<{ id: string; name: string | null }> };
+    };
+    assert.equal(list.result.data.find((t) => t.id === threadId)?.name, "自动命名：测试这个功");
   } finally {
     await loop.tunnel.stop();
     await loop.mock.stop();
