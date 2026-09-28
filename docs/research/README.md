@@ -20,6 +20,9 @@
 - [06-mobile-scenarios.md](06-mobile-scenarios.md) — 12 场景实测：手机端全部 JSON-RPC 方法序列/参数/事件流实证（反向代理抓帧），ZCode 映射表
 - [07-sim-layer.md](07-sim-layer.md) — 模拟层：桥直连真实 wham 扮演被控端，28 方法固定/模拟响应（不接 LLM），`npm run sim`（**已于正式化移除**：入口迁入 `src/agents/sim/*`，改用 `cgrcb serving-agent sim`）
 - [08-formalization.md](08-formalization.md) — 正式化架构：cgrcb CLI + launchd 常驻服务、上游/下游分层、IPC、跨进程 auth 锁、dist 交付面
+- [09-zcode-model-capability.md](09-zcode-model-capability.md) — zcode app-server 模型能力探测：三级模型控制（create/setModel/send.modelSelection）、Provider Registry 双配置体系、env 注入打通 glm、真实调用验证
+- [10-zcode-capability-compat.md](10-zcode-capability-compat.md) — zcode app-server 桥接面兼容性总表：生命周期/turn 流/权限审批/事件流/compact/重放逐接口实测（完全/部分/无法 + 原因），account provider 无头不物化与等价替代
+- [11-zcode-remote-v4-integration.md](11-zcode-remote-v4-integration.md) — 官方 remote/v4 通路完整逆向 + 真实凭证端到端实测（配对/bootstrap/bridge/VQL Channel RPC/v4 conversation 层/GLM 真实对话/权限结构）；桥 terminal 角色接入方案（取代 ACP 路线）
 
 ## 实现代码（探测阶段产出）
 
@@ -39,3 +42,4 @@
 2. **ZCode 的手机远控（`zcode.z.ai/remote/v4` 链接）关键部分闭源**：云端 relay、手机 Web UI、本地端连接 relay 的客户端均不在开源仓库中。逆向此通路成本高且不稳定（v3→v4 已迭代过）。
 3. **ZCode 有官方 headless 可编程形态**：`@zcode/server`（bin 名 `zcode`）暴露 `/ws` WebSocket 上的 ChannelServer RPC，这正是网页版 UI 驱动 ZCode 的通道；`IZCodeAgentService` 接口面（createSession / v4 conversation 通道等）足以支撑 bridge 的全部需求。
 4. **推荐路径 1**（zcode-server / CLI 驱动）+ 自研 wham 客户端，否决路径 2（逆向 ZCode relay）。
+   - **2026-09-27 更新**：路径 2 的"否决"已被推翻——为满足"手机远程控制与 GUI 完全同步"，用户拍板接入官方 remote/v4 通路，且已完成全量逆向（见 [11-zcode-remote-v4-integration.md](11-zcode-remote-v4-integration.md)）。结论从"成本高不稳定"修正为"协议无混淆、四层规格完整还原、桥以 terminal 角色接入即可获得结构性完全同步"。
